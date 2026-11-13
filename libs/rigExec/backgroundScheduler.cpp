@@ -13,6 +13,7 @@
 #include "pxr/base/tf/diagnostic.h"
 #include "pxr/base/tf/getenv.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <set>
@@ -52,6 +53,32 @@ _WarnSwitchOnce(const char *message)
     if (!warned.exchange(true)) {
         TF_WARN("rigExec: %s", message);
     }
+}
+
+// True when every handle of one admission names the same rig identity and
+// compile epoch, and names an output at all: the group rule outputDemand.h
+// states for a whole request, applied to one exact-time demand before the
+// pool reserves a byte for it. A mixed group would answer two provenances
+// from one job.
+bool
+_OneProvenanceGroup(const std::vector<RigExecOutputHandle> &outputs)
+{
+    if (outputs.empty()) {
+        return false;
+    }
+    const std::string &rigIdentity = outputs.front().rigIdentity;
+    const uint64_t compileEpoch = outputs.front().compileEpoch;
+    if (rigIdentity.empty()) {
+        return false;
+    }
+    for (const RigExecOutputHandle &handle : outputs) {
+        if (handle.rigIdentity != rigIdentity ||
+            handle.compileEpoch != compileEpoch || handle.semanticKey.empty() ||
+            handle.type.empty()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -194,26 +221,20 @@ RigExecBackgroundScheduler::~RigExecBackgroundScheduler()
         worker.join();
     }
     // Running jobs finished above (join waits); what is still queued is
-    // dropped, fail-closed -- each frame evaluates live when asked -- and
-    // counted so the books balance.
+    // dropped, fail-closed -- each frame evaluates live when asked, and each
+    // explicit request is re-admitted by its service -- and counted so the
+    // books balance. Every explicit byte reservation goes with it.
     std::lock_guard<std::mutex> lock(_mutex);
     for (const auto &entry : _queue) {
-        const SdfPath &rig = entry.second.request.rig;
-        const auto inFlight = _inFlight.find(rig);
-        if (inFlight != _inFlight.end() && inFlight->second > 0) {
-            if (--(inFlight->second) == 0) {
-                _inFlight.erase(inFlight);
-            }
-        }
-        _ReportTransitionLocked(entry.second.request,
-                                RigExecWarmTransitionKind::DroppedAtShutdown);
-        ++_droppedAtShutdown;
+        _RetireQueuedJobLocked(entry.second,
+                               RigExecWarmTransitionKind::DroppedAtShutdown);
     }
     if (!_queue.empty()) {
         _profiler.RecordSchedulerCancel(_queue.size(), "shutdown");
     }
     _queue.clear();
     _queuedByRigAndTime.clear();
+    _queuedExplicitByKey.clear();
 }
 
 uint64_t
@@ -292,18 +313,133 @@ RigExecBackgroundScheduler::SetTransitionHook(RigExecWarmTransitionHook hook)
 
 void
 RigExecBackgroundScheduler::_ReportTransitionLocked(
-    const RigExecWarmRequest &request, RigExecWarmTransitionKind kind,
+    const _JobIdentity &identity, RigExecWarmTransitionKind kind,
     RigExecWarmOutcome outcome)
 {
     if (!_transitionHook) {
         return;
     }
     RigExecWarmTransition transition;
-    transition.rig = request.rig;
-    transition.timeValue = request.time.GetValue();
+    transition.rig = identity.rig;
+    transition.timeValue = identity.timeValue;
     transition.kind = kind;
     transition.outcome = outcome;
+    transition.workClass = identity.workClass;
+    transition.timeIsDefault = identity.timeIsDefault;
     _transitionHook(transition);
+}
+
+const SdfPath &
+RigExecBackgroundScheduler::_JobRig(const _QueuedJob &job)
+{
+    return job.workClass == RigExecBackgroundWorkClass::Explicit
+               ? job.explicitRequest.rig
+               : job.request.rig;
+}
+
+RigExecBackgroundScheduler::_JobIdentity
+RigExecBackgroundScheduler::_IdentityOf(const _QueuedJob &job)
+{
+    _JobIdentity identity;
+    identity.workClass = job.workClass;
+    identity.enqueuedUs = job.request.enqueuedUs;
+    identity.poppedUs = job.request.poppedUs;
+    if (job.workClass == RigExecBackgroundWorkClass::Explicit) {
+        identity.rig = job.explicitRequest.rig;
+        identity.timeIsDefault = job.explicitRequest.time.IsDefault();
+        identity.timeValue =
+            identity.timeIsDefault ? 0.0 : job.explicitRequest.time.TimeCode();
+        identity.generation = job.explicitRequest.editGeneration;
+        identity.reservationBytes = job.explicitRequest.reservationBytes;
+        identity.explicitKey = job.explicitRequest.Key();
+        return identity;
+    }
+    identity.rig = job.request.rig;
+    identity.timeValue = job.request.time.GetValue();
+    identity.generation = job.request.generation;
+    return identity;
+}
+
+void
+RigExecBackgroundScheduler::_ReleaseReservationLocked(const SdfPath &rig,
+                                                      size_t bytes)
+{
+    if (bytes == 0) {
+        return;
+    }
+    _reservedBytes -= bytes;
+    const auto found = _reservedBytesByRig.find(rig);
+    if (found == _reservedBytesByRig.end()) {
+        return;
+    }
+    found->second -= std::min(found->second, bytes);
+    if (found->second == 0) {
+        _reservedBytesByRig.erase(found);
+    }
+}
+
+size_t
+RigExecBackgroundScheduler::_ExplicitInFlightLocked(const SdfPath &rig) const
+{
+    const auto found = _explicitInFlight.find(rig);
+    return found == _explicitInFlight.end() ? 0 : found->second;
+}
+
+void
+RigExecBackgroundScheduler::_ChangeExplicitInFlightLocked(const SdfPath &rig,
+                                                          int delta)
+{
+    if (delta > 0) {
+        ++_explicitInFlight[rig];
+        return;
+    }
+    const auto found = _explicitInFlight.find(rig);
+    if (found == _explicitInFlight.end()) {
+        return;
+    }
+    if (--(found->second) == 0) {
+        _explicitInFlight.erase(found);
+    }
+}
+
+void
+RigExecBackgroundScheduler::_RetireQueuedJobLocked(
+    const _QueuedJob &job, RigExecWarmTransitionKind kind)
+{
+    const bool explicitJob =
+        job.workClass == RigExecBackgroundWorkClass::Explicit;
+    const _JobIdentity identity = _IdentityOf(job);
+    if (explicitJob) {
+        _queuedExplicitByKey.erase(job.explicitRequest.Key());
+        _ReleaseReservationLocked(identity.rig,
+                                  job.explicitRequest.reservationBytes);
+    } else {
+        _queuedByRigAndTime.erase(
+            std::make_pair(identity.rig, identity.timeValue));
+    }
+    _ReportTransitionLocked(identity, kind);
+    if (explicitJob) {
+        _ChangeExplicitInFlightLocked(identity.rig, -1);
+        if (kind == RigExecWarmTransitionKind::Canceled) {
+            ++_explicitCanceled;
+        } else if (kind == RigExecWarmTransitionKind::DroppedAtShutdown) {
+            ++_explicitDroppedAtShutdown;
+        }
+        return;
+    }
+    const auto inFlight = _inFlight.find(identity.rig);
+    if (inFlight != _inFlight.end() && inFlight->second > 0) {
+        if (--(inFlight->second) == 0) {
+            _inFlight.erase(inFlight);
+        }
+    }
+    if (kind == RigExecWarmTransitionKind::Canceled) {
+        ++_canceled;
+    } else if (kind == RigExecWarmTransitionKind::Shed) {
+        ++_shed;
+    } else if (kind == RigExecWarmTransitionKind::DroppedAtShutdown) {
+        ++_droppedAtShutdown;
+    }
 }
 
 RigExecFrameGeneration
@@ -339,25 +475,15 @@ RigExecBackgroundScheduler::CancelGeneration(const SdfPath &rig)
     // edit -- are moved out and freed promptly, but AFTER the lock closes:
     // up to a rig's in-flight cap of multi-megabyte vectors is not a "map
     // edit", and a worker's pop must not wait on their teardown.
-    std::vector<RigExecWarmWork> retired;
+    std::vector<_QueuedJob> retired;
     for (auto it = _queue.begin(); it != _queue.end();) {
-        if (it->second.request.rig != rig) {
+        if (_JobRig(it->second) != rig) {
             ++it;
             continue;
         }
-        _queuedByRigAndTime.erase(
-            std::make_pair(rig, it->second.request.time.GetValue()));
-        _ReportTransitionLocked(it->second.request,
-                                RigExecWarmTransitionKind::Canceled);
-        retired.push_back(std::move(it->second.work));
+        _RetireQueuedJobLocked(it->second, RigExecWarmTransitionKind::Canceled);
+        retired.push_back(std::move(it->second));
         it = _queue.erase(it);
-        const auto inFlight = _inFlight.find(rig);
-        if (inFlight != _inFlight.end() && inFlight->second > 0) {
-            if (--(inFlight->second) == 0) {
-                _inFlight.erase(inFlight);
-            }
-        }
-        ++_canceled;
     }
     if (!retired.empty()) {
         _profiler.RecordSchedulerCancel(retired.size(), "edit");
@@ -377,6 +503,7 @@ RigExecBackgroundScheduler::ResetRig(const SdfPath &rig)
     // comparison. Only the per-time fence tokens (which would fail
     // a reactivated rig's publishes) and queued jobs reset.
     _fenceCounters.erase(rig);
+    _defaultFenceTokens.erase(rig);
     for (auto it = _fenceTokens.begin(); it != _fenceTokens.end();) {
         if (it->first.first == rig) {
             it = _fenceTokens.erase(it);
@@ -384,27 +511,22 @@ RigExecBackgroundScheduler::ResetRig(const SdfPath &rig)
             ++it;
         }
     }
-    std::vector<RigExecWarmWork> retired;
+    std::vector<_QueuedJob> retired;
     for (auto it = _queue.begin(); it != _queue.end();) {
-        if (it->second.request.rig != rig) {
+        if (_JobRig(it->second) != rig) {
             ++it;
             continue;
         }
-        _queuedByRigAndTime.erase(
-            std::make_pair(rig, it->second.request.time.GetValue()));
-        _ReportTransitionLocked(it->second.request,
-                                RigExecWarmTransitionKind::Canceled);
-        retired.push_back(std::move(it->second.work));
+        _RetireQueuedJobLocked(it->second, RigExecWarmTransitionKind::Canceled);
+        retired.push_back(std::move(it->second));
         it = _queue.erase(it);
-        const auto inFlight = _inFlight.find(rig);
-        if (inFlight != _inFlight.end() && inFlight->second > 0) {
-            if (--(inFlight->second) == 0) {
-                _inFlight.erase(inFlight);
-            }
-        }
-        ++_canceled;
     }
     _inFlight.erase(rig);
+    _explicitInFlight.erase(rig);
+    _explicitOrdinal.erase(rig);
+    // Byte reservations are not swept here: purged jobs released theirs, and
+    // what remains belongs to jobs still running, which release it when they
+    // finish. Subtracting the map entry would count those bytes twice.
     if (!retired.empty()) {
         _profiler.RecordSchedulerCancel(retired.size(), "reset");
     }
@@ -440,29 +562,36 @@ RigExecBackgroundScheduler::CancelGenerationTimes(
     for (const auto &entry : affected) {
         _fenceTokens[std::make_pair(rig, entry.first)] = ++_fenceCounters[rig];
     }
+    if (!affected.empty()) {
+        // The default frame has no numeric time to key, but a scoped edit
+        // moves its inputs like every other frame, so its explicit requests
+        // are fenced by the same counter.
+        _defaultFenceTokens[rig] = ++_fenceCounters[rig];
+    }
     // Purge the rig's queued jobs at those times, same loop shape as
-    // CancelGeneration: the purged closures free AFTER the lock closes.
-    std::vector<RigExecWarmWork> retired;
+    // CancelGeneration: the purged closures free AFTER the lock closes. An
+    // explicit request for the default frame is purged with them.
+    std::vector<_QueuedJob> retired;
     for (auto it = _queue.begin(); it != _queue.end();) {
-        if (it->second.request.rig != rig ||
-            affected.find(it->second.request.time.GetValue()) ==
-                affected.end()) {
+        const _QueuedJob &job = it->second;
+        bool affectedTime = false;
+        if (_JobRig(job) == rig) {
+            if (job.workClass == RigExecBackgroundWorkClass::Explicit) {
+                const RigExecOutputTime &time = job.explicitRequest.time;
+                affectedTime = time.IsDefault() ||
+                               affected.find(time.TimeCode()) != affected.end();
+            } else {
+                affectedTime = affected.find(job.request.time.GetValue()) !=
+                               affected.end();
+            }
+        }
+        if (!affectedTime) {
             ++it;
             continue;
         }
-        _queuedByRigAndTime.erase(
-            std::make_pair(rig, it->second.request.time.GetValue()));
-        _ReportTransitionLocked(it->second.request,
-                                RigExecWarmTransitionKind::Canceled);
-        retired.push_back(std::move(it->second.work));
+        _RetireQueuedJobLocked(it->second, RigExecWarmTransitionKind::Canceled);
+        retired.push_back(std::move(it->second));
         it = _queue.erase(it);
-        const auto inFlight = _inFlight.find(rig);
-        if (inFlight != _inFlight.end() && inFlight->second > 0) {
-            if (--(inFlight->second) == 0) {
-                _inFlight.erase(inFlight);
-            }
-        }
-        ++_canceled;
     }
     if (!retired.empty()) {
         _profiler.RecordSchedulerCancel(retired.size(), "edit-times");
@@ -604,10 +733,12 @@ RigExecBackgroundScheduler::Enqueue(const SdfPath &rig, UsdTimeCode time,
     request.generation = generation;
     request.fenceToken = _CurrentFenceTokenLocked(rig, timeValue);
     request.enqueuedUs = _NowUs();
-    const _QueueKey key{int(priority), _sequence++};
+    const _QueueKey key{int(RigExecBackgroundWorkClass::Warm),
+                        uint64_t(priority), _sequence++};
     _QueuedJob queuedJob;
     queuedJob.request = request;
-    queuedJob.work = std::move(work);
+    queuedJob.warmWork = std::move(work);
+    const _JobIdentity identity = _IdentityOf(queuedJob);
     _queue.emplace(key, std::move(queuedJob));
     _queuedByRigAndTime.emplace(coalesceKey, key);
     _inFlight[rig] = flying + 1;
@@ -616,7 +747,121 @@ RigExecBackgroundScheduler::Enqueue(const SdfPath &rig, UsdTimeCode time,
     } else {
         ++_enqueuedSweep;
     }
-    _ReportTransitionLocked(request, RigExecWarmTransitionKind::Queued);
+    _ReportTransitionLocked(identity, RigExecWarmTransitionKind::Queued);
+    _RecordQueueStateLocked();
+    lock.unlock();
+    _cv.notify_all();
+    return true;
+}
+
+RigExecWarmFenceToken
+RigExecBackgroundScheduler::_CurrentExplicitFenceTokenLocked(
+    const SdfPath &rig, RigExecOutputTime time) const
+{
+    if (time.IsDefault()) {
+        const auto found = _defaultFenceTokens.find(rig);
+        return found == _defaultFenceTokens.end() ? 0 : found->second;
+    }
+    return _CurrentFenceTokenLocked(rig, time.TimeCode());
+}
+
+RigExecWarmFenceToken
+RigExecBackgroundScheduler::CurrentExplicitFenceToken(
+    const SdfPath &rig, RigExecOutputTime time) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _CurrentExplicitFenceTokenLocked(rig, time);
+}
+
+bool
+RigExecBackgroundScheduler::IsExplicitRequestCurrent(
+    const RigExecExplicitRequest &request) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto current = _generations.find(request.rig);
+    const RigExecFrameGeneration currentGeneration =
+        current == _generations.end() ? 0 : current->second;
+    if (currentGeneration != request.editGeneration) {
+        return false;
+    }
+    return _CurrentExplicitFenceTokenLocked(request.rig, request.time) ==
+           request.fenceToken;
+}
+
+bool
+RigExecBackgroundScheduler::AdmitExplicitOutput(
+    const RigExecExplicitRequest &request, RigExecExplicitWork work)
+{
+    // Refusals that need no lock and reserve nothing. The frame-cache fill
+    // gate is deliberately absent here: it gates speculative warming, while a
+    // host that asked for this frame is not speculating.
+    if (!work || !_OneProvenanceGroup(request.outputs) ||
+        (!request.time.IsDefault() &&
+         !std::isfinite(request.time.TimeCode()))) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        ++_explicitDeclined;
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (_stopping) {
+        ++_explicitDeclined;
+        return false;
+    }
+    // Inline, not via IsGenerationCurrent: the lock is already held and
+    // std::mutex does not nest.
+    const auto current = _generations.find(request.rig);
+    const RigExecFrameGeneration currentGeneration =
+        current == _generations.end() ? 0 : current->second;
+    if (currentGeneration != request.editGeneration) {
+        ++_explicitDeclined;
+        return false;
+    }
+    // Coalesce only on the exact key: the same rig, the same exact time, and
+    // the same whole captured generation. Anything else is a second job, so a
+    // recompiled program, a moved input, a different preview or history
+    // revision, or a subframe step can never be answered by -- or overwrite
+    // -- the queued job's answer.
+    const RigExecExplicitJobKey key = request.Key();
+    if (_queuedExplicitByKey.find(key) != _queuedExplicitByKey.end()) {
+        ++_explicitCoalesced;
+        return true;
+    }
+    if (_ExplicitInFlightLocked(request.rig) >= _explicitPerRigCap) {
+        ++_explicitDeclined;
+        return false;
+    }
+    // The byte reservation is bounded before anything is allocated or queued,
+    // fail-closed on overflow. The caller answers the request live instead.
+    const size_t bytes = request.reservationBytes;
+    if (bytes > _explicitByteCap || _reservedBytes > _explicitByteCap - bytes) {
+        ++_explicitDeclined;
+        ++_explicitDeclinedBytes;
+        return false;
+    }
+    RigExecExplicitRequest stamped = request;
+    stamped.fenceToken =
+        _CurrentExplicitFenceTokenLocked(request.rig, request.time);
+    _QueuedJob job;
+    job.workClass = RigExecBackgroundWorkClass::Explicit;
+    job.explicitRequest = stamped;
+    job.explicitWork = std::move(work);
+    // The rank is the job's ordinal within its rig, so another rig's request
+    // queues beside this one, not behind its whole burst.
+    const _QueueKey queueKey{int(RigExecBackgroundWorkClass::Explicit),
+                             _explicitOrdinal[request.rig]++, _sequence++};
+    // The queue-wait stamps live on the job's request record for both
+    // classes: the shared pool measures every job it pops.
+    job.request.enqueuedUs = _NowUs();
+    const _JobIdentity identity = _IdentityOf(job);
+    _queue.emplace(queueKey, std::move(job));
+    _queuedExplicitByKey.emplace(key, queueKey);
+    _ChangeExplicitInFlightLocked(request.rig, +1);
+    _reservedBytes += bytes;
+    if (bytes > 0) {
+        _reservedBytesByRig[request.rig] += bytes;
+    }
+    ++_explicitAccepted;
+    _ReportTransitionLocked(identity, RigExecWarmTransitionKind::Queued);
     _RecordQueueStateLocked();
     lock.unlock();
     _cv.notify_all();
@@ -712,7 +957,8 @@ RigExecBackgroundScheduler::NotePlaybackAdvanced(const SdfPath &rig,
     size_t shed = 0;
     for (auto it = _queue.begin(); it != _queue.end();) {
         const RigExecWarmRequest &request = it->second.request;
-        if (request.rig != rig ||
+        if (it->second.workClass != RigExecBackgroundWorkClass::Warm ||
+            request.rig != rig ||
             request.priority != RigExecWarmPriority::Sweep ||
             request.time > playhead) {
             ++it;
@@ -722,16 +968,9 @@ RigExecBackgroundScheduler::NotePlaybackAdvanced(const SdfPath &rig,
         // frame now, so warming it is pointless. Neighbors stand -- the
         // frames ahead still warm the imminent scrub path -- and the standing
         // neighbor-before-sweep order deprioritizes the sweep that remains.
-        _queuedByRigAndTime.erase(std::make_pair(rig, request.time.GetValue()));
-        _ReportTransitionLocked(request, RigExecWarmTransitionKind::Shed);
+        // An explicit request never sheds: a host asked for that frame.
+        _RetireQueuedJobLocked(it->second, RigExecWarmTransitionKind::Shed);
         it = _queue.erase(it);
-        const auto inFlight = _inFlight.find(rig);
-        if (inFlight != _inFlight.end() && inFlight->second > 0) {
-            if (--(inFlight->second) == 0) {
-                _inFlight.erase(inFlight);
-            }
-        }
-        ++_shed;
         ++shed;
     }
     if (shed > 0) {
@@ -754,6 +993,89 @@ RigExecBackgroundScheduler::GetPerRigJobCap() const
 {
     std::lock_guard<std::mutex> lock(_mutex);
     return _perRigCap;
+}
+
+void
+RigExecBackgroundScheduler::SetExplicitPerRigJobCap(size_t cap)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    _explicitPerRigCap = cap;
+}
+
+size_t
+RigExecBackgroundScheduler::GetExplicitPerRigJobCap() const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _explicitPerRigCap;
+}
+
+void
+RigExecBackgroundScheduler::SetExplicitByteCap(size_t cap)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    _explicitByteCap = cap;
+}
+
+size_t
+RigExecBackgroundScheduler::GetExplicitByteCap() const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _explicitByteCap;
+}
+
+size_t
+RigExecBackgroundScheduler::ExplicitInFlightCount(const SdfPath &rig) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _ExplicitInFlightLocked(rig);
+}
+
+size_t
+RigExecBackgroundScheduler::ReservedExplicitBytes() const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _reservedBytes;
+}
+
+size_t
+RigExecBackgroundScheduler::ReservedExplicitBytesFor(const SdfPath &rig) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto found = _reservedBytesByRig.find(rig);
+    return found == _reservedBytesByRig.end() ? 0 : found->second;
+}
+
+std::vector<RigExecExplicitJobKey>
+RigExecBackgroundScheduler::QueuedExplicitKeys(const SdfPath &rig) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<RigExecExplicitJobKey> keys;
+    for (const auto &entry : _queuedExplicitByKey) {
+        if (entry.first.rig == rig) {
+            keys.push_back(entry.first);
+        }
+    }
+    return keys;
+}
+
+std::vector<RigExecExplicitJobKey>
+RigExecBackgroundScheduler::InFlightExplicitKeys(const SdfPath &rig) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<RigExecExplicitJobKey> keys;
+    for (const auto &entry : _queuedExplicitByKey) {
+        if (entry.first.rig == rig) {
+            keys.push_back(entry.first);
+        }
+    }
+    for (const auto &entry : _runningExplicitByKey) {
+        if (entry.first.rig == rig) {
+            keys.push_back(entry.first);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
 }
 
 RigExecBackgroundSchedulerStats
@@ -793,6 +1115,9 @@ RigExecBackgroundScheduler::Stats() const
     stats.enqueuedNeighbor = _enqueuedNeighbor;
     stats.enqueuedSweep = _enqueuedSweep;
     for (const auto &entry : _queue) {
+        if (entry.second.workClass != RigExecBackgroundWorkClass::Warm) {
+            continue;
+        }
         if (entry.second.request.priority == RigExecWarmPriority::Neighbor) {
             ++stats.queuedNeighbor;
         } else {
@@ -803,6 +1128,20 @@ RigExecBackgroundScheduler::Stats() const
     stats.maxQueueWaitUs = _maxQueueWaitUs;
     stats.totalRunUs = _totalRunUs;
     stats.maxRunUs = _maxRunUs;
+    stats.explicitAccepted = _explicitAccepted;
+    stats.explicitCoalesced = _explicitCoalesced;
+    stats.explicitDeclined = _explicitDeclined;
+    stats.explicitDeclinedBytes = _explicitDeclinedBytes;
+    stats.explicitCompleted = _explicitCompleted;
+    stats.explicitPublished = _explicitPublished;
+    stats.explicitDeclinedInvalid = _explicitDeclinedInvalid;
+    stats.explicitDeclinedGeneration = _explicitDeclinedGeneration;
+    stats.explicitDroppedStale = _explicitDroppedStale;
+    stats.explicitCanceled = _explicitCanceled;
+    stats.explicitDroppedAtShutdown = _explicitDroppedAtShutdown;
+    stats.explicitQueuedDepth = _queuedExplicitByKey.size();
+    stats.explicitRunning = _explicitRunning;
+    stats.explicitReservedBytes = _reservedBytes;
     return stats;
 }
 
@@ -865,16 +1204,26 @@ RigExecBackgroundScheduler::_PopJob(_QueuedJob *job, bool wait)
     auto next = _queue.begin();
     *job = std::move(next->second);
     job->request.poppedUs = _NowUs();
-    _queuedByRigAndTime.erase(
-        std::make_pair(job->request.rig, job->request.time.GetValue()));
+    const _JobIdentity identity = _IdentityOf(*job);
+    if (identity.workClass == RigExecBackgroundWorkClass::Explicit) {
+        _queuedExplicitByKey.erase(identity.explicitKey);
+    } else {
+        _queuedByRigAndTime.erase(
+            std::make_pair(identity.rig, identity.timeValue));
+    }
     _queue.erase(next);
     // Still in-flight -- the cap counts popped-and-executing -- until
     // _FinishJob lands.
     ++_running;
-    ++_runningByRigAndTime[std::make_pair(job->request.rig,
-                                          job->request.time.GetValue())];
+    if (identity.workClass == RigExecBackgroundWorkClass::Explicit) {
+        ++_runningExplicitByKey[identity.explicitKey];
+        ++_explicitRunning;
+    } else {
+        ++_runningByRigAndTime[std::make_pair(identity.rig,
+                                              identity.timeValue)];
+    }
     _RecordQueueStateLocked();
-    _ReportTransitionLocked(job->request, RigExecWarmTransitionKind::Running);
+    _ReportTransitionLocked(identity, RigExecWarmTransitionKind::Running);
     return true;
 }
 
@@ -883,11 +1232,15 @@ RigExecBackgroundScheduler::_ExecutePoppedJob(_QueuedJob *job)
 {
     // The pre-run fence: a bump that landed between the pop and this check
     // -- CancelGeneration purges queued jobs, but this one already popped --
-    // drops the work unrun and frees its sampled inputs promptly.
-    const RigExecWarmRequest request = job->request;
-    if (!IsGenerationCurrent(request.rig, request.generation)) {
+    // drops the work unrun and frees its sampled inputs and its byte
+    // reservation promptly.
+    const _JobIdentity identity = _IdentityOf(*job);
+    const bool explicitJob =
+        identity.workClass == RigExecBackgroundWorkClass::Explicit;
+    if (!IsGenerationCurrent(identity.rig, identity.generation)) {
         *job = _QueuedJob();
-        _FinishJob(request, /*ran=*/false, RigExecWarmOutcome::DeclinedInvalid);
+        _FinishJob(identity, /*ran=*/false,
+                   RigExecWarmOutcome::DeclinedInvalid);
         return false;
     }
     // The serial-variant boundary: the serial scope forces every kernel variant this run
@@ -902,25 +1255,32 @@ RigExecBackgroundScheduler::_ExecutePoppedJob(_QueuedJob *job)
     // The job stamps its phases here, on this worker's frame; _FinishJob
     // records them once.
     RigExecWarmPhaseTimings timings;
-    RigExecWarmRequest running = request;
-    running.timings = _profiler.IsEnabled() ? &timings : nullptr;
+    RigExecWarmRequest running;
+    if (!explicitJob) {
+        running = job->request;
+        running.timings = _profiler.IsEnabled() ? &timings : nullptr;
+    }
     try {
         RigExecFrozenSerialScope serial;
-        outcome = job->work(running);
+        if (explicitJob) {
+            outcome = job->explicitWork(job->explicitRequest);
+        } else {
+            outcome = job->warmWork(running);
+        }
     } catch (const std::exception &error) {
-        TF_WARN("rigExec: background warming job threw: %s", error.what());
+        TF_WARN("rigExec: background job threw: %s", error.what());
     } catch (...) {
-        TF_WARN("rigExec: background warming job threw an unknown exception");
+        TF_WARN("rigExec: background job threw an unknown exception");
     }
     *job = _QueuedJob();
-    _FinishJob(request, /*ran=*/true, outcome,
+    _FinishJob(identity, /*ran=*/true, outcome,
                running.timings ? &timings : nullptr);
     return true;
 }
 
 void
-RigExecBackgroundScheduler::_FinishJob(const RigExecWarmRequest &request,
-                                       bool ran, RigExecWarmOutcome outcome,
+RigExecBackgroundScheduler::_FinishJob(const _JobIdentity &identity, bool ran,
+                                       RigExecWarmOutcome outcome,
                                        const RigExecWarmPhaseTimings *timings)
 {
     // One event per job, spanning its marks, with each phase's duration as
@@ -944,39 +1304,77 @@ RigExecBackgroundScheduler::_FinishJob(const RigExecWarmRequest &request,
     if (_running > 0) {
         --_running;
     }
-    const auto running = _runningByRigAndTime.find(
-        std::make_pair(request.rig, request.time.GetValue()));
-    if (running != _runningByRigAndTime.end() && --running->second == 0) {
-        _runningByRigAndTime.erase(running);
-    }
-    const auto inFlight = _inFlight.find(request.rig);
-    if (inFlight != _inFlight.end() && inFlight->second > 0) {
-        if (--(inFlight->second) == 0) {
-            _inFlight.erase(inFlight);
+    const bool explicitJob =
+        identity.workClass == RigExecBackgroundWorkClass::Explicit;
+    if (explicitJob) {
+        if (_explicitRunning > 0) {
+            --_explicitRunning;
+        }
+        const auto running = _runningExplicitByKey.find(identity.explicitKey);
+        if (running != _runningExplicitByKey.end() && --running->second == 0) {
+            _runningExplicitByKey.erase(running);
+        }
+        // The reservation covers the values the job closed over and the
+        // payload it published; either way the job is over, so the bytes are
+        // free again.
+        _ReleaseReservationLocked(identity.rig, identity.reservationBytes);
+        _ChangeExplicitInFlightLocked(identity.rig, -1);
+    } else {
+        const auto running = _runningByRigAndTime.find(
+            std::make_pair(identity.rig, identity.timeValue));
+        if (running != _runningByRigAndTime.end() && --running->second == 0) {
+            _runningByRigAndTime.erase(running);
+        }
+        const auto inFlight = _inFlight.find(identity.rig);
+        if (inFlight != _inFlight.end() && inFlight->second > 0) {
+            if (--(inFlight->second) == 0) {
+                _inFlight.erase(inFlight);
+            }
         }
     }
     if (ran) {
-        ++_completed;
-        switch (outcome) {
-        case RigExecWarmOutcome::Published:
-            ++_published;
-            break;
-        case RigExecWarmOutcome::DeclinedGeneration:
-            ++_declinedGeneration;
-            break;
-        case RigExecWarmOutcome::DeclinedInvalid:
-            ++_declinedInvalid;
-            break;
+        if (explicitJob) {
+            ++_explicitCompleted;
+            switch (outcome) {
+            case RigExecWarmOutcome::Published:
+                ++_explicitPublished;
+                break;
+            case RigExecWarmOutcome::DeclinedGeneration:
+                ++_explicitDeclinedGeneration;
+                break;
+            case RigExecWarmOutcome::DeclinedInvalid:
+                ++_explicitDeclinedInvalid;
+                break;
+            }
+            _ReportTransitionLocked(
+                identity, RigExecWarmTransitionKind::Finished, outcome);
+        } else {
+            ++_completed;
+            switch (outcome) {
+            case RigExecWarmOutcome::Published:
+                ++_published;
+                break;
+            case RigExecWarmOutcome::DeclinedGeneration:
+                ++_declinedGeneration;
+                break;
+            case RigExecWarmOutcome::DeclinedInvalid:
+                ++_declinedInvalid;
+                break;
+            }
+            _ReportTransitionLocked(
+                identity, RigExecWarmTransitionKind::Finished, outcome);
         }
-        _ReportTransitionLocked(request, RigExecWarmTransitionKind::Finished,
-                                outcome);
     } else {
-        ++_droppedStale;
-        _ReportTransitionLocked(request,
+        if (explicitJob) {
+            ++_explicitDroppedStale;
+        } else {
+            ++_droppedStale;
+        }
+        _ReportTransitionLocked(identity,
                                 RigExecWarmTransitionKind::DroppedStale);
     }
-    if (request.poppedUs >= request.enqueuedUs) {
-        const uint64_t waitUs = request.poppedUs - request.enqueuedUs;
+    if (identity.poppedUs >= identity.enqueuedUs) {
+        const uint64_t waitUs = identity.poppedUs - identity.enqueuedUs;
         _totalQueueWaitUs += waitUs;
         if (waitUs > _maxQueueWaitUs) {
             _maxQueueWaitUs = waitUs;
@@ -984,8 +1382,8 @@ RigExecBackgroundScheduler::_FinishJob(const RigExecWarmRequest &request,
     }
     if (ran) {
         const uint64_t nowUs = _NowUs();
-        if (nowUs > request.poppedUs) {
-            const uint64_t runUs = nowUs - request.poppedUs;
+        if (nowUs > identity.poppedUs) {
+            const uint64_t runUs = nowUs - identity.poppedUs;
             _totalRunUs += runUs;
             if (runUs > _maxRunUs) {
                 _maxRunUs = runUs;
@@ -1015,7 +1413,8 @@ RigExecBackgroundScheduler::_MergeIfQueuedLocked(
         _QueuedJob promoted = std::move(job->second);
         promoted.request.priority = RigExecWarmPriority::Neighbor;
         _queue.erase(job);
-        const _QueueKey newKey{int(RigExecWarmPriority::Neighbor),
+        const _QueueKey newKey{int(RigExecBackgroundWorkClass::Warm),
+                               uint64_t(RigExecWarmPriority::Neighbor),
                                oldKey.sequence};
         _queue.emplace(newKey, std::move(promoted));
         queued->second = newKey;
@@ -1142,10 +1541,12 @@ RigExecBackgroundScheduler::_EnqueueTriggerTime(
     request.generation = generation;
     request.fenceToken = _CurrentFenceTokenLocked(rig, timeValue);
     request.enqueuedUs = _NowUs();
-    const _QueueKey key{int(priority), _sequence++};
+    const _QueueKey key{int(RigExecBackgroundWorkClass::Warm),
+                        uint64_t(priority), _sequence++};
     _QueuedJob queuedJob;
     queuedJob.request = request;
-    queuedJob.work = std::move(work);
+    queuedJob.warmWork = std::move(work);
+    const _JobIdentity identity = _IdentityOf(queuedJob);
     _queue.emplace(key, std::move(queuedJob));
     _queuedByRigAndTime.emplace(coalesceKey, key);
     _inFlight[rig] = flying + 1;
@@ -1154,7 +1555,7 @@ RigExecBackgroundScheduler::_EnqueueTriggerTime(
     } else {
         ++_enqueuedSweep;
     }
-    _ReportTransitionLocked(request, RigExecWarmTransitionKind::Queued);
+    _ReportTransitionLocked(identity, RigExecWarmTransitionKind::Queued);
     _RecordQueueStateLocked();
     lock.unlock();
     _cv.notify_all();

@@ -115,3 +115,45 @@ canonical operation — the lookup invalidation and cache publication use to
 decide what to re-evaluate. The mask feeds `RigExecOpCallbacks::active`
 directly: operations it marks 0 are never candidates, and history ticks run
 only the operations a windowed operation depends on.
+
+## Background admission
+
+A subscription service runs the work behind a request on the existing
+background pool. `libs/rigExec/backgroundScheduler.h` declares the admission
+it calls; the pool itself does not change, and no second queue appears.
+
+| Declaration | Says |
+| --- | --- |
+| `RigExecBackgroundWorkClass` | `Explicit` or `Warm`: the pool runs a host request ahead of speculative warming. |
+| `RigExecExplicitRequest` | One admission: the rig, the exact `RigExecOutputTime`, the whole `RigExecOutputGeneration`, the outputs of that one demand, the rig edit generation, and the bytes the request pins. |
+| `RigExecExplicitJobKey` | The exact identity the admission is keyed and coalesced by: rig, exact time, whole generation. |
+| `AdmitExplicitOutput` | Reserves a job slot and the request's bytes, then queues the work. Returns false, having reserved nothing, when the request has no work or no output, mixes rig identities or compile epochs, is under a stale edit generation, passes the per-rig job cap or the pool's byte cap, or the pool is stopping. |
+| `RigExecExplicitWork` | The job body: serial, from values captured at admission, no live stage, evaluator or registry access, reporting a `RigExecExplicitOutcome` the way warm work reports its disposition. |
+| `IsExplicitRequestCurrent`, `CurrentExplicitFenceToken` | The scheduler's half of the publish fence: the rig's edit generation and the time's fence token. The default frame has a token of its own, re-issued by `CancelGenerationTimes`, because a scoped edit moves its inputs too. |
+| `ExplicitInFlightCount`, `ReservedExplicitBytes`, `ReservedExplicitBytesFor`, `QueuedExplicitKeys`, `InFlightExplicitKeys` | What a rig has in flight, in jobs and in reserved bytes, and the exact keys behind them. |
+| `SetExplicitPerRigJobCap`, `SetExplicitByteCap` | The two bounds, independent of the warm job cap: how many requests one rig may hold, and how many bytes the pool may hold reserved across every rig. |
+
+- **Explicit demand is not warming.** `RIGEXEC_FRAME_CACHE=off`, `warm-off`,
+  and `RIGEXEC_ENABLE_PARALLEL_EVAL=0` close speculative warming; they do not
+  close admission, because a frame a host asked for is not a guess. A host
+  that needs the answer on its own thread still evaluates live: the pool runs
+  work whose result is published behind the fences and read later.
+- **Coalescing is exact.** Two admissions merge only when the rig, the exact
+  time and every generation field agree. The default frame never merges with
+  frame zero, a subframe step is its own job, and a different program, input,
+  preview or history revision is a different job. The warm path's rounded
+  `(rig, time value)` key never merges an explicit request, in either
+  direction.
+- **Fairness and bounds.** Warm rank is the priority (neighbors before
+  sweep); explicit rank is the job's ordinal within its rig, so two rigs take
+  turns instead of one rig's burst running first. Every queued job carries its
+  reservation, and every terminal path releases it -- published, declined
+  inside, threw, dropped stale, purged by `CancelGeneration`,
+  `CancelGenerationTimes` or `ResetRig`, or dropped at shutdown -- so
+  `ReservedExplicitBytes` is zero once the queue has drained. Byte counts come
+  from `RigExecPayloadByteCount`, which refuses an overflowing element count
+  before anything allocates.
+- **The counters split by class.** `RigExecBackgroundSchedulerStats` keeps the
+  warm equations as they were and adds the `explicit*` counters beside them;
+  the transition hook tags every move with its class and says when the time
+  names no frame at all.

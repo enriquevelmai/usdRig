@@ -34,6 +34,13 @@
 //   * FAIRNESS. One worker preserves the pop order exactly (neighbors
 //     closest-first, then sweep); under a two-worker flood both rigs
 //     still complete every job and the books balance.
+//   * EXPLICIT. Explicit output admission shares the pool: it runs ahead of
+//     warming, is keyed exactly (rig, exact output time, whole captured
+//     generation) and coalesces only on that key, stays eligible when
+//     speculative warming is off, takes the rigs in turn, holds a bounded job
+//     and byte reservation that every terminal path releases, and is fenced
+//     by the same generation and per-time tokens -- with a token of its own
+//     for the default frame.
 //   * BUDGET. The sampling budget bounds factory invocations per trigger;
 //     the millisecond stop binds sampling; already-queued merges consume
 //     nothing; the unlimited default preserves the full burst shape.
@@ -1701,6 +1708,168 @@ TestDeclinedEnqueuesSplitByReason()
     ScopedFrameCacheMode on("on");
     if (!RigExecBackgroundWarmingEnabled()) {
         std::printf("SKIP TestDeclinedEnqueuesSplitByReason: "
+// ---------------------------------------------------------------------------
+// EXPLICIT. Explicit output admission shares the pool with warming.
+// ---------------------------------------------------------------------------
+
+// An explicit request for one rig, exact time and whole captured generation,
+// with \p outputCount outputs of one rig identity and compile epoch.
+RigExecExplicitRequest
+MakeExplicitRequest(const SdfPath &rig, RigExecOutputTime time,
+                    uint64_t programIdentity = 1, uint64_t inputRevision = 0,
+                    uint64_t previewRevision = 0, uint64_t historyRevision = 0,
+                    size_t reservationBytes = 0, size_t outputCount = 1)
+{
+    RigExecExplicitRequest request;
+    request.rig = rig;
+    request.time = time;
+    request.generation.programIdentity = programIdentity;
+    request.generation.inputRevision = inputRevision;
+    request.generation.previewRevision = previewRevision;
+    request.generation.historyRevision = historyRevision;
+    request.reservationBytes = reservationBytes;
+    for (size_t i = 0; i < outputCount; ++i) {
+        RigExecOutputHandle handle;
+        handle.rigIdentity = rig.GetString();
+        handle.compileEpoch = programIdentity;
+        handle.semanticKey = "/Out/out" + std::to_string(i);
+        handle.type = RigExecPayloadText::point3;
+        handle.readPhase = "final";
+        request.outputs.push_back(handle);
+    }
+    return request;
+}
+
+// An exact output time: the default frame, or \p timeCode.
+RigExecOutputTime
+NumericTime(double timeCode)
+{
+    RigExecOutputTime time;
+    RigExecOutputTime::TryTimeCode(timeCode, &time);
+    return time;
+}
+
+// One ordered log shared by warm and explicit work: each job names itself, so
+// a mixed-class test asserts the whole pop order at once.
+class OrderLog {
+public:
+    RigExecWarmWork WarmWork(const std::string &label)
+    {
+        return [this, label](const RigExecWarmRequest &) {
+            Add(label);
+            return RigExecWarmOutcome::Published;
+        };
+    }
+    RigExecExplicitWork ExplicitWork(const std::string &label)
+    {
+        return [this, label](const RigExecExplicitRequest &) {
+            Add(label);
+            return RigExecWarmOutcome::Published;
+        };
+    }
+
+    std::vector<std::string> Entries() const
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _entries;
+    }
+
+private:
+    void Add(const std::string &label)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _entries.push_back(label);
+    }
+
+    mutable std::mutex _mutex;
+    std::vector<std::string> _entries;
+};
+
+// One executed explicit job, as the recording work observed it.
+struct ExplicitRun {
+    SdfPath rig;
+    double time = 0.0;
+    bool timeIsDefault = false;
+    uint64_t programIdentity = 0;
+    size_t outputs = 0;
+    size_t reservationBytes = 0;
+    RigExecWarmFenceToken fenceToken = 0;
+    bool serialActive = false;
+    bool currentAtPublish = false;
+};
+
+// Records explicit runs, and can publish only through the publish fence the
+// way the production work does: ask IsExplicitRequestCurrent, decline when it
+// says the request is gone.
+class ExplicitRecorder {
+public:
+    explicit ExplicitRecorder(
+        const RigExecBackgroundScheduler *scheduler = nullptr)
+        : _scheduler(scheduler)
+    {
+    }
+
+    RigExecExplicitWork
+    Work(RigExecWarmOutcome outcome = RigExecWarmOutcome::Published)
+    {
+        return [this, outcome](const RigExecExplicitRequest &request) {
+            ExplicitRun run;
+            run.rig = request.rig;
+            run.timeIsDefault = request.time.IsDefault();
+            run.time = run.timeIsDefault ? 0.0 : request.time.TimeCode();
+            run.programIdentity = request.generation.programIdentity;
+            run.outputs = request.outputs.size();
+            run.reservationBytes = request.reservationBytes;
+            run.fenceToken = request.fenceToken;
+            run.serialActive = RigExecFrozenSerialActive();
+            run.currentAtPublish =
+                _scheduler ? _scheduler->IsExplicitRequestCurrent(request)
+                           : true;
+            std::lock_guard<std::mutex> lock(_mutex);
+            _runs.push_back(run);
+            if (run.currentAtPublish) {
+                return outcome;
+            }
+            return RigExecWarmOutcome::DeclinedGeneration;
+        };
+    }
+
+    // A work closure that throws after recording: the books must still land.
+    RigExecExplicitWork ThrowingWork()
+    {
+        return
+            [this](
+                const RigExecExplicitRequest &request) -> RigExecWarmOutcome {
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    _runs.push_back(ExplicitRun());
+                }
+                throw std::runtime_error("test throw");
+            };
+    }
+
+    std::vector<ExplicitRun> Runs() const
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _runs;
+    }
+
+private:
+    mutable std::mutex _mutex;
+    std::vector<ExplicitRun> _runs;
+    const RigExecBackgroundScheduler *_scheduler;
+};
+
+// The pool runs every explicit request ahead of every warm job, in the order
+// the queue ranks them: explicit first, then warm neighbors, then sweep.
+void
+TestExplicitOutputRunsAheadOfWarming()
+{
+    std::printf("progress: TestExplicitOutputRunsAheadOfWarming\n");
+    std::fflush(stdout);
+    ScopedFrameCacheMode on("on");
+    if (!RigExecBackgroundWarmingEnabled()) {
+        std::printf("SKIP TestExplicitOutputRunsAheadOfWarming: "
                     "warming unavailable in this process\n");
         return;
     }
@@ -1852,6 +2021,694 @@ TestTriggerStopsSplitByCause()
           scheduler.Stats().triggerStopsStale +
               scheduler.Stats().triggerStopsBudget +
               scheduler.Stats().triggerStopsCap);
+    OrderLog log;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    CHECK(scheduler.Enqueue(rig, UsdTimeCode(1.0), RigExecWarmPriority::Sweep,
+                            current, log.WarmWork("W1")));
+    CHECK(scheduler.Enqueue(rig, UsdTimeCode(2.0),
+                            RigExecWarmPriority::Neighbor, current,
+                            log.WarmWork("W2")));
+    RigExecExplicitRequest five = MakeExplicitRequest(rig, NumericTime(5.0));
+    five.editGeneration = current;
+    RigExecExplicitRequest def = MakeExplicitRequest(rig, RigExecOutputTime());
+    def.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(five, log.ExplicitWork("E5")));
+    CHECK(scheduler.AdmitExplicitOutput(def, log.ExplicitWork("ED")));
+    CHECK(scheduler.Stats().queuedDepth == 4);
+    CHECK(scheduler.DrainQueueForTesting() == 4);
+    const std::vector<std::string> entries = log.Entries();
+    CHECK(entries == std::vector<std::string>({"E5", "ED", "W2", "W1"}));
+    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.completed == 2);
+    CHECK(stats.explicitCompleted == 2);
+    CHECK(stats.published == 2);
+    CHECK(stats.explicitPublished == 2);
+    CHECK(stats.explicitAccepted == 2);
+    CHECK(stats.queuedDepth == 0);
+    // The warm balance equation still counts warm accepts only, and the
+    // explicit one balances against its own counters.
+    CHECK(stats.published + stats.declinedInvalid + stats.declinedGeneration +
+              stats.droppedStale + stats.canceled + stats.shed +
+              stats.droppedAtShutdown + stats.queuedDepth + stats.running ==
+          2);
+    CHECK(stats.explicitAccepted - stats.explicitCoalesced ==
+          stats.explicitPublished + stats.explicitDeclinedInvalid +
+              stats.explicitDeclinedGeneration + stats.explicitDroppedStale +
+              stats.explicitCanceled + stats.explicitDroppedAtShutdown +
+              stats.explicitQueuedDepth + stats.explicitRunning);
+}
+
+// The exact time is an identity: the default frame, frame zero, negative zero,
+// a subframe and a negative frame are five different demands, and negative
+// zero coalesces with zero because the time normalizes it.
+void
+TestExplicitKeysKeepDefaultZeroAndSubframesApart()
+{
+    ScopedFrameCacheMode on("on");
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    const RigExecOutputTime times[] = {RigExecOutputTime(), NumericTime(0.0),
+                                       NumericTime(-0.0), NumericTime(3.5),
+                                       NumericTime(-2.25)};
+    size_t accepted = 0;
+    for (const RigExecOutputTime &time : times) {
+        RigExecExplicitRequest request = MakeExplicitRequest(rig, time);
+        request.editGeneration = current;
+        accepted +=
+            scheduler.AdmitExplicitOutput(request, recorder.Work()) ? 1 : 0;
+    }
+    CHECK(accepted == 5);
+    CHECK(scheduler.Stats().explicitCoalesced == 1);
+    const std::vector<RigExecExplicitJobKey> keys =
+        scheduler.QueuedExplicitKeys(rig);
+    CHECK(keys.size() == 4);
+    // Key order is rig, then the exact time with the default frame first.
+    CHECK(keys[0].time.IsDefault());
+    CHECK(!keys[1].time.IsDefault() && keys[1].time.TimeCode() == -2.25);
+    CHECK(!keys[2].time.IsDefault() && keys[2].time.TimeCode() == 0.0);
+    CHECK(!keys[3].time.IsDefault() && keys[3].time.TimeCode() == 3.5);
+    CHECK(scheduler.DrainQueueForTesting() == 4);
+    CHECK(recorder.Runs().size() == 4);
+}
+
+// Provenance is part of the key: a different program, input, preview or
+// history revision is a second job, and warming a time never coalesces with
+// an explicit request for the same time.
+void
+TestExplicitGenerationFieldsNeverCoalesce()
+{
+    ScopedFrameCacheMode on("on");
+    if (!RigExecBackgroundWarmingEnabled()) {
+        std::printf("SKIP TestExplicitGenerationFieldsNeverCoalesce: "
+                    "warming unavailable in this process\n");
+        return;
+    }
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder;
+    OrderLog log;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    const RigExecOutputTime five = NumericTime(5.0);
+    const uint64_t generations[][4] = {
+        {1, 0, 0, 0}, {2, 0, 0, 0}, {1, 1, 0, 0}, {1, 0, 1, 0}, {1, 0, 0, 1}};
+    for (const auto &generation : generations) {
+        RigExecExplicitRequest request =
+            MakeExplicitRequest(rig, five, generation[0], generation[1],
+                                generation[2], generation[3]);
+        request.editGeneration = current;
+        CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+    }
+    // The identical key coalesces: the same demand twice is one job.
+    RigExecExplicitRequest again = MakeExplicitRequest(rig, five, 1, 0, 0, 0);
+    again.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(again, recorder.Work()));
+    CHECK(scheduler.Stats().explicitCoalesced == 1);
+    CHECK(scheduler.QueuedExplicitKeys(rig).size() == 5);
+    // A warm job for the same rig and time is a separate job: the rounded
+    // (rig, time) warm key never merges an explicit request.
+    CHECK(scheduler.Enqueue(rig, UsdTimeCode(5.0), RigExecWarmPriority::Sweep,
+                            current, log.WarmWork("W5")));
+    CHECK(scheduler.Stats().coalesced == 0);
+    CHECK(scheduler.Stats().upgraded == 0);
+    CHECK(scheduler.QueuedExplicitKeys(rig).size() == 5);
+    CHECK(scheduler.Stats().queuedDepth == 6);
+    CHECK(scheduler.DrainQueueForTesting() == 6);
+    CHECK(recorder.Runs().size() == 5);
+}
+
+// Explicit demand is eligible whatever the speculative-warming switches say:
+// warm-off and off close the warm queue only, and a host that asked for a
+// frame still gets it from the pool.
+void
+TestExplicitDemandIsEligibleWithWarmingOff()
+{
+    for (const char *mode : {"warm-off", "off"}) {
+        ScopedFrameCacheMode closed(mode);
+        CHECK(!RigExecBackgroundWarmingEnabled());
+        RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+        ExplicitRecorder recorder(&scheduler);
+        OrderLog warm;
+        const SdfPath rig("/Asset/Rig");
+        const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+        CHECK(!scheduler.Enqueue(rig, UsdTimeCode(3.0),
+                                 RigExecWarmPriority::Neighbor, current,
+                                 warm.WarmWork("W3")));
+        const std::vector<UsdTimeCode> sweep{UsdTimeCode(4.0)};
+        CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep,
+                               RigExecWarmJobFactory()) == 0);
+        RigExecExplicitRequest request =
+            MakeExplicitRequest(rig, NumericTime(4.0));
+        request.editGeneration = current;
+        request.reservationBytes = 24 * 8;
+        CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+        CHECK(scheduler.ReservedExplicitBytes() == 24 * 8);
+        CHECK(scheduler.RunNextQueuedForTesting());
+        CHECK(recorder.Runs().size() == 1);
+        CHECK(recorder.Runs()[0].currentAtPublish);
+        CHECK(scheduler.Stats().explicitPublished == 1);
+        CHECK(scheduler.ReservedExplicitBytes() == 0);
+        // The fence still works with warming off.
+        scheduler.CancelGeneration(rig);
+        CHECK(scheduler.CurrentGeneration(rig) == current + 1);
+    }
+}
+
+// The explicit class is fair per rig: with two rigs queued, the pool takes
+// them in turn instead of draining the first rig's whole burst first.
+void
+TestExplicitRequestsTakeTheRigsInTurn()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    OrderLog log;
+    const SdfPath rigA("/Asset/RigA");
+    const SdfPath rigB("/Asset/RigB");
+    const RigExecFrameGeneration currentA = scheduler.CurrentGeneration(rigA);
+    const RigExecFrameGeneration currentB = scheduler.CurrentGeneration(rigB);
+    for (int frame = 1; frame <= 3; ++frame) {
+        RigExecExplicitRequest request =
+            MakeExplicitRequest(rigA, NumericTime(double(frame)));
+        request.editGeneration = currentA;
+        CHECK(scheduler.AdmitExplicitOutput(
+            request, log.ExplicitWork("A" + std::to_string(frame))));
+    }
+    for (int frame = 1; frame <= 3; ++frame) {
+        RigExecExplicitRequest request =
+            MakeExplicitRequest(rigB, NumericTime(double(frame)));
+        request.editGeneration = currentB;
+        CHECK(scheduler.AdmitExplicitOutput(
+            request, log.ExplicitWork("B" + std::to_string(frame))));
+    }
+    CHECK(scheduler.ExplicitInFlightCount(rigA) == 3);
+    CHECK(scheduler.ExplicitInFlightCount(rigB) == 3);
+    CHECK(scheduler.DrainQueueForTesting() == 6);
+    const std::vector<std::string> entries = log.Entries();
+    CHECK(entries ==
+          std::vector<std::string>({"A1", "B1", "A2", "B2", "A3", "B3"}));
+    CHECK(scheduler.ExplicitInFlightCount(rigA) == 0);
+}
+
+// An admission with no work, no output, or handles from two different
+// provenances declines and reserves nothing: a mixed group would answer two
+// compile epochs from one job.
+void
+TestExplicitDeclinesForNoWorkNoOutputOrMixedProvenance()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest request =
+        MakeExplicitRequest(rig, NumericTime(3.0),
+                            /*programIdentity=*/1,
+                            /*inputRevision=*/0,
+                            /*previewRevision=*/0,
+                            /*historyRevision=*/0,
+                            /*reservationBytes=*/64);
+    request.editGeneration = current;
+    CHECK(!scheduler.AdmitExplicitOutput(request, RigExecExplicitWork()));
+    RigExecExplicitRequest noOutputs = MakeExplicitRequest(
+        rig, NumericTime(3.0), 1, 0, 0, 0, 64, /*outputCount=*/0);
+    noOutputs.editGeneration = current;
+    CHECK(!scheduler.AdmitExplicitOutput(noOutputs, recorder.Work()));
+    RigExecExplicitRequest mixedEpoch = MakeExplicitRequest(
+        rig, NumericTime(3.0), 1, 0, 0, 0, 64, /*outputCount=*/2);
+    mixedEpoch.editGeneration = current;
+    mixedEpoch.outputs.back().compileEpoch = 2;
+    CHECK(!scheduler.AdmitExplicitOutput(mixedEpoch, recorder.Work()));
+    RigExecExplicitRequest mixedRig = MakeExplicitRequest(
+        rig, NumericTime(3.0), 1, 0, 0, 0, 64, /*outputCount=*/2);
+    mixedRig.editGeneration = current;
+    mixedRig.outputs.back().rigIdentity = "/Asset/Other";
+    CHECK(!scheduler.AdmitExplicitOutput(mixedRig, recorder.Work()));
+    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.explicitDeclined == 4);
+    CHECK(stats.explicitAccepted == 0);
+    CHECK(stats.queuedDepth == 0);
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+}
+
+// The explicit caps are independent of the warm cap: the per-rig explicit cap
+// declines, a stale edit generation declines, and a freed slot admits again.
+void
+TestExplicitCapAndStaleGenerationDecline()
+{
+    RigExecBackgroundScheduler probe;
+    CHECK(probe.GetExplicitPerRigJobCap() ==
+          kRigExecBackgroundSchedulerDefaultExplicitPerRigJobs);
+    CHECK(probe.GetExplicitByteCap() ==
+          kRigExecBackgroundSchedulerDefaultExplicitBytes);
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    scheduler.SetExplicitPerRigJobCap(2);
+    CHECK(scheduler.GetExplicitPerRigJobCap() == 2);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    for (int frame = 1; frame <= 3; ++frame) {
+        RigExecExplicitRequest request =
+            MakeExplicitRequest(rig, NumericTime(double(frame)));
+        request.editGeneration = current;
+        const bool expected = frame <= 2;
+        CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()) ==
+              expected);
+    }
+    CHECK(scheduler.Stats().explicitDeclined == 1);
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 2);
+    // A run frees a slot.
+    CHECK(scheduler.RunNextQueuedForTesting());
+    RigExecExplicitRequest fourth = MakeExplicitRequest(rig, NumericTime(4.0));
+    fourth.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(fourth, recorder.Work()));
+    // A stale edit generation declines: the compiled rig moved under it.
+    scheduler.CancelGeneration(rig);
+    RigExecExplicitRequest stale = MakeExplicitRequest(rig, NumericTime(7.0));
+    stale.editGeneration = current;
+    CHECK(!scheduler.AdmitExplicitOutput(stale, recorder.Work()));
+    CHECK(scheduler.Stats().explicitDeclined == 2);
+    // The cancel purged the rig's queued explicit jobs too.
+    CHECK(scheduler.Stats().explicitCanceled == 2);
+    CHECK(scheduler.QueuedExplicitKeys(rig).empty());
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 0);
+    RigExecExplicitRequest fresh = MakeExplicitRequest(rig, NumericTime(7.0));
+    fresh.editGeneration = scheduler.CurrentGeneration(rig);
+    CHECK(scheduler.AdmitExplicitOutput(fresh, recorder.Work()));
+}
+
+// The byte reservation is a bound checked before anything queues: a request
+// past it declines, and running or purging a job frees its bytes.
+void
+TestExplicitByteReservationDeclinesPastTheCap()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    scheduler.SetExplicitByteCap(256);
+    CHECK(scheduler.GetExplicitByteCap() == 256);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest tooBig = MakeExplicitRequest(
+        rig, NumericTime(1.0), 1, 0, 0, 0, /*reservationBytes=*/257);
+    tooBig.editGeneration = current;
+    CHECK(!scheduler.AdmitExplicitOutput(tooBig, recorder.Work()));
+    CHECK(scheduler.Stats().explicitDeclinedBytes == 1);
+    for (int frame = 1; frame <= 2; ++frame) {
+        RigExecExplicitRequest request = MakeExplicitRequest(
+            rig, NumericTime(double(frame)), 1, 0, 0, 0, /*bytes=*/128);
+        request.editGeneration = current;
+        CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+    }
+    CHECK(scheduler.ReservedExplicitBytes() == 256);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 256);
+    RigExecExplicitRequest oneMore =
+        MakeExplicitRequest(rig, NumericTime(3.0), 1, 0, 0, 0, /*bytes=*/1);
+    oneMore.editGeneration = current;
+    CHECK(!scheduler.AdmitExplicitOutput(oneMore, recorder.Work()));
+    CHECK(scheduler.Stats().explicitDeclinedBytes == 2);
+    // A ran job releases its bytes; then the room is there.
+    CHECK(scheduler.RunNextQueuedForTesting());
+    CHECK(scheduler.ReservedExplicitBytes() == 128);
+    CHECK(scheduler.AdmitExplicitOutput(oneMore, recorder.Work()));
+    CHECK(scheduler.ReservedExplicitBytes() == 129);
+    // A purge releases them too.
+    scheduler.CancelGenerationTimes(rig, {UsdTimeCode(2.0), UsdTimeCode(1.0)});
+    CHECK(scheduler.ReservedExplicitBytes() == 1);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 1);
+    // The reservation is the payload arithmetic the contract declares: a
+    // 100-point Point3 payload is 2400 bytes, and an overflowing count is
+    // refused before any allocation.
+    uint64_t bytes = 0;
+    CHECK(RigExecPayloadByteCount(RigExecPayloadKind::Point3, 100, &bytes));
+    CHECK(bytes == 2400);
+    CHECK(!RigExecPayloadByteCount(RigExecPayloadKind::Point3,
+                                   std::numeric_limits<uint64_t>::max(),
+                                   &bytes));
+}
+
+// Every terminal path releases the reservation: published, declined inside,
+// threw, and purged all leave no bytes held, and the drop-at-shutdown path
+// runs the same retire for a job still queued at destruction.
+void
+TestExplicitReservationReleasesOnEveryPath()
+{
+    {
+        RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+        const SdfPath rig("/Asset/Rig");
+        const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+        ExplicitRecorder recorder;
+        const double frames[] = {1.0, 2.0, 3.0, 4.0, 5.0};
+        RigExecExplicitWork declined = [](const RigExecExplicitRequest &) {
+            return RigExecWarmOutcome::DeclinedInvalid;
+        };
+        const RigExecExplicitWork works[] = {recorder.Work(),
+                                             recorder.ThrowingWork(), declined,
+                                             recorder.Work(), recorder.Work()};
+        for (size_t i = 0; i < 5; ++i) {
+            RigExecExplicitRequest request = MakeExplicitRequest(
+                rig, NumericTime(frames[i]), 1, 0, 0, 0, /*bytes=*/64);
+            request.editGeneration = current;
+            CHECK(scheduler.AdmitExplicitOutput(request, works[i]));
+        }
+        CHECK(scheduler.ReservedExplicitBytes() == 5 * 64);
+        // Pop them one at a time: published, threw, declined inside, ran.
+        for (int pop = 0; pop < 4; ++pop) {
+            CHECK(scheduler.RunNextQueuedForTesting());
+        }
+        const RigExecBackgroundSchedulerStats running = scheduler.Stats();
+        CHECK(running.explicitPublished == 2);
+        CHECK(running.explicitDeclinedInvalid == 2);
+        CHECK(running.explicitReservedBytes == 64);
+        // A scoped purge retires the job that is still queued.
+        CHECK(scheduler.CancelGenerationTimes(rig, {UsdTimeCode(5.0)}) == 1);
+        CHECK(scheduler.Stats().explicitCanceled == 1);
+        CHECK(scheduler.ReservedExplicitBytes() == 0);
+        CHECK(scheduler.QueuedExplicitKeys(rig).empty());
+    }
+    // The shutdown retire path is the same one, and it runs for a job that
+    // never started.
+    TransitionRecorder transitions;
+    {
+        RigExecBackgroundScheduler stopping(/*workerCount=*/0);
+        stopping.SetTransitionHook(transitions.Hook());
+        const SdfPath rig("/Asset/Rig");
+        const RigExecFrameGeneration current = stopping.CurrentGeneration(rig);
+        ExplicitRecorder recorder;
+        RigExecExplicitRequest request =
+            MakeExplicitRequest(rig, RigExecOutputTime(), 1, 0, 0, 0, 64);
+        request.editGeneration = current;
+        CHECK(stopping.AdmitExplicitOutput(request, recorder.Work()));
+        CHECK(stopping.ReservedExplicitBytes() == 64);
+    }
+    const std::vector<RigExecWarmTransition> lost = transitions.Transitions();
+    size_t droppedAtShutdown = 0;
+    for (const RigExecWarmTransition &transition : lost) {
+        if (transition.kind == RigExecWarmTransitionKind::DroppedAtShutdown) {
+            ++droppedAtShutdown;
+            CHECK(transition.workClass == RigExecBackgroundWorkClass::Explicit);
+            CHECK(transition.timeIsDefault);
+        }
+    }
+    CHECK(droppedAtShutdown == 1);
+}
+
+// The books balance across a cancel racing the pool: every explicit job lands
+// in exactly one terminal state, and no byte stays reserved.
+void
+TestExplicitBalancesUnderACancelRace()
+{
+    std::printf("progress: TestExplicitBalancesUnderACancelRace\n");
+    std::fflush(stdout);
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/2);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    size_t accepted = 0;
+    for (int frame = 1; frame <= 32; ++frame) {
+        RigExecExplicitRequest request = MakeExplicitRequest(
+            rig, NumericTime(double(frame)), 1, 0, 0, 0, /*bytes=*/128);
+        request.editGeneration = current;
+        accepted +=
+            scheduler.AdmitExplicitOutput(request, recorder.Work()) ? 1 : 0;
+    }
+    CHECK(accepted == 32);
+    CHECK(scheduler.ReservedExplicitBytes() > 0);
+    scheduler.CancelGeneration(rig);
+    scheduler.WaitUntilIdle();
+    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.queuedDepth == 0);
+    CHECK(stats.running == 0);
+    CHECK(stats.explicitQueuedDepth == 0);
+    CHECK(stats.explicitRunning == 0);
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 0);
+    CHECK(stats.explicitAccepted - stats.explicitCoalesced ==
+          stats.explicitPublished + stats.explicitDeclinedInvalid +
+              stats.explicitDeclinedGeneration + stats.explicitDroppedStale +
+              stats.explicitCanceled + stats.explicitDroppedAtShutdown +
+              stats.explicitQueuedDepth + stats.explicitRunning);
+    CHECK(stats.explicitPublished + stats.explicitDeclinedInvalid +
+              stats.explicitDeclinedGeneration ==
+          stats.explicitCompleted);
+    CHECK(recorder.Runs().size() == stats.explicitCompleted);
+}
+
+// Scoped cancellation re-fences explicit requests, including the default
+// frame, which has no numeric time to key on: an old request never answers,
+// and the re-admitted one carries the fresh token.
+void
+TestScopedCancellationRefencesExplicitRequests()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder(&scheduler);
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest five =
+        MakeExplicitRequest(rig, NumericTime(5.0), 1, 0, 0, 0, /*bytes=*/16);
+    five.editGeneration = current;
+    RigExecExplicitRequest def =
+        MakeExplicitRequest(rig, RigExecOutputTime(), 1, 0, 0, 0, /*bytes=*/16);
+    def.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(five, recorder.Work()));
+    CHECK(scheduler.AdmitExplicitOutput(def, recorder.Work()));
+    CHECK(scheduler.ReservedExplicitBytes() == 32);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, NumericTime(5.0)) == 0);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, RigExecOutputTime()) == 0);
+    // A patch at frame 9 moves the default frame's inputs, so the
+    // default-frame demand is retired even though no listed time names it;
+    // frame 5 keeps its token, its job and its fence.
+    CHECK(scheduler.CancelGenerationTimes(rig, {UsdTimeCode(9.0)}) == 1);
+    CHECK(scheduler.QueuedExplicitKeys(rig).size() == 1);
+    CHECK(scheduler.ReservedExplicitBytes() == 16);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, NumericTime(5.0)) == 0);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, RigExecOutputTime()) != 0);
+    CHECK(scheduler.IsExplicitRequestCurrent(five));
+    CHECK(!scheduler.IsExplicitRequestCurrent(def));
+    // A patch at frame 5 retires frame 5's job too.
+    CHECK(scheduler.CancelGenerationTimes(rig, {UsdTimeCode(5.0)}) == 1);
+    CHECK(scheduler.Stats().explicitCanceled == 2);
+    CHECK(scheduler.QueuedExplicitKeys(rig).empty());
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    CHECK(scheduler.CurrentGeneration(rig) == current);
+    // The old requests are fenced out: their token is superseded.
+    CHECK(!scheduler.IsExplicitRequestCurrent(five));
+    CHECK(!scheduler.IsExplicitRequestCurrent(def));
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, NumericTime(5.0)) != 0);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, RigExecOutputTime()) != 0);
+    // Re-admitted under the new tokens they run and publish.
+    RigExecExplicitRequest freshFive =
+        MakeExplicitRequest(rig, NumericTime(5.0));
+    freshFive.editGeneration = current;
+    RigExecExplicitRequest freshDef =
+        MakeExplicitRequest(rig, RigExecOutputTime());
+    freshDef.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(freshFive, recorder.Work()));
+    CHECK(scheduler.AdmitExplicitOutput(freshDef, recorder.Work()));
+    CHECK(scheduler.DrainQueueForTesting() == 2);
+    const std::vector<ExplicitRun> runs = recorder.Runs();
+    CHECK(runs.size() == 2);
+    CHECK(runs[0].currentAtPublish);
+    CHECK(runs[0].fenceToken != 0);
+    CHECK(runs[1].currentAtPublish);
+    CHECK(runs[1].timeIsDefault);
+    CHECK(scheduler.Stats().explicitPublished == 2);
+    CHECK(scheduler.Stats().explicitDeclinedGeneration == 0);
+}
+
+// Deactivation drops the rig's explicit state with its warm state: queued
+// jobs, in-flight count, reservations and fence tokens go, the generation
+// stands, and nothing leaks into the reactivated rig.
+void
+TestResetRigClearsExplicitState()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest request =
+        MakeExplicitRequest(rig, NumericTime(5.0), 1, 0, 0, 0, /*bytes=*/64);
+    request.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+    CHECK(scheduler.CancelGenerationTimes(rig, {UsdTimeCode(5.0)}) == 1);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, NumericTime(5.0)) != 0);
+    RigExecExplicitRequest requeue =
+        MakeExplicitRequest(rig, NumericTime(6.0), 1, 0, 0, 0, /*bytes=*/64);
+    requeue.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(requeue, recorder.Work()));
+    CHECK(scheduler.ReservedExplicitBytes() == 64);
+    scheduler.ResetRig(rig);
+    CHECK(scheduler.QueuedExplicitKeys(rig).empty());
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 0);
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 0);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, NumericTime(5.0)) == 0);
+    CHECK(scheduler.CurrentGeneration(rig) == current);
+    RigExecExplicitRequest again = MakeExplicitRequest(rig, NumericTime(5.0));
+    again.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(again, recorder.Work()));
+    CHECK(scheduler.IsExplicitRequestCurrent(again));
+    CHECK(scheduler.DrainQueueForTesting() == 1);
+    CHECK(recorder.Runs().back().currentAtPublish);
+}
+
+// A cancellation landing while an explicit job runs must not release its
+// reservation twice: the running job releases its own bytes when it finishes.
+void
+TestExplicitMidRunCancelKeepsTheBooksBalanced()
+{
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool started = false;
+    bool released = false;
+
+    RigExecBackgroundScheduler scheduler(1);
+    const SdfPath rig("/Rig/Mid");
+    RigExecExplicitRequest running = MakeExplicitRequest(rig, NumericTime(4.0));
+    running.reservationBytes = 4096;
+    CHECK(scheduler.AdmitExplicitOutput(
+        running, [&](const RigExecExplicitRequest &request) {
+            (void)request;
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                started = true;
+            }
+            gateCv.notify_all();
+            std::unique_lock<std::mutex> lock(gateMutex);
+            gateCv.wait(lock, [&] { return released; });
+            return RigExecExplicitOutcome::Published;
+        }));
+
+    // The cancel lands while the job is held in its wait, so the purge is
+    // definitely mid-run with nothing queued behind it. The release then
+    // arrives from the same thread, so WaitUntilIdle below cannot deadlock
+    // however the threads interleave.
+    std::thread releaser([&] {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        gateCv.wait(lock, [&] { return started; });
+        lock.unlock();
+        scheduler.CancelGeneration(rig);
+        released = true;
+        gateCv.notify_all();
+    });
+    releaser.join();
+    scheduler.WaitUntilIdle();
+
+    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.explicitAccepted == 1);
+    CHECK(stats.explicitCompleted == 1);
+    CHECK(stats.explicitReservedBytes == 0);
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    CHECK(scheduler.InFlightExplicitKeys(rig).empty());
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 0);
+
+    // The books still admit a fresh request under the new generation.
+    ExplicitRecorder recorder(&scheduler);
+    RigExecExplicitRequest again = MakeExplicitRequest(rig, NumericTime(4.0));
+    again.editGeneration = scheduler.CurrentGeneration(rig);
+    again.reservationBytes = 4096;
+    CHECK(scheduler.AdmitExplicitOutput(again, recorder.Work()));
+    scheduler.WaitUntilIdle();
+    CHECK(scheduler.Stats().explicitReservedBytes == 0);
+    CHECK(recorder.Runs().back().currentAtPublish);
+}
+
+// Playback advance sheds speculative sweep only: a frame a host asked for is
+// never shed, and its reservation stands until the job runs.
+void
+TestPlaybackAdvanceNeverShedsExplicitOutput()
+{
+    ScopedFrameCacheMode on("on");
+    if (!RigExecBackgroundWarmingEnabled()) {
+        std::printf("SKIP TestPlaybackAdvanceNeverShedsExplicitOutput: "
+                    "warming unavailable in this process\n");
+        return;
+    }
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    OrderLog warm;
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    CHECK(scheduler.Enqueue(rig, UsdTimeCode(9.0), RigExecWarmPriority::Sweep,
+                            current, warm.WarmWork("W9")));
+    RigExecExplicitRequest request =
+        MakeExplicitRequest(rig, NumericTime(9.0), 1, 0, 0, 0, /*bytes=*/64);
+    request.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+    CHECK(scheduler.NotePlaybackAdvanced(rig, UsdTimeCode(10.0)) == 1);
+    CHECK(scheduler.Stats().shed == 1);
+    CHECK(scheduler.QueuedExplicitKeys(rig).size() == 1);
+    CHECK(scheduler.ReservedExplicitBytes() == 64);
+    CHECK(scheduler.DrainQueueForTesting() == 1);
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    CHECK(recorder.Runs().size() == 1);
+}
+
+// The transition hook sees explicit moves, tagged by class, and says when the
+// time names no frame at all.
+void
+TestTransitionHookReportsExplicitMoves()
+{
+    TransitionRecorder transitions;
+    {
+        RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+        scheduler.SetTransitionHook(transitions.Hook());
+        const SdfPath rig("/Asset/Rig");
+        const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+        ExplicitRecorder recorder;
+        RigExecExplicitRequest request = MakeExplicitRequest(
+            rig, RigExecOutputTime(), 1, 0, 0, 0, /*bytes=*/8);
+        request.editGeneration = current;
+        CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+        CHECK(scheduler.RunNextQueuedForTesting());
+    }
+    const std::vector<RigExecWarmTransition> got = transitions.Transitions();
+    CHECK(got.size() == 3);
+    if (got.size() == 3) {
+        CHECK(got[0].kind == RigExecWarmTransitionKind::Queued);
+        CHECK(got[0].workClass == RigExecBackgroundWorkClass::Explicit);
+        CHECK(got[0].timeIsDefault);
+        CHECK(got[1].kind == RigExecWarmTransitionKind::Running);
+        CHECK(got[1].workClass == RigExecBackgroundWorkClass::Explicit);
+        CHECK(got[2].kind == RigExecWarmTransitionKind::Finished);
+        CHECK(got[2].outcome == RigExecWarmOutcome::Published);
+        CHECK(got[2].workClass == RigExecBackgroundWorkClass::Explicit);
+    }
+}
+
+// The work runs on the same serial boundary as warming, receives the request
+// it was admitted with -- its outputs, its generation, its reservation and
+// the stamped token -- and in-flight explicit keys stay visible to a scoped
+// retirement query.
+void
+TestExplicitWorkRunsUnderTheSerialScopeWithItsRequest()
+{
+    std::printf("progress: "
+                "TestExplicitWorkRunsUnderTheSerialScopeWithItsRequest\n");
+    std::fflush(stdout);
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/1);
+    ExplicitRecorder recorder(&scheduler);
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest request = MakeExplicitRequest(
+        rig, NumericTime(-2.5), /*programIdentity=*/7, /*input=*/3,
+        /*preview=*/2, /*history=*/1, /*bytes=*/96, /*outputs=*/4);
+    request.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
+    CHECK(scheduler.InFlightExplicitKeys(rig).size() == 1);
+    scheduler.WaitUntilIdle();
+    const std::vector<ExplicitRun> runs = recorder.Runs();
+    CHECK(runs.size() == 1);
+    CHECK(runs[0].rig == rig);
+    CHECK(!runs[0].timeIsDefault);
+    CHECK(runs[0].time == -2.5);
+    CHECK(runs[0].programIdentity == 7);
+    CHECK(runs[0].outputs == 4);
+    CHECK(runs[0].reservationBytes == 96);
+    CHECK(runs[0].fenceToken == 0);
+    CHECK(runs[0].serialActive);
+    CHECK(runs[0].currentAtPublish);
+    CHECK(!RigExecFrozenSerialActive());
+    CHECK(scheduler.InFlightExplicitKeys(rig).empty());
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
 }
 
 } // namespace
@@ -1892,6 +2749,22 @@ main()
     TestDeclinedEnqueuesSplitByReason();
     TestQueueDepthMaximaAndPrioritySplit();
     TestTriggerStopsSplitByCause();
+    TestExplicitOutputRunsAheadOfWarming();
+    TestExplicitKeysKeepDefaultZeroAndSubframesApart();
+    TestExplicitGenerationFieldsNeverCoalesce();
+    TestExplicitDemandIsEligibleWithWarmingOff();
+    TestExplicitRequestsTakeTheRigsInTurn();
+    TestExplicitDeclinesForNoWorkNoOutputOrMixedProvenance();
+    TestExplicitCapAndStaleGenerationDecline();
+    TestExplicitByteReservationDeclinesPastTheCap();
+    TestExplicitReservationReleasesOnEveryPath();
+    TestExplicitBalancesUnderACancelRace();
+    TestScopedCancellationRefencesExplicitRequests();
+    TestResetRigClearsExplicitState();
+    TestExplicitMidRunCancelKeepsTheBooksBalanced();
+    TestPlaybackAdvanceNeverShedsExplicitOutput();
+    TestTransitionHookReportsExplicitMoves();
+    TestExplicitWorkRunsUnderTheSerialScopeWithItsRequest();
     TestPoolRunsEveryJobExactlyOnce();
     TestThreadedCancelBalancesTheBooks();
     TestShutdownDropsPendingJobs();
