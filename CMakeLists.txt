@@ -1195,6 +1195,13 @@ add_executable(testRigExecOpGraph tests/testRigExecOpGraph.cpp)
 target_link_libraries(testRigExecOpGraph PRIVATE rigExecGraph work Threads::Threads)
 add_test(NAME testRigExecOpGraph COMMAND testRigExecOpGraph)
 
+# The demand contract is header-only and USD-free; rigExecGraph alone compiles it.
+add_executable(testRigExecOutputDemand tests/testRigExecOutputDemand.cpp)
+target_link_libraries(testRigExecOutputDemand PRIVATE rigExecGraph)
+add_test(NAME testRigExecOutputDemand COMMAND testRigExecOutputDemand)
+set_tests_properties(testRigExecOutputDemand PROPERTIES
+    LABELS "rigExecGraph;usd-free;fast")
+
 add_executable(testRigExecExecCrossCheck tests/testRigExecExecCrossCheck.cpp)
 target_link_libraries(testRigExecExecCrossCheck PRIVATE rigExec)
 target_compile_definitions(testRigExecExecCrossCheck PRIVATE ${_rigexec_schema_resource_define})
