@@ -105,6 +105,7 @@ add_library(rigExecScene SHARED
     libs/rigExecScene/geometryGraphBinding.cpp
     libs/rigExecScene/geometrySceneTranslation.cpp
     libs/rigExecScene/jointGroupTranslation.cpp
+    libs/rigExecScene/outputDescriptors.cpp
     libs/rigExecScene/poseCommit.cpp
     libs/rigExecScene/poseGraphBinding.cpp
     libs/rigExecScene/poseSceneTranslation.cpp
@@ -155,6 +156,7 @@ add_library(rigExec SHARED
     libs/rigExec/inputReplay.cpp
     libs/rigExec/scalarReferenceAdapter.cpp
     libs/rigExec/oracleDispatch.cpp
+    libs/rigExec/outputCatalog.cpp
     libs/rigExec/sceneDispatch.cpp
     libs/rigExec/weightField.cpp
     libs/rigExecScene/constraintProgram.cpp
@@ -1265,6 +1267,10 @@ endforeach()
 add_executable(testRigExecGraphBindings tests/testRigExecGraphBindings.cpp)
 target_link_libraries(testRigExecGraphBindings PRIVATE rigExec)
 add_test(NAME testRigExecGraphBindings COMMAND testRigExecGraphBindings)
+
+add_executable(testRigExecOutputCatalog tests/testRigExecOutputCatalog.cpp)
+target_link_libraries(testRigExecOutputCatalog PRIVATE rigExec)
+add_test(NAME testRigExecOutputCatalog COMMAND testRigExecOutputCatalog)
 
 add_executable(testRigExecInputReplayValues tests/testRigExecInputReplayValues.cpp)
 target_link_libraries(testRigExecInputReplayValues PRIVATE rigExec)
@@ -2907,7 +2913,7 @@ foreach(_rigexec_scene_exe IN ITEMS
     testRigExecExecCrossCheckRows testRigExecExternalMovers
     testRigExecFrameCacheCones_Verify testRigExecFrameCacheSparsity
     testRigExecFrozenContext testRigExecGeometryOpsBakedParity
-    testRigExecGeometryProgram testRigExecGraphBindings
+    testRigExecGeometryProgram testRigExecGraphBindings testRigExecOutputCatalog
     testRigExecGroupForwarding testRigExecInputActions testRigExecInputReplayHosting
     testRigExecInteractive testRigExecInteropNotices testRigExecLattice testRigExecLeaves
     testRigExecOneLoopAcceptance testRigExecOpTrace

@@ -116,6 +116,34 @@ decide what to re-evaluate. The mask feeds `RigExecOpCallbacks::active`
 directly: operations it marks 0 are never candidates, and history ticks run
 only the operations a windowed operation depends on.
 
+## Where the entries come from
+
+`RigExecDiscoverOutputs` (`libs/rigExec/outputCatalog.h`) builds the catalog of
+outputs one compiled program epoch can name, straight from the baked program's
+binding tables. Each entry is a semantic address — target, public computation
+and phase, spelled as a `RigExecValueAddress` — bound to the graph value its
+canonical producer writes, plus the retained storage an extractor reads after
+the graph joins.
+
+- **Only retained storage is exported.** Property results, provider base and
+  final matrices, frame records, chain bases, published chain points and a
+  revision fuse's publication record have an enumerator; scratch packets,
+  candidates, chunk and staging slots do not, and discovery refuses an entry
+  that binds one.
+- **The payload layout is checked before the entry is indexed.** `double` goes
+  with a scalar, `matrix4d` with a transform, `point3d[]` with a point array; an
+  entry whose kind and layout disagree fails discovery.
+- **GPU-only point chains are exported as `Unsupported` with a reason.** There
+  is no CPU fallback for them, and no evaluator answers them specially.
+- **A missing output is refused, not guessed.** An address with no retained
+  producer resolves `Unsupported`; a handle naming another rig identity or an
+  older compile epoch resolves `Invalidated`. `Resolve` reports both before any
+  dispatch, so no host reads a stage to fill in what the rig does not export.
+
+Scene lowering maps an authored value to one of those spellings in
+`RigExecResolveOutputDescriptor` (`libs/rigExecScene/outputDescriptors.h`),
+which reads stage identity and type metadata only and authors nothing.
+
 ## Background admission
 
 A subscription service runs the work behind a request on the existing
