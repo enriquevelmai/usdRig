@@ -5,13 +5,14 @@
 //
 // This is the only place these types are declared: scene lowering, cache
 // publication, bake, runtime, imaging and host adapters include this header and
-// may not declare their own time, handle, status, packet, payload lease or
-// closure type.
+// may not declare their own time, handle, status, packet, payload layout,
+// payload lease or closure type.
 //
 // USD-free by contract, like the rest of rigExecGraph: no stage, path or
 // schema type appears here. Compiled rig identity travels as plain text plus a
-// compile epoch, and a payload is an immutable byte lease whose element count
-// is declared by the producer.
+// compile epoch, a time is a USD time code spelled as a double, and a payload
+// is an immutable byte lease whose layout and element count are declared here
+// and by the producer.
 #ifndef RIGEXEC_GRAPH_OUTPUT_DEMAND_H
 #define RIGEXEC_GRAPH_OUTPUT_DEMAND_H
 
@@ -22,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -35,9 +37,12 @@ constexpr uint32_t kRigExecNoOp = 0xffffffffu;
 // Namespace-scope so an absent demand list needs no guard at call time.
 const std::vector<uint32_t> kRigExecNoOutputs;
 
-// One requested frame: the context's default frame, or one exact finite time
-// in seconds. The default is an identity, not a number: it never equals
-// numeric zero, and negative or subframe times survive unchanged. Negative
+// One requested frame: the context's default frame, or one exact finite USD
+// time code carried as a double -- UsdTimeCode::GetValue(), a count of frames
+// on the stage's time code scale, never seconds. A host that holds seconds
+// converts with the stage's rate before building a time; nothing here applies
+// or records a rate. The default is an identity, not a number: it never equals
+// numeric zero, and negative or subframe codes survive unchanged. Negative
 // zero is stored as zero so equal times compare and hash the same.
 struct RigExecOutputTime {
     RigExecOutputTime() = default;
@@ -48,11 +53,11 @@ struct RigExecOutputTime {
     }
 
     // false for NaN or infinity; *out is then unchanged.
-    static bool TryNumeric(double seconds, RigExecOutputTime *out)
+    static bool TryTimeCode(double timeCode, RigExecOutputTime *out)
     {
-        if (!out || !std::isfinite(seconds))
+        if (!out || !std::isfinite(timeCode))
             return false;
-        out->seconds_ = (seconds == 0.0) ? 0.0 : seconds;
+        out->timeCode_ = (timeCode == 0.0) ? 0.0 : timeCode;
         out->hasTime_ = true;
         return true;
     }
@@ -61,10 +66,10 @@ struct RigExecOutputTime {
     {
         return !hasTime_;
     }
-    // The frame in seconds. Meaningless for the default frame.
-    double Seconds() const
+    // The USD time code. Meaningless for the default frame.
+    double TimeCode() const
     {
-        return seconds_;
+        return timeCode_;
     }
 
     // The default frame sorts before every numeric frame, so grouping by time
@@ -76,7 +81,7 @@ struct RigExecOutputTime {
             return false;
         if (!a.hasTime_)
             return true;
-        return a.seconds_ == b.seconds_;
+        return a.timeCode_ == b.timeCode_;
     }
     friend bool operator!=(const RigExecOutputTime &a,
                            const RigExecOutputTime &b)
@@ -88,7 +93,7 @@ struct RigExecOutputTime {
     {
         if (a.hasTime_ != b.hasTime_)
             return !a.hasTime_;
-        return a.seconds_ < b.seconds_;
+        return a.timeCode_ < b.timeCode_;
     }
 
     std::size_t Hash() const
@@ -98,7 +103,7 @@ struct RigExecOutputTime {
         if (!hasTime_)
             return 0x9e3779b97f4a7c15ULL;
         uint64_t bits;
-        std::memcpy(&bits, &seconds_, sizeof(bits));
+        std::memcpy(&bits, &timeCode_, sizeof(bits));
         bits ^= bits >> 33;
         bits *= 0xff51afd7ed558ccdULL;
         bits ^= bits >> 29;
@@ -108,7 +113,7 @@ struct RigExecOutputTime {
 
 private:
     bool hasTime_ = false;
-    double seconds_ = 0.0;
+    double timeCode_ = 0.0;
 };
 
 struct RigExecOutputTimeHash {
@@ -208,12 +213,19 @@ enum class RigExecDemandPolicy {
     Speculative,
 };
 
-// One host's request: the outputs it wants and the exact frames it wants them
-// at. A request is well formed when every handle names an output and every
-// time is the default frame or a finite number.
-struct RigExecOutputRequest {
+// One host's request: the outputs it wants, each at the exact times it wants
+// them at. A request is a set of per-time demands: outputs union inside one
+// demand, and a demand for one time never carries an output asked for only at
+// another time. A request is well formed when every demand names at least one
+// output, every handle names an output, and every time is the default frame or
+// a finite time code.
+struct RigExecOutputTimeDemand {
+    RigExecOutputTime time;
     std::vector<RigExecOutputHandle> handles;
-    std::vector<RigExecOutputTime> times;
+};
+
+struct RigExecOutputRequest {
+    std::vector<RigExecOutputTimeDemand> demands;
     RigExecDemandPolicy policy = RigExecDemandPolicy::Explicit;
 
     bool IsWellFormed(std::string *error) const
@@ -223,27 +235,262 @@ struct RigExecOutputRequest {
                 *error = message;
             return false;
         };
-        if (handles.empty())
-            return fail("output request has no handles");
-        for (const RigExecOutputHandle &handle : handles) {
-            if (handle.semanticKey.empty())
-                return fail("output handle has no semantic key");
-            if (handle.type.empty())
-                return fail("output handle has no payload type");
-        }
-        for (const RigExecOutputTime &time : times) {
-            if (!time.IsDefault() && !std::isfinite(time.Seconds()))
-                return fail("output request time is not finite");
+        if (demands.empty())
+            return fail("output request has no demands");
+        for (const RigExecOutputTimeDemand &demand : demands) {
+            if (demand.handles.empty())
+                return fail("output demand has no handles");
+            for (const RigExecOutputHandle &handle : demand.handles) {
+                if (handle.rigIdentity.empty())
+                    return fail("output handle has no rig identity");
+                if (handle.semanticKey.empty())
+                    return fail("output handle has no semantic key");
+                if (handle.type.empty())
+                    return fail("output handle has no payload type");
+            }
         }
         return true;
     }
 };
 
-// Immutable lease on one produced value. The producer declares the element
-// count; consumers never re-derive it from the buffer size. Copies share the
-// bytes; a writer detaches before changing them.
+// The index of the merged demand for this exact time, or -1 when the request
+// has none yet.
+inline int
+RigExecFindDemand(const RigExecOutputRequest &request,
+                  const RigExecOutputTime &time)
+{
+    for (size_t i = 0; i < request.demands.size(); ++i)
+        if (request.demands[i].time == time)
+            return int(i);
+    return -1;
+}
+
+// The position of a handle naming the same output, or -1 when the list has
+// none. Matching ignores the value revision, as RigExecOutputHandle::SameTarget
+// does.
+inline int
+RigExecFindTarget(const std::vector<RigExecOutputHandle> &handles,
+                  const RigExecOutputHandle &handle)
+{
+    for (size_t i = 0; i < handles.size(); ++i)
+        if (handles[i].SameTarget(handle))
+            return int(i);
+    return -1;
+}
+
+// True when the request asks for this output at this exact time. Revision is
+// part of the comparison: the same output at another revision is a different
+// answer.
+inline bool
+RigExecRequestWants(const RigExecOutputRequest &request,
+                    const RigExecOutputHandle &handle,
+                    const RigExecOutputTime &time)
+{
+    const int demand = RigExecFindDemand(request, time);
+    if (demand < 0)
+        return false;
+    const std::vector<RigExecOutputHandle> &handles =
+        request.demands[size_t(demand)].handles;
+    const int at = RigExecFindTarget(handles, handle);
+    return at >= 0 && handles[size_t(at)] == handle;
+}
+
+// The one rig identity and compile epoch a request names, checked across
+// every handle of every demand. False with a diagnostic for an empty request,
+// a handle with no identity, or a request that mixes rigs or epochs: those
+// are two groups, and no dispatch answers both.
+inline bool
+RigExecRequestGroup(const RigExecOutputRequest &request,
+                    std::string *rigIdentity, uint64_t *compileEpoch,
+                    std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    bool seen = false;
+    std::string group;
+    uint64_t epoch = 0;
+    for (const RigExecOutputTimeDemand &demand : request.demands) {
+        if (demand.handles.empty())
+            return fail("output demand has no handles");
+        for (const RigExecOutputHandle &handle : demand.handles) {
+            if (handle.rigIdentity.empty())
+                return fail("output handle has no rig identity");
+            if (!seen) {
+                group = handle.rigIdentity;
+                epoch = handle.compileEpoch;
+                seen = true;
+                continue;
+            }
+            if (handle.rigIdentity != group)
+                return fail("request mixes rig identities " + group + " and " +
+                            handle.rigIdentity);
+            if (handle.compileEpoch != epoch)
+                return fail("request mixes compile epochs");
+        }
+    }
+    if (!seen)
+        return fail("request has no handles");
+    if (rigIdentity)
+        *rigIdentity = group;
+    if (compileEpoch)
+        *compileEpoch = epoch;
+    return true;
+}
+
+// True when two requests can be answered by one dispatch. Every handle of
+// every demand is checked, never one representative handle: both requests
+// must name one rig identity and one compile epoch, and an output demanded at
+// the same exact time by both must be demanded at one value revision.
+// Requests that disagree are two groups; merging them would answer one handle
+// from one revision and another handle from a second.
+inline bool
+RigExecRequestsCompatible(const RigExecOutputRequest &a,
+                          const RigExecOutputRequest &b,
+                          std::string *error = nullptr)
+{
+    std::string aRig, bRig;
+    uint64_t aEpoch = 0, bEpoch = 0;
+    if (!RigExecRequestGroup(a, &aRig, &aEpoch, error))
+        return false;
+    if (!RigExecRequestGroup(b, &bRig, &bEpoch, error))
+        return false;
+    if (aRig != bRig) {
+        if (error)
+            *error = "requests name different rigs " + aRig + " and " + bRig;
+        return false;
+    }
+    if (aEpoch != bEpoch) {
+        if (error)
+            *error = "requests name different compile epochs";
+        return false;
+    }
+    for (const RigExecOutputTimeDemand &demand : a.demands) {
+        const int at = RigExecFindDemand(b, demand.time);
+        if (at < 0)
+            continue;
+        const std::vector<RigExecOutputHandle> &other =
+            b.demands[size_t(at)].handles;
+        for (const RigExecOutputHandle &handle : demand.handles) {
+            const int found = RigExecFindTarget(other, handle);
+            if (found >= 0 &&
+                other[size_t(found)].valueRevision != handle.valueRevision) {
+                if (error)
+                    *error = "output " + handle.semanticKey +
+                             " is demanded at mismatched value revisions";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The payload layouts the contract defines. A produced value is one of these
+// or it is not an exportable output; anything else is scratch.
+//
+// The wire form is host-order IEEE-754 doubles with no padding, and this
+// header is its only declaration: extraction, cache publication and the
+// runtime read these layouts and never re-declare them. Element sizes:
+//   Scalar        1 double   (8 bytes)
+//   Matrix4x4Row 16 doubles  (128 bytes), row-major, USD row-vector form, so a
+//                point transforms as p' = p * M.
+//   Point3        3 doubles  (24 bytes), x y z in the value's own space
+enum class RigExecPayloadKind {
+    Unknown,      // no layout declared: never a readable payload
+    Scalar,       // one double
+    Matrix4x4Row, // 16 doubles, row-major
+    Point3,       // 3 doubles, x y z
+};
+
+// The exact handle-type spellings for these layouts. A handle's `type` names
+// the payload layout, not the USD storage type of the attribute the output
+// came from: scene lowering maps a USD value type to one of these spellings
+// (converting to double where the attribute stores floats) and a consumer
+// never invents another spelling.
+namespace RigExecPayloadText {
+inline constexpr const char *const scalar = "double";
+inline constexpr const char *const matrix4x4Row = "matrix4d";
+inline constexpr const char *const point3 = "point3d[]";
+} // namespace RigExecPayloadText
+
+// Bytes per element of a layout, 0 for an unknown kind.
+inline std::size_t
+RigExecPayloadElementBytes(RigExecPayloadKind kind)
+{
+    switch (kind) {
+    case RigExecPayloadKind::Scalar:
+        return sizeof(double);
+    case RigExecPayloadKind::Matrix4x4Row:
+        return 16 * sizeof(double);
+    case RigExecPayloadKind::Point3:
+        return 3 * sizeof(double);
+    case RigExecPayloadKind::Unknown:
+        break;
+    }
+    return 0;
+}
+
+// The layout a handle-type spelling names. false for a spelling this header
+// does not define.
+inline bool
+RigExecPayloadKindForType(const std::string &type, RigExecPayloadKind *kind)
+{
+    if (!kind)
+        return false;
+    if (type == RigExecPayloadText::scalar)
+        *kind = RigExecPayloadKind::Scalar;
+    else if (type == RigExecPayloadText::matrix4x4Row)
+        *kind = RigExecPayloadKind::Matrix4x4Row;
+    else if (type == RigExecPayloadText::point3)
+        *kind = RigExecPayloadKind::Point3;
+    else
+        return false;
+    return true;
+}
+
+// The spelling a layout travels as, "unknown" for an undeclared kind.
+inline const char *
+RigExecPayloadTypeSpelling(RigExecPayloadKind kind)
+{
+    switch (kind) {
+    case RigExecPayloadKind::Scalar:
+        return RigExecPayloadText::scalar;
+    case RigExecPayloadKind::Matrix4x4Row:
+        return RigExecPayloadText::matrix4x4Row;
+    case RigExecPayloadKind::Point3:
+        return RigExecPayloadText::point3;
+    case RigExecPayloadKind::Unknown:
+        break;
+    }
+    return "unknown";
+}
+
+// Byte count for a layout and element count, false when the count would
+// overflow the byte count. Reservation happens here, before any allocation.
+inline bool
+RigExecPayloadByteCount(RigExecPayloadKind kind, uint64_t elementCount,
+                        uint64_t *bytes)
+{
+    const std::size_t elementBytes = RigExecPayloadElementBytes(kind);
+    if (!bytes || elementBytes == 0)
+        return false;
+    if (elementCount >
+        uint64_t(std::numeric_limits<std::size_t>::max()) / elementBytes)
+        return false;
+    *bytes = elementCount * uint64_t(elementBytes);
+    return true;
+}
+
+// Immutable lease on one produced value. The producer declares the layout and
+// the element count; consumers never re-derive either from the buffer size,
+// and the buffer carries no alignment guarantee, so elements are read one
+// memcpy at a time (RigExecPayloadView). Copies share the bytes; a writer
+// detaches before changing them.
 struct RigExecOutputPayload {
     std::shared_ptr<const std::vector<uint8_t>> bytes;
+    RigExecPayloadKind kind = RigExecPayloadKind::Unknown;
     uint64_t elementCount = 0;
 
     bool IsEmpty() const
@@ -253,6 +500,210 @@ struct RigExecOutputPayload {
     std::size_t ByteCount() const
     {
         return bytes ? bytes->size() : 0;
+    }
+};
+
+// True when the lease matches its declared layout: a declared kind, bytes
+// exactly elementCount * elementBytes (never short, never trailing extra
+// bytes), and a buffer for a non-empty payload. false with a diagnostic.
+inline bool
+RigExecValidatePayload(const RigExecOutputPayload &payload, std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    const std::size_t elementBytes = RigExecPayloadElementBytes(payload.kind);
+    if (elementBytes == 0)
+        return fail(std::string("payload ") +
+                    RigExecPayloadTypeSpelling(payload.kind) +
+                    " has no declared layout");
+    uint64_t expected = 0;
+    if (!RigExecPayloadByteCount(payload.kind, payload.elementCount, &expected))
+        return fail("payload element count overflows its byte count");
+    if (expected == 0) {
+        if (payload.ByteCount() != 0)
+            return fail("payload declares no elements but carries bytes");
+        return true;
+    }
+    if (!payload.bytes)
+        return fail("payload has no bytes");
+    if (uint64_t(payload.ByteCount()) != expected)
+        return fail(std::string("payload ") +
+                    RigExecPayloadTypeSpelling(payload.kind) + " has " +
+                    std::to_string(payload.ByteCount()) + " bytes for " +
+                    std::to_string(payload.elementCount) + " elements");
+    return true;
+}
+
+// True when the payload is readable for the handle that names it: the handle's
+// type spelling declares the payload's layout. A payload for an output whose
+// type has no defined layout is never answered with a guessed one.
+inline bool
+RigExecPayloadMatchesHandle(const RigExecOutputHandle &handle,
+                            const RigExecOutputPayload &payload,
+                            std::string *error)
+{
+    RigExecPayloadKind kind = RigExecPayloadKind::Unknown;
+    if (!RigExecPayloadKindForType(handle.type, &kind)) {
+        if (error)
+            *error = "output " + handle.semanticKey + " has type " +
+                     handle.type + " with no defined payload layout";
+        return false;
+    }
+    if (payload.kind != kind) {
+        if (error)
+            *error = "output " + handle.semanticKey + " is declared " +
+                     handle.type + " but its payload is " +
+                     RigExecPayloadTypeSpelling(payload.kind);
+        return false;
+    }
+    return RigExecValidatePayload(payload, error);
+}
+
+// Copy a producer's contiguous doubles into an immutable lease. src must hold
+// elementCount * (element bytes / sizeof(double)) doubles. The byte count is
+// computed and checked before the buffer is allocated. This runs at the
+// extraction boundary after the join, never inside an operation body or a
+// kernel: it allocates and publishes a shared owner.
+inline bool
+RigExecPackPayload(RigExecPayloadKind kind, uint64_t elementCount,
+                   const double *src, RigExecOutputPayload *out,
+                   std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (!out)
+        return fail("no payload to pack into");
+    uint64_t bytes = 0;
+    if (!RigExecPayloadByteCount(kind, elementCount, &bytes))
+        return fail(std::string("cannot pack ") +
+                    RigExecPayloadTypeSpelling(kind) + " payload");
+    if (bytes == 0) {
+        out->bytes = nullptr;
+        out->kind = kind;
+        out->elementCount = 0;
+        return true;
+    }
+    if (!src)
+        return fail("payload has no source values");
+    const size_t byteCount = size_t(bytes);
+    std::vector<uint8_t> buffer(byteCount);
+    std::memcpy(buffer.data(), src, byteCount);
+    out->bytes =
+        std::make_shared<const std::vector<uint8_t>>(std::move(buffer));
+    out->kind = kind;
+    out->elementCount = elementCount;
+    return RigExecValidatePayload(*out, error);
+}
+
+// Element access for one lease. Every read copies sizeof(double) bytes with
+// memcpy from the declared offset: the byte buffer has no alignment guarantee,
+// so nothing here reinterprets it as a double array. Reads are bounds checked
+// against the declared element count, not against the buffer size.
+class RigExecPayloadView {
+public:
+    bool Open(const RigExecOutputPayload &payload, std::string *error)
+    {
+        if (!RigExecValidatePayload(payload, error))
+            return false;
+        bytes_ = payload.bytes;
+        kind_ = payload.kind;
+        count_ = payload.elementCount;
+        return true;
+    }
+
+    // Opens for the handle that names the payload, checking the declared type
+    // against the layout first.
+    bool Open(const RigExecOutputHandle &handle,
+              const RigExecOutputPayload &payload, std::string *error)
+    {
+        if (!RigExecPayloadMatchesHandle(handle, payload, error))
+            return false;
+        return Open(payload, error);
+    }
+
+    RigExecPayloadKind Kind() const
+    {
+        return kind_;
+    }
+
+    uint64_t ElementCount() const
+    {
+        return count_;
+    }
+
+    bool ReadScalar(size_t element, double *out) const
+    {
+        return kind_ == RigExecPayloadKind::Scalar && Read(element, 1, out);
+    }
+    bool ReadMatrix4x4Row(size_t element, double *out) const
+    {
+        return kind_ == RigExecPayloadKind::Matrix4x4Row &&
+               Read(element, 16, out);
+    }
+    bool ReadPoint3(size_t element, double *out) const
+    {
+        return kind_ == RigExecPayloadKind::Point3 && Read(element, 3, out);
+    }
+
+private:
+    bool Read(size_t element, size_t doublesPerElement, double *out) const
+    {
+        if (!out || !bytes_ || element >= count_)
+            return false;
+        const size_t stride = doublesPerElement * sizeof(double);
+        const size_t offset = element * stride;
+        if (offset / stride != element || offset >= bytes_->size())
+            return false;
+        std::memcpy(out, bytes_->data() + offset, stride);
+        return true;
+    }
+
+    std::shared_ptr<const std::vector<uint8_t>> bytes_;
+    RigExecPayloadKind kind_ = RigExecPayloadKind::Unknown;
+    uint64_t count_ = 0;
+};
+
+// The full captured generation a value was produced from. Every field is part
+// of the key: the program that produced the value, the inputs it sampled, the
+// preview generation, and the history generation. A partial key (the program
+// alone, or the history revision alone) never identifies a generation, and the
+// service compares all four before a packet answers a request.
+struct RigExecOutputGeneration {
+    uint64_t programIdentity = 0;
+    uint64_t inputRevision = 0;
+    uint64_t previewRevision = 0;
+    uint64_t historyRevision = 0;
+
+    friend bool operator==(const RigExecOutputGeneration &a,
+                           const RigExecOutputGeneration &b)
+    {
+        return a.programIdentity == b.programIdentity &&
+               a.inputRevision == b.inputRevision &&
+               a.previewRevision == b.previewRevision &&
+               a.historyRevision == b.historyRevision;
+    }
+    friend bool operator!=(const RigExecOutputGeneration &a,
+                           const RigExecOutputGeneration &b)
+    {
+        return !(a == b);
+    }
+
+    std::size_t Hash() const
+    {
+        std::size_t seed = std::size_t(programIdentity);
+        const auto mix = [&seed](std::size_t value) {
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+        mix(std::size_t(inputRevision));
+        mix(std::size_t(previewRevision));
+        mix(std::size_t(historyRevision));
+        return seed;
     }
 };
 
@@ -269,9 +720,35 @@ struct RigExecOutputPacket {
     std::string reason;
     RigExecOutputPayload payload;
 
+    // The packet's full captured generation key.
+    RigExecOutputGeneration Generation() const
+    {
+        RigExecOutputGeneration generation;
+        generation.programIdentity = programIdentity;
+        generation.inputRevision = inputRevision;
+        generation.previewRevision = previewRevision;
+        generation.historyRevision = historyRevision;
+        return generation;
+    }
+
     bool IsUsable() const
     {
         return status == RigExecOutputStatus::Ready;
+    }
+    // A Ready packet answers only when its payload is readable and every part
+    // of the generation key it was captured from matches.
+    bool Answers(const RigExecOutputHandle &requested,
+                 const RigExecOutputTime &at,
+                 const RigExecOutputGeneration &captured) const
+    {
+        if (status != RigExecOutputStatus::Ready)
+            return false;
+        if (!(handle == requested) || !(time == at))
+            return false;
+        if (Generation() != captured)
+            return false;
+        std::string error;
+        return RigExecPayloadMatchesHandle(handle, payload, &error);
     }
 };
 
@@ -330,41 +807,66 @@ struct RigExecOutputDemandEntry {
     RigExecValueId producerValue;
 };
 
-// True when two requests can be answered by one dispatch: same rig identity
-// and compile epoch.
-inline bool
-RigExecRequestsCompatible(const RigExecOutputRequest &a,
-                          const RigExecOutputRequest &b)
-{
-    if (a.handles.empty() || b.handles.empty())
-        return false;
-    return a.handles.front().rigIdentity == b.handles.front().rigIdentity &&
-           a.handles.front().compileEpoch == b.handles.front().compileEpoch;
-}
-
-// Merge requests of one compiled rig into one request: duplicate handles and
-// times appear once, and an explicit request outranks a speculative one.
+// Merge requests of one compiled rig into one request. Handles merge only
+// inside the demand for the same exact time: an output asked for at frame 12
+// never picks up a frame it was not asked for, so a union can never name a
+// (handle, time) pair no host requested. A target demanded at one time by two
+// requests at different value revisions is refused rather than resolved to
+// one of them: the merged request comes back empty with a diagnostic, and the
+// caller dispatches the groups separately.
 inline RigExecOutputRequest
-RigExecUnionRequests(const std::vector<RigExecOutputRequest> &requests)
+RigExecUnionRequests(const std::vector<RigExecOutputRequest> &requests,
+                     std::string *error = nullptr)
 {
     RigExecOutputRequest merged;
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        merged = RigExecOutputRequest{};
+        return merged;
+    };
     bool explicitRequested = false;
+    std::string groupRig;
+    uint64_t groupEpoch = 0;
+    bool grouped = false;
     for (const RigExecOutputRequest &request : requests) {
-        for (const RigExecOutputHandle &handle : request.handles) {
-            const auto found =
-                std::find_if(merged.handles.begin(), merged.handles.end(),
-                             [&](const RigExecOutputHandle &existing) {
-                                 return existing.SameTarget(handle);
-                             });
-            if (found == merged.handles.end())
-                merged.handles.push_back(handle);
+        std::string rig;
+        uint64_t epoch = 0;
+        if (!RigExecRequestGroup(request, &rig, &epoch, error)) {
+            merged = RigExecOutputRequest{};
+            return merged;
         }
-        for (const RigExecOutputTime &time : request.times) {
-            if (std::find(merged.times.begin(), merged.times.end(), time) ==
-                merged.times.end())
-                merged.times.push_back(time);
+        if (!grouped) {
+            groupRig = rig;
+            groupEpoch = epoch;
+            grouped = true;
+        } else if (rig != groupRig) {
+            return fail("requests name different rigs " + groupRig + " and " +
+                        rig);
+        } else if (epoch != groupEpoch) {
+            return fail("requests name different compile epochs");
         }
         explicitRequested |= request.policy == RigExecDemandPolicy::Explicit;
+        for (const RigExecOutputTimeDemand &demand : request.demands) {
+            int at = RigExecFindDemand(merged, demand.time);
+            if (at < 0) {
+                merged.demands.push_back(demand);
+                continue;
+            }
+            std::vector<RigExecOutputHandle> &existing =
+                merged.demands[size_t(at)].handles;
+            for (const RigExecOutputHandle &handle : demand.handles) {
+                const int found = RigExecFindTarget(existing, handle);
+                if (found < 0) {
+                    existing.push_back(handle);
+                    continue;
+                }
+                if (existing[size_t(found)].valueRevision !=
+                    handle.valueRevision)
+                    return fail("output " + handle.semanticKey +
+                                " is demanded at mismatched value revisions");
+            }
+        }
     }
     merged.policy = explicitRequested ? RigExecDemandPolicy::Explicit
                                       : RigExecDemandPolicy::Speculative;
@@ -525,6 +1027,35 @@ public:
     const std::vector<uint32_t> &DemandedBy(uint32_t op) const
     {
         return op < demanders_.size() ? demanders_[op] : kRigExecNoOutputs;
+    }
+
+    // The index slots a request names, one per distinct handle, in request
+    // order. Every handle of every demand is resolved: a handle the index does
+    // not know is refused with a diagnostic instead of dropped, so a partial
+    // demand never produces a partial mask.
+    bool ResolveRequest(const RigExecOutputRequest &request,
+                        std::vector<size_t> *slots, std::string *error) const
+    {
+        if (!slots)
+            return false;
+        slots->clear();
+        for (const RigExecOutputTimeDemand &demand : request.demands) {
+            for (const RigExecOutputHandle &handle : demand.handles) {
+                size_t slot = 0;
+                if (!Find(handle, &slot)) {
+                    if (error)
+                        *error = "request names an output the index does not "
+                                 "know: " +
+                                 handle.semanticKey;
+                    slots->clear();
+                    return false;
+                }
+                if (std::find(slots->begin(), slots->end(), slot) ==
+                    slots->end())
+                    slots->push_back(slot);
+            }
+        }
+        return true;
     }
 
     // The operations one dispatch must run for a set of outputs: the union of
