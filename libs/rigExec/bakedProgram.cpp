@@ -38,6 +38,7 @@
 #include "rigEvaluatorInternal.h"
 #include "types.h"
 
+#include "rigExecGraph/outputDemand.h"
 #include "rigExecMath/pointFrame.h"
 #include "rigExecSchema/schemaTokens.h"
 
@@ -4904,8 +4905,52 @@ RigExecBakedProgramImpl::ConstraintArrays::Names()
     return kConstraintArrayNames;
 }
 
+namespace {
+// The facts a requested run leaves behind, read after the join while its mask
+// still stands: which bodies ran, and per value the closure writes whether
+// this run produced it or clean retained storage stood.
+void
+FillRequestedRunReport(RigExecBakedProgramImpl &B,
+                       RigExecRequestedRunReport *report)
+{
+    report->executed.clear();
+    report->values.clear();
+    std::vector<char> counted(B.opAdapter.values.size(), 0);
+    for (uint32_t op : B.requestedOps) {
+        if (op >= B.opGraph.ops.size())
+            continue;
+        const bool ran =
+            op < B.opExecution.ran.size() && B.opExecution.ran[op] != 0;
+        if (ran)
+            report->executed.push_back(op);
+        for (RigExecValueId id : B.opGraph.ops[op].descriptor.writes) {
+            if (id >= B.opAdapter.values.size() || counted[size_t(id)])
+                continue;
+            counted[size_t(id)] = 1;
+            const RigExecOpValueState &value = B.opAdapter.values[size_t(id)];
+            RigExecValueMaterialization fact;
+            fact.value = id;
+            fact.produced = ran;
+            fact.reused = !ran && value.initialized;
+            fact.wasAbsent = id < B.requestedAbsent.size() &&
+                             B.requestedAbsent[size_t(id)] != 0;
+            fact.revision = value.revision;
+            report->values.push_back(fact);
+        }
+    }
+    std::sort(
+        report->values.begin(), report->values.end(),
+        [](const RigExecValueMaterialization &a,
+           const RigExecValueMaterialization &b) { return a.value < b.value; });
+    report->requestedOperations = B.requestedOps.size();
+    report->executedOperations = report->executed.size();
+    report->clustersRun = B.lastClosedClusters;
+}
+} // namespace
+
 bool
-RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
+RigExecBakedProgram::_RunFrame(UsdTimeCode time, RigExecRigPose *pose,
+                               bool requested, _FrameMarks *marks)
 {
     RigExecBakedProgramImpl &B = *_impl;
     if (B.inputReplayCapture) {
@@ -4941,8 +4986,11 @@ RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
     // take three mutexes apiece and cost more than the prologue they would
     // be measuring, which is why the phase a frame spends its time in was
     // never readable without the tracer distorting it. See
-    // RigExecBakedStepTimingRequested, read at Build.
-    const bool measuring = B.scheduleStepTiming;
+    // RigExecBakedStepTimingRequested, read at Build. A requested run is not
+    // a published frame, so it enters no numerator whose denominator stood
+    // still.
+    marks->measuring = B.scheduleStepTiming && !requested;
+    const bool measuring = marks->measuring;
     const auto now = [] {
         return std::chrono::duration<double, std::micro>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -5158,7 +5206,7 @@ RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
     // run's whole answer is shadowed, the state the prologue left is put
     // back, every step runs, and the two are compared. A difference is
     // reported rather than fatal, so a test can assert on the count.
-    const bool verifying = RigExecBakedVerifyConesRequested();
+    const bool verifying = !requested && RigExecBakedVerifyConesRequested();
     RigExecBakedRunShadow before, after;
     if (verifying) {
         before.Capture(B);
@@ -5230,7 +5278,9 @@ RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
         RIGEXEC_PROFILE_SCOPE_CAT(*B.profiler, "BakedReplayTimings", "baked");
         RigExecBakedReplayStepTimings(B);
     }
-    if (B.scheduleCalibrate) {
+    if (B.scheduleCalibrate && !requested) {
+        // Calibration fits costs to what a frame measured; a requested run
+        // measured part of one.
         RigExecBakedScheduleCalibrate(&B);
     }
     if (B.scheduleReport) {
@@ -5250,6 +5300,26 @@ RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
         pose->valid = false;
         return false;
     }
+    marks->frameBegan = frameBegan;
+    marks->phaseMark = phaseMark;
+    marks->prologueUs = prologueUs;
+    marks->regionUs = regionUs;
+    return true;
+}
+
+bool
+RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
+{
+    RigExecBakedProgramImpl &B = *_impl;
+    _FrameMarks marks;
+    if (!_RunFrame(time, pose, /*requested = */ false, &marks))
+        return false;
+    const auto now = [] {
+        return std::chrono::duration<double, std::micro>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    double phaseMark = marks.phaseMark;
     if (!RigExecBakedPublishPose(&B, pose)) {
         _lastBail = RigExecBakedBail::Publish;
         pose->valid = false;
@@ -5271,7 +5341,7 @@ RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
 
     pose->executedOpCount = B.opExecution.executed;
     pose->valid = scalarReferenceValid;
-    if (measuring) {
+    if (marks.measuring) {
         // Counted here, at the one exit that published a pose: a frame that
         // bailed before publish did not run the epilogue this is measuring,
         // and its prologue and region are dropped with it so that every
@@ -5279,18 +5349,83 @@ RigExecBakedProgram::Run(UsdTimeCode time, RigExecRigPose *pose)
         // cold run the per-step sums left out goes to sums of its own.
         const double epilogueUs = now() - phaseMark;
         if (B.coldRunExcluded) {
-            B.coldPrologueUs += prologueUs;
-            B.coldRegionUs += regionUs;
+            B.coldPrologueUs += marks.prologueUs;
+            B.coldRegionUs += marks.regionUs;
             B.coldEpilogueUs += epilogueUs;
             ++B.coldFrames;
         } else {
-            B.timedPrologueUs += prologueUs;
-            B.timedRegionUs += regionUs;
+            B.timedPrologueUs += marks.prologueUs;
+            B.timedRegionUs += marks.regionUs;
             B.timedEpilogueUs += epilogueUs;
             ++B.timedFrames;
         }
         RigExecBakedStepTimingReport(&B);
     }
+    return true;
+}
+
+bool
+RigExecBakedProgram::RunRequested(UsdTimeCode time,
+                                  const RigExecDemandClosure &requested,
+                                  RigExecRequestedRunReport *report,
+                                  std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (!report)
+        return fail("no requested-run report");
+    *report = RigExecRequestedRunReport{};
+    RigExecBakedProgramImpl &B = *_impl;
+    const size_t opCount = B.opGraph.ops.size();
+    if (!B.opAdapter.compiled || opCount == 0)
+        return fail("baked program has no canonical operation graph");
+    if (requested.ops.empty())
+        return fail("requested run names no operation");
+    uint32_t previous = 0;
+    bool leading = true;
+    for (uint32_t op : requested.ops) {
+        if (op >= opCount)
+            return fail("requested run names an operation outside the graph");
+        if (!leading && op <= previous)
+            return fail("requested run names operations out of order, or the "
+                        "same one twice");
+        previous = op;
+        leading = false;
+    }
+    std::string reason;
+    if (!RigExecClosureIsClosed(B.opGraph, requested, &reason))
+        return fail("requested closure: " + reason);
+
+    std::vector<char> mask(opCount, 0);
+    for (uint32_t op : requested.ops)
+        mask[size_t(op)] = 1;
+    struct RequestedRunReset {
+        RigExecBakedProgramImpl &program;
+        ~RequestedRunReset()
+        {
+            program.requestedRun = false;
+            program.requestedMask.clear();
+            program.requestedOps.clear();
+            program.requestedSkipEffects.clear();
+            program.requestedAbsent.clear();
+        }
+    } reset{B};
+    B.requestedMask = std::move(mask);
+    B.requestedOps = requested.ops;
+    B.requestedRun = true;
+
+    // A requested run publishes nothing, so the pose it hands the shared
+    // frame is scratch: the prologue's source capture takes one, and the
+    // refusal paths write diagnostics no caller reads.
+    RigExecRigPose scratch;
+    _FrameMarks marks;
+    const bool ran = _RunFrame(time, &scratch, /*requested = */ true, &marks);
+    FillRequestedRunReport(B, report);
+    if (!ran)
+        return fail("requested execution did not complete");
     return true;
 }
 

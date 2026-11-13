@@ -1272,6 +1272,12 @@ add_executable(testRigExecOutputCatalog tests/testRigExecOutputCatalog.cpp)
 target_link_libraries(testRigExecOutputCatalog PRIVATE rigExec)
 add_test(NAME testRigExecOutputCatalog COMMAND testRigExecOutputCatalog)
 
+# Requested execution over a compiled stage: the run is the baked program's,
+# so it needs the scene hooks like any other stage-compile test.
+add_executable(testRigExecOutputExtraction tests/testRigExecOutputExtraction.cpp)
+target_link_libraries(testRigExecOutputExtraction PRIVATE rigExec)
+add_test(NAME testRigExecOutputExtraction COMMAND testRigExecOutputExtraction)
+
 add_executable(testRigExecInputReplayValues tests/testRigExecInputReplayValues.cpp)
 target_link_libraries(testRigExecInputReplayValues PRIVATE rigExec)
 add_test(NAME testRigExecInputReplayValues COMMAND testRigExecInputReplayValues)
@@ -2914,6 +2920,7 @@ foreach(_rigexec_scene_exe IN ITEMS
     testRigExecFrameCacheCones_Verify testRigExecFrameCacheSparsity
     testRigExecFrozenContext testRigExecGeometryOpsBakedParity
     testRigExecGeometryProgram testRigExecGraphBindings testRigExecOutputCatalog
+    testRigExecOutputExtraction
     testRigExecGroupForwarding testRigExecInputActions testRigExecInputReplayHosting
     testRigExecInteractive testRigExecInteropNotices testRigExecLattice testRigExecLeaves
     testRigExecOneLoopAcceptance testRigExecOpTrace

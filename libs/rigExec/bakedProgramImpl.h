@@ -2787,6 +2787,25 @@ struct RigExecBakedProgramImpl {
     /// Set for a history tick: the masked graph runs, windowed bodies
     /// capture, and nothing is published.
     bool historyTick = false;
+    /// Canonical-op mask of a requested run: the operations a demand closure
+    /// names. Ops outside it are never candidates, and their keys, dirty
+    /// flags and retained values stand (RigExecBakedProgram::RunRequested).
+    std::vector<char> requestedMask;
+    /// The closure's operations, ascending: what a requested run reports on.
+    std::vector<uint32_t> requestedOps;
+    /// Set while a requested run restricts the graph.
+    bool requestedRun = false;
+    /// opAdapter.skipEffects restricted to the mask, so a masked-out op is not
+    /// passed to skip and keeps the dirty state a cone skip would clear.
+    std::vector<uint32_t> requestedSkipEffects;
+    /// Ops a requested run left out, ascending: the next run seeds the ones
+    /// whose values this arena never published and offers the rest as
+    /// candidates, so an operation a partial run skipped is never trusted as
+    /// clean on a key it has never compared.
+    std::vector<uint32_t> requestedDebt;
+    /// Per canonical value: its storage held no published value when the
+    /// requested run began. Read after the join for the run report.
+    std::vector<char> requestedAbsent;
     /// Per windowed op, written only by that op's body: the packet captured
     /// at this run's tick.
     std::vector<RigExecWindowPacketPtr> windowCaptures;

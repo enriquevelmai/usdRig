@@ -114,6 +114,7 @@ struct RigExecUpstreamArrayRow {
 };
 
 class RigExecRigEvaluator;
+struct RigExecDemandClosure;
 
 /// Every array attribute of \p evaluator's compiled rig an upstream value
 /// may stand on, sorted by path, one row per attribute: each chain's base
@@ -142,6 +143,34 @@ struct RigExecBakedProgramImpl;
 struct RigExecWeightOracleFacts;
 struct RigExecBakedEnvelopeObject;
 struct RigExecBakedPropertyChainDesc;
+
+/// One canonical graph value's fate in a requested run, keyed by the value id
+/// an output binding names, so an extractor asks about its own binding rather
+/// than reading presence off a buffer.
+struct RigExecValueMaterialization {
+    RigExecValueId value = 0;
+    /// The producing body ran in this run.
+    bool produced = false;
+    /// The body did not run and the retained value stands: this run reads what
+    /// an earlier one published, copied and recomputed by nobody.
+    bool reused = false;
+    /// The storage held no published value when the run began, so the run had
+    /// to produce it whatever its inputs did.
+    bool wasAbsent = false;
+    /// The value's version after the run.
+    uint64_t revision = 0;
+};
+
+/// What one requested run did, gathered after the join on the owning thread.
+struct RigExecRequestedRunReport {
+    /// Canonical operations whose bodies ran, ascending.
+    std::vector<uint32_t> executed;
+    /// Every value the requested closure writes, ascending by value id.
+    std::vector<RigExecValueMaterialization> values;
+    size_t requestedOperations = 0;
+    size_t executedOperations = 0;
+    size_t clustersRun = 0;
+};
 
 /// Exact comparison of independently supplied poses, including published maps,
 /// guides, operation counters and diagnostics. Appends disagreements to out.
@@ -269,6 +298,33 @@ public:
     ///
     /// Returns false with an invalid generation when execution cannot complete.
     bool Run(UsdTimeCode time, RigExecRigPose *pose);
+
+    /// Runs the same program over \p requested only: the operations a demand
+    /// index closed over the outputs a host asked for, closed under graph
+    /// predecessors and the declared validity, effect and history edges
+    /// (rigExecGraph/outputDemand.h). One executor, one schedule, the same
+    /// kernels and the same skip effects as Run: no operation is asked for by
+    /// name and nothing computes a rig result beside the loop.
+    ///
+    /// An operation the closure omits is never a candidate: no body, no skip,
+    /// no input-key rebuild, so its dirty state and its retained values stand
+    /// for whichever run asks for it next. An operation inside the closure
+    /// also runs when a value it writes was never published in this arena, so
+    /// a partial run cannot leave a hole a later request reads as an answer,
+    /// and what any requested run left out is offered to the next run instead
+    /// of trusted. Selector endpoints never prune a branch on their own: the
+    /// closure is what the index declares, not what a blend weight picked.
+    ///
+    /// Nothing is published: a partial run is not a full pose. \p report
+    /// answers which bodies ran and, per value the closure writes, whether
+    /// this run produced it or clean retained storage stands, which is what an
+    /// extractor reads after the join. Returns false with a diagnostic when
+    /// the closure does not fit this program's graph or the run bails; \p
+    /// report still describes what ran. The closure spells its operations
+    /// ascending, as the demand index builds it.
+    bool RunRequested(UsdTimeCode time, const RigExecDemandClosure &requested,
+                      RigExecRequestedRunReport *report,
+                      std::string *error = nullptr);
 
     /// Asks the next Run to execute every step rather than the closure of
     /// what moved, then forget the request. A request, not state: the
@@ -533,6 +589,16 @@ public:
     std::vector<RigExecOpGraphNode> GetOpGraph() const;
 
 private:
+    /// The prologue, the run and the epilogue's accounting up to the point
+    /// where a generation would publish. \p requested restricts the run to
+    /// that closure and turns the publishing half of the frame off.
+    struct _FrameMarks {
+        bool measuring = false;
+        double frameBegan = 0, phaseMark = 0, prologueUs = 0, regionUs = 0;
+    };
+    bool _RunFrame(UsdTimeCode time, RigExecRigPose *pose, bool requested,
+                   _FrameMarks *marks);
+
     // Test-only; reached through RigExecBakedProgramTesting
     // (bakedProgramImpl.h), because only this class is the evaluator's friend.
     friend struct RigExecBakedProgramTesting;

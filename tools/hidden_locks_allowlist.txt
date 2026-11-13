@@ -57,16 +57,16 @@ libs/rigExec/bakedGeometry.cpp | env | const int authored = TfGetenvInt("RIGEXEC
 libs/rigExec/bakedGeometry.cpp | env | const int authored = TfGetenvInt("RIGEXEC_BAKED_GROUP_CAP",
 libs/rigExec/bakedGeometry.cpp | env | return TfGetenvBool("RIGEXEC_BAKED_GROUP_GATES", true);
 
-libs/rigExec/bakedOpGraph.cpp | env | index->verify=TfGetenvBool("RIGEXEC_VERIFY_SPARSE_LEAVES",false);
-libs/rigExec/bakedOpGraph.cpp | env | B.sourceWatch.sparseVisit=TfGetenvBool("RIGEXEC_SPARSE_SOURCE_WATCH",true);
-libs/rigExec/bakedOpGraph.cpp | env | state.verifyConstantSources=TfGetenvBool("RIGEXEC_VERIFY_CONSTANT_KEYS",false);
-libs/rigExec/bakedOpGraph.cpp | env | state.verifyLeafVersions=TfGetenvBool("RIGEXEC_VERIFY_LEAF_VERSIONS",false);
-libs/rigExec/bakedOpGraph.cpp | env | B->verifySourceKeys=TfGetenvBool("RIGEXEC_VERIFY_SOURCE_KEYS",false);
-libs/rigExec/bakedOpGraph.cpp | env | B->verifyChainVersions=TfGetenvBool("RIGEXEC_VERIFY_CHAIN_VERSIONS",false);
-libs/rigExec/bakedOpGraph.cpp | env | B->verifyPacketVersions=TfGetenvBool("RIGEXEC_VERIFY_PACKET_VERSIONS",false);
-libs/rigExec/bakedOpGraph.cpp | env | B->verifyRangeChains=TfGetenvBool("RIGEXEC_VERIFY_RANGE_CHAINS",false);
-libs/rigExec/bakedOpGraph.cpp | env | B->epilogue.verify=TfGetenvBool("RIGEXEC_VERIFY_EPILOGUE_LISTS",false);
-libs/rigExec/bakedOpGraph.cpp | env | B->opWorkspace.verifyReset=TfGetenvBool("RIGEXEC_VERIFY_EXECUTION_RESET",false);
+libs/rigExec/bakedOpGraph.cpp | env | index->verify = TfGetenvBool("RIGEXEC_VERIFY_SPARSE_LEAVES", false);
+libs/rigExec/bakedOpGraph.cpp | env | TfGetenvBool("RIGEXEC_SPARSE_SOURCE_WATCH", true);
+libs/rigExec/bakedOpGraph.cpp | env | TfGetenvBool("RIGEXEC_VERIFY_CONSTANT_KEYS", false);
+libs/rigExec/bakedOpGraph.cpp | env | TfGetenvBool("RIGEXEC_VERIFY_LEAF_VERSIONS", false);
+libs/rigExec/bakedOpGraph.cpp | env | B->verifySourceKeys = TfGetenvBool("RIGEXEC_VERIFY_SOURCE_KEYS", false);
+libs/rigExec/bakedOpGraph.cpp | env | TfGetenvBool("RIGEXEC_VERIFY_CHAIN_VERSIONS", false);
+libs/rigExec/bakedOpGraph.cpp | env | TfGetenvBool("RIGEXEC_VERIFY_PACKET_VERSIONS", false);
+libs/rigExec/bakedOpGraph.cpp | env | B->verifyRangeChains = TfGetenvBool("RIGEXEC_VERIFY_RANGE_CHAINS", false);
+libs/rigExec/bakedOpGraph.cpp | env | B->epilogue.verify = TfGetenvBool("RIGEXEC_VERIFY_EPILOGUE_LISTS", false);
+libs/rigExec/bakedOpGraph.cpp | env | TfGetenvBool("RIGEXEC_VERIFY_EXECUTION_RESET", false);
 
 libs/rigExec/bakedPose.cpp | token-text | TfToken value(fallback);
 libs/rigExec/bakedPose.cpp | token-text | return TfToken(port);

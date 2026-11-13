@@ -116,6 +116,57 @@ decide what to re-evaluate. The mask feeds `RigExecOpCallbacks::active`
 directly: operations it marks 0 are never candidates, and history ticks run
 only the operations a windowed operation depends on.
 
+## Running what was asked for
+
+`RigExecBakedProgram::RunRequested` (with `RigExecRequestedRunReport` and
+`RigExecValueMaterialization` in `libs/rigExec/bakedProgram.h`) is the
+baked program's answer to a demand closure. It runs the same frame `Run`
+runs — the same prologue, the same executor, schedule, kernels and skip
+effects — restricted to the closure's operations. It is additive:
+`Run(UsdTimeCode, RigExecRigPose*)` keeps the whole-rig behavior, and there
+is no second evaluator, no fallback walk and no operation named by text.
+
+| Declaration | Says |
+| --- | --- |
+| `RunRequested(time, closure, report, error)` | Run the frame over `closure` only. Nothing is published: a partial run is not a full pose. |
+| `RigExecRequestedRunReport` | Which operations ran, how many clusters they closed, and the per-value facts below. |
+| `RigExecValueMaterialization` | Per canonical value the closure writes: `produced` (this run's body wrote it), `reused` (clean retained storage stood), `wasAbsent` (the arena held no published value when the run began), and its `revision` after the run. |
+
+- **The closure is checked, not assumed.** The operations must belong to this
+  program's canonical graph, and `RigExecClosureIsClosed` must accept the
+  closure: a mask that is not predecessor closed is refused before any body
+  runs, and the program is left as it was. A step the compiler set aside over
+  a cycle is not in the canonical graph, so no closure can name its body, and
+  `RequestFullRun`'s whole-program request keeps the SCC authority the
+  compiler retains.
+- **An operation outside the closure is not asked about.** It is not a seed,
+  not a volatile run, not a successor, and not a candidate, so its body does
+  not run and its skip effects do not run either: the cone skip's bookkeeping
+  (a geometry revision's dirty flags, a head chain's status) is the
+  bookkeeping of an operation that was asked and found clean. Its input keys
+  stay behind the generation it last ran in, which is what makes it change on
+  the run that asks for it. `skipEffects` is filtered to the mask for the
+  run.
+- **What a run leaves out is owed, not trusted.** Every operation outside the
+  closure goes on a debt list, and the next run seeds the ones whose values
+  this arena has never published and offers the rest as candidates. An
+  operation can therefore never be read as clean on a key it has never
+  compared, which is what a sequence of partial runs — or a partial run
+  followed by a whole one — needs to land on the whole run's answer.
+- **A missing value is not a clean one.** Inside the closure, an operation
+  whose write list holds storage this arena never published is seeded however
+  clean its inputs look, so a request that stops partway leaves no slot a
+  later request would answer from. Selectors are still conservative: a blend
+  weight's endpoints never prune a branch on their own, and the closure the
+  index declares — with its validity, effect and history edges — is what
+  runs.
+- **The facts are the run's, not an inference.** Declared writes alone prove
+  nothing, so the report is gathered after the join from the executor's own
+  record and the value states: what ran, and per value whether this run
+  produced it, whether clean retained storage stands for it, and whether it
+  was missing when the run began. An extractor reads a value only when the
+  closure names its producer and the facts say it materialized.
+
 ## Where the entries come from
 
 `RigExecDiscoverOutputs` (`libs/rigExec/outputCatalog.h`) builds the catalog of
