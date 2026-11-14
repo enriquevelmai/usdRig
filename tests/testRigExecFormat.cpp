@@ -22,8 +22,10 @@
 // they rest on) among them; array inputs (slots of each
 // array tag, their pool and layout defaults, the reads bound to them, and
 // the chain base, layout, painted and oracle slots) round-trip bit for bit,
-// and each rule of theirs refuses its violation with its exact message.
-// USD-free, like the format.
+// and each rule of theirs refuses its violation with its exact message. The
+// export catalog (format 33) round-trips every entry, refuses a duplicate,
+// disagreeing or out-of-range one, and a file older than it exposes no
+// export. USD-free, like the format.
 #include "rigExecBinary/format.h"
 #include "rigExecBinary/stepGraph.h"
 #include "rigExecBinary/transport.h"
@@ -1563,7 +1565,7 @@ TestOpenRefusals()
     wildRoot[3] = 0x0f;
     CHECK(!_Open(wildRoot, &why) && _Contains(why, "malformed"));
 
-    static_assert(RigExecFormatVersion == 32 &&
+    static_assert(RigExecFormatVersion == 33 &&
                       RigExecFormatOldestReadable == 20,
                   "format 22 adds the IK/FK match, format 23 the property "
                   "movers' quantize and path operations, format 24 "
@@ -1571,11 +1573,11 @@ TestOpenRefusals()
                   "format 26 the cloth's material model (RCL3) and format "
                   "27 volume falloff sample inputs, format 28 Range "
                   "Smooth revisions, format 29 sparse blend channel keys, "
-                  "format 30 Range DQ and independent summaries and format 31 "
+                  "format 30 Range DQ and independent summaries, format 31 "
                   "the 2D skeleton, unclamped animated map and scalar primvar "
-                  "records, format 32 the recomputed normals layout; per-group "
-                  "range chains pin the oldest readable "
-                  "format at 20");
+                  "records, format 32 the recomputed normals layout, format "
+                  "33 the export catalog; per-group range chains pin the "
+                  "oldest readable format at 20");
     // Every format before 20, 19 among them, requires re-export: a chain
     // with groups' records (gated parts, Whole revisions' published groups,
     // Range skins, private constants) mean something else to an older
@@ -7068,7 +7070,289 @@ TestRequiredStageFramesAdmission()
     reject(std::move(bad));
 }
 
-} // namespace
+// --------------------------------------------------------- export catalog
+
+using fb::ExportCapability;
+using fb::ExportKind;
+using fb::ExportPayload;
+using fb::ExportStorage;
+using fb::SlotDomain;
+
+/// An entry as the writer spells one.
+fb::RigExecWireExportEntry
+_Export(const std::string &key, const std::string &phase, ExportPayload payload,
+        ExportKind kind, ExportStorage storage, uint32_t object,
+        uint32_t version, int32_t producer = -1,
+        ExportCapability capability = ExportCapability::Extractable,
+        const std::string &reason = {})
+{
+    fb::RigExecWireExportEntry entry;
+    entry.semanticKey = key;
+    entry.phase = phase;
+    entry.payload = payload;
+    entry.kind = kind;
+    entry.storage = storage;
+    entry.object = object;
+    entry.version = version;
+    entry.producerValue = producer;
+    entry.capability = capability;
+    entry.reason = reason;
+    return entry;
+}
+
+/// The rich file with its graph values and a catalog that names five of
+/// them: a property chain's base, a provider slot's final matrix, a
+/// geometry chain's base and final points, and the same final points
+/// address the compiled rig cannot extract. The semantic keys are opaque
+/// texts here; the writer spells them with the demand contract's key.
+RigExecWireFile
+_ExportFile()
+{
+    RigExecWireFile f = _RichFile();
+    const auto value = [&](SlotDomain domain, uint32_t slot) {
+        fb::RigExecWireCommonValueSpec spec;
+        spec.domain = uint32_t(domain);
+        spec.slot = slot;
+        f.commonGraph->valueSpecs.push_back(spec);
+        return uint32_t(f.commonGraph->valueSpecs.size() - 1);
+    };
+    const uint32_t property = value(SlotDomain::PropertyResult, 0);
+    const uint32_t fin = value(SlotDomain::FinalMatrix, 0);
+    const uint32_t chainBase = value(SlotDomain::ChainBase, 0);
+    const uint32_t fuse = value(SlotDomain::RevisionDone, 0);
+    f.exportCatalog = std::make_unique<fb::RigExecWireExportCatalog>();
+    f.exportCatalog->entries = {
+        _Export("a:property", "base", ExportPayload::Double, ExportKind::Scalar,
+                ExportStorage::PropertyValue, 0, 0, property),
+        _Export("b:provider", "final", ExportPayload::Matrix4d,
+                ExportKind::Transform, ExportStorage::ProviderMatrix, 0, 0,
+                fin),
+        _Export("c:points", "base", ExportPayload::Point3dArray,
+                ExportKind::Points, ExportStorage::PointVersion, 0, 0,
+                chainBase),
+        _Export("d:points", "final", ExportPayload::Point3dArray,
+                ExportKind::Points, ExportStorage::PointVersion, 0, 1, fuse),
+        _Export("e:points", "final", ExportPayload::Point3dArray,
+                ExportKind::Points, ExportStorage::PointVersion, 0, 1, -1,
+                ExportCapability::Unusable,
+                "GPU-only points export has no CPU payload")};
+    return f;
+}
+
+/// The record file (one frame record with its FrameMatrix step) naming that
+/// record's matrix as an export, spelled the way discovery spells it: the
+/// record index as the object, the record index plus one as the version.
+RigExecWireFile
+_ExportFrameFile()
+{
+    RigExecWireFile f = _RecordFile();
+    for (const SlotDomain domain :
+         {SlotDomain::BaseMatrix, SlotDomain::FrameMatrix}) {
+        fb::RigExecWireCommonValueSpec spec;
+        spec.domain = uint32_t(domain);
+        spec.slot = 0;
+        f.commonGraph->valueSpecs.push_back(spec);
+    }
+    f.exportCatalog = std::make_unique<fb::RigExecWireExportCatalog>();
+    f.exportCatalog->entries = {
+        _Export("f:frame", "final", ExportPayload::Matrix4d,
+                ExportKind::Transform, ExportStorage::FrameMatrix, 0, 1, 1)};
+    return f;
+}
+
+void
+TestExportCatalogRoundTrip()
+{
+    _context = "export catalog round trip";
+    const RigExecWireFile file = _ExportFile();
+    std::vector<uint8_t> bytes;
+    std::string why;
+    CHECK(_Write(file, &bytes, &why));
+    const auto opened = _Open(bytes, &why);
+    CHECK(opened != nullptr);
+    if (!opened)
+        return;
+    CHECK(opened->exportCatalog != nullptr);
+    if (!opened->exportCatalog)
+        return;
+    const auto &back = opened->exportCatalog->entries;
+    const auto &want = file.exportCatalog->entries;
+    CHECK(back.size() == want.size());
+    for (size_t k = 0; k < back.size() && k < want.size(); ++k) {
+        CHECK(back[k].semanticKey == want[k].semanticKey);
+        CHECK(back[k].phase == want[k].phase);
+        CHECK(back[k].payload == want[k].payload);
+        CHECK(back[k].kind == want[k].kind);
+        CHECK(back[k].storage == want[k].storage);
+        CHECK(back[k].object == want[k].object);
+        CHECK(back[k].version == want[k].version);
+        CHECK(back[k].producerValue == want[k].producerValue);
+        CHECK(back[k].capability == want[k].capability);
+        CHECK(back[k].reason == want[k].reason);
+    }
+    std::vector<uint8_t> again;
+    CHECK(_Write(*opened, &again, &why) && again == bytes);
+
+    // A frame record's matrix, spelled the way discovery spells it.
+    _context = "export catalog: a frame record";
+    const RigExecWireFile framed = _ExportFrameFile();
+    std::vector<uint8_t> frameBytes;
+    CHECK(_Write(framed, &frameBytes, &why));
+    const auto frameOpened = _Open(frameBytes, &why);
+    CHECK(frameOpened != nullptr);
+    if (frameOpened && frameOpened->exportCatalog) {
+        const auto &got = frameOpened->exportCatalog->entries;
+        CHECK(got.size() == 1);
+        CHECK(got.empty() || (got[0].storage == ExportStorage::FrameMatrix &&
+                              got[0].object == 0 && got[0].version == 1 &&
+                              got[0].payload == ExportPayload::Matrix4d));
+        std::vector<uint8_t> rewrote;
+        CHECK(_Write(*frameOpened, &rewrote, &why) && rewrote == frameBytes);
+    }
+
+    // A current file with nothing to export names no catalog, and an older
+    // one exposes no fabricated export.
+    _context = "export catalog: no catalog";
+    const auto bare = _Open(_PackUnchecked(_RichFile()), &why);
+    CHECK(bare && bare->exportCatalog == nullptr);
+    RigExecWireFile legacy = _RichFile();
+    legacy.formatVersion = RigExecFormatExportCatalogVersion - 1;
+    const auto old = _Open(_PackUnchecked(legacy), &why);
+    CHECK(old && old->formatVersion == RigExecFormatExportCatalogVersion - 1 &&
+          old->exportCatalog == nullptr);
+}
+
+void
+TestExportCatalogRefusals()
+{
+    const auto reject = [](RigExecWireFile bad, const char *fragment) {
+        std::vector<uint8_t> written;
+        std::string error;
+        CHECK(!_Write(bad, &written, &error));
+        CHECK(_Contains(error, fragment));
+        error.clear();
+        CHECK(!_Open(_PackUnchecked(bad), &error));
+        CHECK(_Contains(error, fragment));
+    };
+    auto at = [](RigExecWireFile &file,
+                 size_t row) -> fb::RigExecWireExportEntry & {
+        return file.exportCatalog->entries[row];
+    };
+
+    _context = "export catalog refusals: empty key";
+    auto bad = _ExportFile();
+    at(bad, 0).semanticKey.clear();
+    reject(std::move(bad), "empty semantic_key");
+
+    _context = "export catalog refusals: empty phase";
+    bad = _ExportFile();
+    at(bad, 0).phase.clear();
+    reject(std::move(bad), "empty phase");
+
+    _context = "export catalog refusals: duplicate key";
+    bad = _ExportFile();
+    at(bad, 1).semanticKey = at(bad, 0).semanticKey;
+    reject(std::move(bad), "duplicate or an unsorted catalog");
+
+    _context = "export catalog refusals: unsorted keys";
+    bad = _ExportFile();
+    std::swap(bad.exportCatalog->entries[0], bad.exportCatalog->entries[1]);
+    reject(std::move(bad), "duplicate or an unsorted catalog");
+
+    _context = "export catalog refusals: kind and payload";
+    bad = _ExportFile();
+    at(bad, 1).kind = ExportKind::Scalar;
+    reject(std::move(bad), "payload, kind and storage disagree");
+
+    _context = "export catalog refusals: scratch storage";
+    bad = _ExportFile();
+    at(bad, 1).storage = ExportStorage::PointVersion;
+    reject(std::move(bad), "payload, kind and storage disagree");
+
+    _context = "export catalog refusals: no such property chain";
+    bad = _ExportFile();
+    at(bad, 0).object = uint32_t(bad.propertyChains.size());
+    reject(std::move(bad), "is no property chain");
+
+    _context = "export catalog refusals: property version";
+    bad = _ExportFile();
+    at(bad, 0).version = uint32_t(bad.propertyChains[0].revisions.size() + 1);
+    reject(std::move(bad), "is past property chain");
+
+    _context = "export catalog refusals: no such provider slot";
+    bad = _ExportFile();
+    at(bad, 1).object = uint32_t(bad.slotMeta->paths.size());
+    reject(std::move(bad), "is no provider slot");
+
+    _context = "export catalog refusals: provider version";
+    bad = _ExportFile();
+    at(bad, 1).version = 1;
+    reject(std::move(bad), "a provider matrix has no version index");
+
+    _context = "export catalog refusals: no such frame record";
+    bad = _ExportFile();
+    at(bad, 1).storage = ExportStorage::FrameMatrix;
+    reject(std::move(bad), "is no frame record");
+
+    _context = "export catalog refusals: frame record version";
+    bad = _ExportFrameFile();
+    at(bad, 0).version = 2; // record 0 carries version 1
+    reject(std::move(bad), "carries version");
+
+    _context = "export catalog refusals: frame matrix producer";
+    bad = _ExportFrameFile();
+    at(bad, 0).producerValue = 0;
+    reject(std::move(bad), "binds a slot domain its storage does not answer");
+
+    _context = "export catalog refusals: no such point version";
+    bad = _ExportFile();
+    at(bad, 2).version = uint32_t(bad.geometry->chains[0].revisions.size() + 1);
+    reject(std::move(bad), "is past chain");
+
+    _context = "export catalog refusals: no such geometry chain";
+    bad = _ExportFile();
+    at(bad, 2).object = uint32_t(bad.geometry->chains.size());
+    reject(std::move(bad), "is no geometry chain");
+
+    _context = "export catalog refusals: producer out of range";
+    bad = _ExportFile();
+    at(bad, 0).producerValue = int32_t(bad.commonGraph->valueSpecs.size() + 7);
+    reject(std::move(bad), "is no graph value");
+
+    _context = "export catalog refusals: producer domain";
+    bad = _ExportFile();
+    at(bad, 0).producerValue = 1; // a final matrix, not a property result
+    reject(std::move(bad), "binds a slot domain its storage does not answer");
+
+    _context = "export catalog refusals: extractable with no producer";
+    bad = _ExportFile();
+    at(bad, 0).producerValue = -1;
+    reject(std::move(bad), "no producer value, so it is not extractable");
+
+    _context = "export catalog refusals: unusable without a reason";
+    bad = _ExportFile();
+    at(bad, 4).reason.clear();
+    reject(std::move(bad), "an unusable export names no reason");
+
+    _context = "export catalog refusals: more entries than the program";
+    bad = _ExportFile();
+    for (size_t k = 0;
+         k <= bad.geometry->chains.size() + bad.propertyChains.size() +
+                  bad.slotMeta->paths.size();
+         ++k) {
+        bad.exportCatalog->entries.push_back(
+            _Export("{" + std::to_string(k), "final", ExportPayload::Double,
+                    ExportKind::Scalar, ExportStorage::PropertyValue, 0, 0));
+    }
+    reject(std::move(bad), "the program can retain at most");
+
+    _context = "export catalog refusals: older format";
+    bad = _ExportFile();
+    bad.formatVersion = RigExecFormatExportCatalogVersion - 1;
+    reject(std::move(bad), "export_catalog in a format older than");
+}
+
+}  // namespace
 
 int
 main()
@@ -7092,6 +7376,8 @@ main()
     TestExtendedSettingNames();
     TestPathText();
     TestValidationSmoke();
+    TestExportCatalogRoundTrip();
+    TestExportCatalogRefusals();
     TestStepGraph();
     TestPresentationIdentifier();
     TestExternalMovers();

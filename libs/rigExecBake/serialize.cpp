@@ -5,6 +5,7 @@
 #include "rigExecBake/pathTable.h"
 #include "rigExecBake/staticCapture.h"
 #include "rigExec/bakedProgramImpl.h"
+#include "rigExec/outputCatalog.h"
 #include "rigExec/rigEvaluator.h"
 #include "rigExecScene/providerRecordExport.h"
 
@@ -2090,6 +2091,145 @@ RigExecBakeFillFile(const RigExecBakedProgramImpl &program,
         *error = why;
     }
     return false;
+}
+
+namespace {
+
+// The wire enums mirror the runtime's in order; the order is part of the
+// format, so a reordered enumerator fails the build, not the bake.
+static_assert(uint8_t(RigExecOutputKind::Scalar) ==
+                      uint8_t(fb::ExportKind::Scalar) &&
+                  uint8_t(RigExecOutputKind::Transform) ==
+                      uint8_t(fb::ExportKind::Transform) &&
+                  uint8_t(RigExecOutputKind::Points) ==
+                      uint8_t(fb::ExportKind::Points),
+              "export kind order drifted");
+static_assert(uint8_t(RigExecOutputStorage::PropertyValue) ==
+                      uint8_t(fb::ExportStorage::PropertyValue) &&
+                  uint8_t(RigExecOutputStorage::ProviderMatrix) ==
+                      uint8_t(fb::ExportStorage::ProviderMatrix) &&
+                  uint8_t(RigExecOutputStorage::FrameMatrix) ==
+                      uint8_t(fb::ExportStorage::FrameMatrix) &&
+                  uint8_t(RigExecOutputStorage::PointVersion) ==
+                      uint8_t(fb::ExportStorage::PointVersion),
+              "export storage order drifted");
+
+// The catalog's kinds and layouts travel as the schema's numbers; a new
+// runtime enumerator with no wire counterpart fails the bake, not the read.
+bool
+_ExportPayload(const std::string &type, fb::ExportPayload *out)
+{
+    if (type == RigExecPayloadText::scalar) {
+        *out = fb::ExportPayload::Double;
+    } else if (type == RigExecPayloadText::matrix4x4Row) {
+        *out = fb::ExportPayload::Matrix4d;
+    } else if (type == RigExecPayloadText::point3) {
+        *out = fb::ExportPayload::Point3dArray;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool
+_ExportKind(RigExecOutputKind kind, fb::ExportKind *out)
+{
+    switch (kind) {
+    case RigExecOutputKind::Scalar:
+        *out = fb::ExportKind::Scalar;
+        return true;
+    case RigExecOutputKind::Transform:
+        *out = fb::ExportKind::Transform;
+        return true;
+    case RigExecOutputKind::Points:
+        *out = fb::ExportKind::Points;
+        return true;
+    }
+    return false;
+}
+
+bool
+_ExportStorage(RigExecOutputStorage storage, fb::ExportStorage *out)
+{
+    switch (storage) {
+    case RigExecOutputStorage::PropertyValue:
+        *out = fb::ExportStorage::PropertyValue;
+        return true;
+    case RigExecOutputStorage::ProviderMatrix:
+        *out = fb::ExportStorage::ProviderMatrix;
+        return true;
+    case RigExecOutputStorage::FrameMatrix:
+        *out = fb::ExportStorage::FrameMatrix;
+        return true;
+    case RigExecOutputStorage::PointVersion:
+        *out = fb::ExportStorage::PointVersion;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool
+RigExecBakeFillExportCatalog(const RigExecOutputCatalog &catalog,
+                             fb::RigExecWireFile *file, std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error) {
+            *error = message;
+        }
+        return false;
+    };
+    if (!file) {
+        return fail("no file to fill");
+    }
+    if (catalog.GetBindings().empty()) {
+        return true;
+    }
+    auto out = std::make_unique<fb::RigExecWireExportCatalog>();
+    out->entries.reserve(catalog.GetBindings().size());
+    for (const RigExecOutputBinding &binding : catalog.GetBindings()) {
+        const std::string where = "export " + binding.descriptor.semanticKey;
+        fb::RigExecWireExportEntry entry;
+        if (!_ExportPayload(binding.handle.type, &entry.payload)) {
+            return fail(where + " names payload type " + binding.handle.type +
+                        " the format cannot spell");
+        }
+        if (!_ExportKind(binding.kind, &entry.kind)) {
+            return fail(where + " names an output kind the format cannot "
+                                "spell");
+        }
+        if (!_ExportStorage(binding.storage, &entry.storage)) {
+            return fail(where + " names retained storage the format cannot "
+                                "spell");
+        }
+        // A catalog from discovery holds a discovery status: a runtime
+        // status here means the catalog is not this compile's.
+        if (binding.status != RigExecOutputStatus::Pending &&
+            binding.status != RigExecOutputStatus::Unsupported) {
+            return fail(where + " holds status " +
+                        RigExecOutputStatusText(binding.status));
+        }
+        entry.semanticKey = binding.descriptor.semanticKey;
+        entry.phase = binding.descriptor.phase;
+        entry.object = binding.object;
+        entry.version = binding.version;
+        entry.producerValue = binding.producerValue == kRigExecNoOutputValue
+                                  ? -1
+                                  : int32_t(binding.producerValue);
+        entry.capability = binding.status == RigExecOutputStatus::Unsupported
+                               ? fb::ExportCapability::Unusable
+                               : fb::ExportCapability::Extractable;
+        entry.reason = binding.reason;
+        out->entries.push_back(std::move(entry));
+    }
+    std::sort(out->entries.begin(), out->entries.end(),
+              [](const fb::RigExecWireExportEntry &a,
+                 const fb::RigExecWireExportEntry &b) {
+                  return a.semanticKey < b.semanticKey;
+              });
+    file->exportCatalog = std::move(out);
+    return true;
 }
 
 } // namespace rigExec

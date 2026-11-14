@@ -496,6 +496,8 @@ using RigExecWirePropertyChain = fb::RigExecWirePropertyChain;
 using RigExecWirePhasedConsumer = fb::RigExecWirePhasedConsumer;
 using RigExecWireExternalMover = fb::RigExecWireExternalMover;
 using RigExecWirePointsBinding = fb::RigExecWirePointsBinding;
+using RigExecWireExportEntry = fb::RigExecWireExportEntry;
+using RigExecWireExportCatalog = fb::RigExecWireExportCatalog;
 
 // The schema's index structs, read through accessors (domain(), name()).
 using RigExecWireSlotRange = fb::SlotRange;
@@ -518,6 +520,10 @@ using RigExecWirePathKind = fb::PathKind;
 using RigExecWirePathTag = fb::PathTag;
 using RigExecWirePropertyValueType = fb::PropertyValueType;
 using RigExecWirePropertyOp = fb::PropertyOp;
+using RigExecWireExportPayload = fb::ExportPayload;
+using RigExecWireExportKind = fb::ExportKind;
+using RigExecWireExportStorage = fb::ExportStorage;
+using RigExecWireExportCapability = fb::ExportCapability;
 
 /// Bits of RigExecWireConstraint::flags (fb::ConstraintFlags).
 inline constexpr uint8_t RigExecWireConstraintBlendShear =
@@ -595,7 +601,15 @@ inline constexpr uint8_t RigExecWireConstraintRadialBlend =
 /// Format 32 adds RevisionBinding.normals_per_corner and
 /// normals_left_handed: a RecomputeNormals target's faceVarying layout and
 /// leftHanded orientation. Older files hold neither.
-inline constexpr uint32_t RigExecFormatVersion = 32;
+///
+/// Format 33 adds the export catalog (File.export_catalog): the outputs the
+/// compiled program exports explicitly, each one a semantic address (target,
+/// public computation and read phase), the payload layout it answers with,
+/// and the retained storage behind it. A file names no time and no live
+/// handle: the rig instance and compile epoch belong to whoever opens it.
+/// Older files hold no catalog, so a new reader exposes no intermediate
+/// export for them.
+inline constexpr uint32_t RigExecFormatVersion = 33;
 
 /// The first format version whose RecomputeNormals binding may carry the
 /// normals layout.
@@ -603,6 +617,9 @@ inline constexpr uint32_t RigExecFormatNormalsLayoutVersion = 32;
 
 /// The first format version that may hold a Range Smooth or DeltaMush.
 inline constexpr uint32_t RigExecFormatRangeSmoothVersion = 28;
+
+/// The first format version whose file may name explicit exports.
+inline constexpr uint32_t RigExecFormatExportCatalogVersion = 33;
 
 /// Fields every Solver row carries before its kind-specific inputs, in
 /// registration order: the bake numbers them (serialize.cpp), the runtime
@@ -724,9 +741,13 @@ inline constexpr char RigExecFormatIdentifier[] = "REXB";
 /// lattices and gates rest on), chain base, painted and oracle slots, path
 /// reads, property chains, external movers, the extended deformer settings
 /// of its format version (none in format 20; each op's frame provider
-/// count in 21) and the nested presentation (bounded like Open's buffer,
-/// then verified with its REXP identifier). Any readable format version
-/// validates. False with a reason naming the table, index and field.
+/// count in 21), the nested presentation (bounded like Open's buffer,
+/// then verified with its REXP identifier) and the export catalog (distinct
+/// semantic addresses in order, their payload/kind/storage agreement, their
+/// binding ranges and producer domains, and a count the program can hold).
+/// A catalog in a file older than RigExecFormatExportCatalogVersion is
+/// refused. Any readable format version validates. False with a reason
+/// naming the table, index and field.
 bool RigExecFormatValidate(const fb::RigExecWireFile &file, std::string *error);
 
 /// Decodes \p bytes: refuses a buffer shorter than 8 bytes, the old REXB
@@ -760,6 +781,33 @@ std::string RigExecFormatPathText(const fb::RigExecWireFile &file, uint32_t id);
 /// kind and the object's number.
 std::string RigExecFormatStepLabel(const fb::RigExecWireFile &file,
                                    size_t step);
+
+/// Whether an export whose storage is \p storage may name a producer value
+/// in slot domain \p domain (an fb::SlotDomain number): a property value
+/// binds PropertyResult, a provider matrix BaseMatrix or FinalMatrix, a
+/// frame record FrameMatrix, and a point version ChainBase, ChainPoints or
+/// RevisionDone. False for a storage this format does not answer. The
+/// validator and any consumer resolving a binding share it, so a binding
+/// never names scratch.
+inline constexpr bool
+RigExecFormatExportDomainMatches(fb::ExportStorage storage, uint32_t domain)
+{
+    using Domain = fb::SlotDomain;
+    switch (storage) {
+    case fb::ExportStorage::PropertyValue:
+        return domain == uint32_t(Domain::PropertyResult);
+    case fb::ExportStorage::ProviderMatrix:
+        return domain == uint32_t(Domain::BaseMatrix) ||
+               domain == uint32_t(Domain::FinalMatrix);
+    case fb::ExportStorage::FrameMatrix:
+        return domain == uint32_t(Domain::FrameMatrix);
+    case fb::ExportStorage::PointVersion:
+        return domain == uint32_t(Domain::ChainBase) ||
+               domain == uint32_t(Domain::ChainPoints) ||
+               domain == uint32_t(Domain::RevisionDone);
+    }
+    return false;
+}
 
 /// The evaluator's shape rule for a skin layout (RigExecBuildSkinTopology):
 /// \p indexCount indices and \p weightCount weights are rows of an

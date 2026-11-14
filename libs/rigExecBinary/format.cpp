@@ -548,7 +548,7 @@ private:
         return _Root() && _Paths() && _Values() && _Pools() && _Slots() &&
                _SlotMeta() && _Constants() && _Steps() && _Cones() && _Pose() &&
                _Geometry() && _LayoutValues() && _PhaseBindings() &&
-               _PropertyChains() && _CrossDomainTables() &&
+               _PropertyChains() && _ExportCatalog() && _CrossDomainTables() &&
                _ConsumerLeafSites() && _WeightFieldTables() &&
                _ProviderTables() && _PoseBodyDeclarations() && _HeadChecks() &&
                _StepGraph() && _SolverSemanticRequirements() &&
@@ -8814,6 +8814,173 @@ private:
                     return _Bad(_At(row, "hops", long(j)) + ": slot " +
                                 _N(phased.hops[j]) + " is an array input");
                 }
+            }
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------ export catalog
+
+    /// The exports a format-32 file names explicitly. An older file holds
+    /// none, so a catalog there is a refusal rather than an empty answer;
+    /// a current file with nothing to export holds no catalog at all.
+    bool _ExportCatalog()
+    {
+        if (_f.formatVersion < RigExecFormatExportCatalogVersion) {
+            if (_f.exportCatalog && !_f.exportCatalog->entries.empty()) {
+                return _Bad("export_catalog in a format older than " +
+                            _N(RigExecFormatExportCatalogVersion));
+            }
+            return true;
+        }
+        if (!_f.exportCatalog) {
+            return true;
+        }
+        const auto &entries = _f.exportCatalog->entries;
+        // The catalog describes retained outputs, so it cannot outrun the
+        // tables that retain them: at most one export per property-chain
+        // version, provider base and final, frame record, and point
+        // version. The bound holds a crafted buffer's allocation down to
+        // the program's size.
+        size_t capacity = _f.pose->frameRecords.size() + 2 * _slots;
+        for (const auto &chain : _f.propertyChains) {
+            capacity += chain.revisions.size() + 2;
+        }
+        for (const auto &chain : _f.geometry->chains) {
+            capacity += chain.revisions.size() + 2;
+        }
+        if (entries.size() > capacity) {
+            return _Bad("export_catalog holds " + _N(entries.size()) +
+                        " entries; the program can retain at most " +
+                        _N(capacity));
+        }
+        for (size_t k = 0; k < entries.size(); ++k) {
+            const auto &entry = entries[k];
+            const std::string row = _At("export_catalog.entries", "", long(k));
+            if (entry.semanticKey.empty()) {
+                return _Bad(row + ": empty semantic_key");
+            }
+            if (k > 0 && !(entries[k - 1].semanticKey < entry.semanticKey)) {
+                return _Bad(row + ": semantic_key is not greater than the "
+                                  "entry before it (a duplicate or an "
+                                  "unsorted catalog)");
+            }
+            if (entry.phase.empty()) {
+                return _Bad(row + ": empty phase");
+            }
+            if (entry.payload > fb::ExportPayload::MAX ||
+                entry.kind > fb::ExportKind::MAX ||
+                entry.storage > fb::ExportStorage::MAX ||
+                entry.capability > fb::ExportCapability::MAX) {
+                return _Bad(row + ": an export enum is out of range");
+            }
+            // The layout, the kind and the storage are three views of one
+            // answer, so they must agree; scratch is not an answer.
+            const bool agrees =
+                (entry.payload == fb::ExportPayload::Double &&
+                 entry.storage == fb::ExportStorage::PropertyValue &&
+                 entry.kind == fb::ExportKind::Scalar) ||
+                (entry.payload == fb::ExportPayload::Matrix4d &&
+                 (entry.storage == fb::ExportStorage::ProviderMatrix ||
+                  entry.storage == fb::ExportStorage::FrameMatrix) &&
+                 entry.kind == fb::ExportKind::Transform) ||
+                (entry.payload == fb::ExportPayload::Point3dArray &&
+                 entry.storage == fb::ExportStorage::PointVersion &&
+                 entry.kind == fb::ExportKind::Points);
+            if (!agrees) {
+                return _Bad(row + ": payload, kind and storage disagree");
+            }
+            // The binding must address the object its storage names, and a
+            // version that object can hold.
+            switch (entry.storage) {
+            case fb::ExportStorage::PropertyValue: {
+                if (entry.object >= _f.propertyChains.size()) {
+                    return _Bad(row + ": object " + _N(entry.object) +
+                                " is no property chain (" +
+                                _N(_f.propertyChains.size()) + ")");
+                }
+                const auto &chain = _f.propertyChains[entry.object];
+                if (entry.version > chain.revisions.size()) {
+                    return _Bad(row + ": version " + _N(entry.version) +
+                                " is past property chain " + _N(entry.object) +
+                                "'s " + _N(chain.revisions.size()) +
+                                " revisions");
+                }
+                if (chain.valueType != fb::PropertyValueType::Float &&
+                    chain.valueType != fb::PropertyValueType::Double) {
+                    return _Bad(row + ": property chain " + _N(entry.object) +
+                                " is not a float or double chain, so it "
+                                "answers no scalar export");
+                }
+                break;
+            }
+            case fb::ExportStorage::ProviderMatrix:
+                if (entry.object >= _slots) {
+                    return _Bad(row + ": object " + _N(entry.object) +
+                                " is no provider slot (" + _N(_slots) + ")");
+                }
+                if (entry.version != 0) {
+                    return _Bad(row + ": a provider matrix has no version "
+                                      "index");
+                }
+                break;
+            case fb::ExportStorage::FrameMatrix: {
+                if (entry.object >= _f.pose->frameRecords.size()) {
+                    return _Bad(row + ": object " + _N(entry.object) +
+                                " is no frame record (" +
+                                _N(_f.pose->frameRecords.size()) + ")");
+                }
+                if (entry.version != entry.object + 1) {
+                    return _Bad(row + ": frame record " + _N(entry.object) +
+                                " carries version " + _N(entry.object + 1));
+                }
+                break;
+            }
+            case fb::ExportStorage::PointVersion: {
+                if (entry.object >= _f.geometry->chains.size()) {
+                    return _Bad(row + ": object " + _N(entry.object) +
+                                " is no geometry chain (" +
+                                _N(_f.geometry->chains.size()) + ")");
+                }
+                const auto &chain = _f.geometry->chains[entry.object];
+                if (entry.version > chain.revisions.size()) {
+                    return _Bad(row + ": version " + _N(entry.version) +
+                                " is past chain " + _N(entry.object) + "'s " +
+                                _N(chain.revisions.size()) + " point versions");
+                }
+                break;
+            }
+            default:
+                return _Bad(row + ": an export enum is out of range");
+            }
+            // An address with no canonical producer is reported as
+            // unusable, never answered from fabricated bytes.
+            if (entry.producerValue == -1) {
+                if (entry.capability != fb::ExportCapability::Unusable) {
+                    return _Bad(row + ": no producer value, so it is not "
+                                      "extractable");
+                }
+                if (entry.reason.empty()) {
+                    return _Bad(row + ": an unusable export names no reason");
+                }
+                continue;
+            }
+            if (size_t(entry.producerValue) >=
+                _f.commonGraph->valueSpecs.size()) {
+                return _Bad(row + ": producer_value " +
+                            _N(size_t(entry.producerValue)) +
+                            " is no graph value (" +
+                            _N(_f.commonGraph->valueSpecs.size()) + ")");
+            }
+            const auto &spec =
+                _f.commonGraph->valueSpecs[size_t(entry.producerValue)];
+            if (!RigExecFormatExportDomainMatches(entry.storage, spec.domain)) {
+                return _Bad(row + ": producer_value binds a slot domain its "
+                                  "storage does not answer");
+            }
+            if (entry.capability == fb::ExportCapability::Unusable &&
+                entry.reason.empty()) {
+                return _Bad(row + ": an unusable export names no reason");
             }
         }
         return true;

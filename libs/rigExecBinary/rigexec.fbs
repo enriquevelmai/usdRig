@@ -1812,6 +1812,67 @@ table ProviderProgram {
 /// common_graph (RigExecSettleWindowLayout).
 table WindowedOp { step: int = -1; frames: uint; }
 
+// ---------------------------------------------------------- export catalog
+
+// Format 33. The discoverable evaluated outputs of the file's compiled
+// program: the addresses a host may ask the runtime to produce at an exact
+// frame. They are facts of the compiled rig, never of a frame: no entry
+// names a time, and none carries a live handle, a rig instance or a
+// compile epoch, which belong to whoever opens the file.
+
+/// The payload layout an export answers with, spelled by the demand
+/// contract's handle types (rigExecGraph/outputDemand.h): "double",
+/// "matrix4d" and "point3d[]". Append only.
+enum ExportPayload : ubyte { Double = 0, Matrix4d = 1, Point3dArray = 2 }
+
+/// The runtime kind of an export: RigExecOutputKind, in the same order.
+enum ExportKind : ubyte { Scalar = 0, Transform = 1, Points = 2 }
+
+/// The retained storage an extractor reads: RigExecOutputStorage, in the
+/// same order. A scratch packet, candidate, chunk or staging slot has no
+/// enumerator here, and a file that binds one is refused.
+enum ExportStorage : ubyte { PropertyValue = 0, ProviderMatrix = 1,
+  FrameMatrix = 2, PointVersion = 3 }
+
+/// Whether this file's runtime can produce the payload. Unusable names an
+/// address the compiled rig retained but cannot extract here, a GPU-only
+/// points chain among them; `reason` says which.
+enum ExportCapability : ubyte { Extractable = 0, Unusable = 1 }
+
+/// One export: its semantic address, the layout it answers with, and the
+/// retained storage behind it. The semantic key is the address the demand
+/// contract uses (target, public computation and read phase, each
+/// length-prefixed); dense slots and value ids never enter it. Entries are
+/// sorted strictly by semantic_key, so a duplicate is a rule violation
+/// rather than a second answer.
+table ExportEntry {
+  /// The canonical semantic key of the output.
+  semantic_key: string (required);
+  /// The read phase the key addresses: "base", "final", or the mover path
+  /// that published it.
+  phase: string (required);
+  payload: ExportPayload;
+  /// The kind that agrees with payload.
+  kind: ExportKind;
+  /// Storage plus the object and version it names: a property chain and
+  /// its value version, a provider slot, a pose.frame_records index, or a
+  /// geometry chain and its point version.
+  storage: ExportStorage;
+  object: uint;
+  version: uint;
+  /// common_graph.value_specs id of the canonical producer, or -1 for an
+  /// address the compiled graph retains no producer for.
+  producer_value: int = -1;
+  capability: ExportCapability = Extractable;
+  /// Why the export is not extractable; empty when it is.
+  reason: string;
+}
+/// The exports of one compiled program. Absent below format 33: those files
+/// name no intermediate export, so a new reader exposes none for them.
+table ExportCatalog {
+  entries: [ExportEntry] (native_inline);
+}
+
 // -------------------------------------------------------------------- root
 
 table File {
@@ -1861,6 +1922,8 @@ table File {
   /// float or double primvars:* result is published as a constant primvar,
   /// sorted by target path.
   scalar_primvar_chains: [uint];
+  /// Format 33: the outputs this program exports explicitly.
+  export_catalog: ExportCatalog;
 }
 
 root_type File;

@@ -1514,8 +1514,9 @@ _HeldSettings(fb::RigExecWireFile *file, const std::string &mover)
 }
 
 /// \p file with every format-21 setting of its Delta Mush, lattice and
-/// surface revisions taken out (path reads and leaf sites), relabelled
-/// format 20: what a format-20 export of the same legacy rig holds.
+/// surface revisions taken out (path reads and leaf sites), and with no
+/// export catalog, which format 20 spells no field for, relabelled format
+/// 20: what a format-20 export of the same legacy rig holds.
 static void
 _AsFormat20(fb::RigExecWireFile *file)
 {
@@ -1540,6 +1541,7 @@ _AsFormat20(fb::RigExecWireFile *file)
                         reads.end());
         }
     }
+    file->exportCatalog.reset();
     file->formatVersion = 20;
 }
 
@@ -1623,6 +1625,7 @@ TestExtendedDeformerSettingsBake()
         CHECK(RigExecFormatWrite(*file, &rewritten, &why) &&
               rewritten == bytes);
         fb::RigExecWireFile relabelled(*file);
+        relabelled.exportCatalog.reset();
         relabelled.formatVersion = 20;
         CHECK(_Refused(relabelled, "format 20 holds no"));
         relabelled.formatVersion = RigExecFormatVersion + 1;
@@ -1759,6 +1762,7 @@ TestAffineFrameRecords()
     std::string why;
     CHECK(RigExecFormatWrite(*file, &rewritten, &why) && rewritten == bytes);
     fb::RigExecWireFile previous(*file);
+    previous.exportCatalog.reset();
     previous.formatVersion = 20;
     CHECK(_Refused(previous, "holds no affine frame expressions"));
     fb::RigExecWireFile unknown(*file);
@@ -2738,6 +2742,7 @@ TestRangeChainBake()
            std::to_string(firstBase + ranges - 1) + "]");
     {
         fb::RigExecWireFile legacy(*file);
+        legacy.exportCatalog.reset();
         legacy.formatVersion = 29;
         std::string why;
         CHECK(!RigExecFormatValidate(legacy, &why));

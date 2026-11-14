@@ -7,6 +7,7 @@
 #include "rigExecBake/staticCapture.h"
 #include "rigExec/bakedProgramImpl.h"
 #include "rigExec/movers/moverRegistry.h"
+#include "rigExec/outputCatalog.h"
 #include "rigExec/rigEvaluator.h"
 #include "rigExecBinary/format.h"
 #include "rigExecBinary/generated/presentation_generated.h"
@@ -390,6 +391,17 @@ RigExecBakeToBinary(RigExecRigEvaluator &evaluator,
         return Fail("cannot build the .rigexec file: " + why);
     }
     external.Fill(program, bakeTime, inputs.GetInputs(), &paths, &pools, &file.externalMovers);
+    // The file names its exports explicitly (format 33). The identity and
+    // epoch are this bake's own bookkeeping for the discovery call: the
+    // file carries neither, and the reader mints them when it opens.
+    RigExecOutputCatalog outputs;
+    if (!RigExecDiscoverOutputs(*standing, evaluator.GetRigPath().GetString(),
+                                /*compileEpoch = */ 1, &outputs, &why)) {
+        return Fail("cannot discover the file's exports: " + why);
+    }
+    if (!RigExecBakeFillExportCatalog(outputs, &file, &why)) {
+        return Fail("cannot build the .rigexec export catalog: " + why);
+    }
     file.formatVersion = RigExecFormatVersion;
     file.rig = paths.Path(evaluator.GetRigPath());
     file.bakeTime = bakeTime;

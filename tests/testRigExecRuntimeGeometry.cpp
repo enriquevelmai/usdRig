@@ -5154,8 +5154,9 @@ _StageFromText(const std::string &text)
 }
 
 /// \p file with every format-21 setting of its Delta Mush, lattice and
-/// surface revisions taken out (path reads and leaf sites), relabelled
-/// format 20: what a format-20 export of the same legacy rig holds.
+/// surface revisions taken out (path reads and leaf sites), and with no
+/// export catalog, which format 20 spells no field for, relabelled format
+/// 20: what a format-20 export of the same legacy rig holds.
 static void
 _AsFormat20(fb::RigExecWireFile *file)
 {
@@ -5194,6 +5195,7 @@ _AsFormat20(fb::RigExecWireFile *file)
                         reads.end());
         }
     }
+    file->exportCatalog.reset();
     file->formatVersion = 20;
 }
 

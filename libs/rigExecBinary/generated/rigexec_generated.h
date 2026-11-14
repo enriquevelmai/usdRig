@@ -412,6 +412,14 @@ struct WindowedOp;
 struct WindowedOpBuilder;
 struct RigExecWireWindowedOp;
 
+struct ExportEntry;
+struct ExportEntryBuilder;
+struct RigExecWireExportEntry;
+
+struct ExportCatalog;
+struct ExportCatalogBuilder;
+struct RigExecWireExportCatalog;
+
 struct File;
 struct FileBuilder;
 struct RigExecWireFile;
@@ -635,6 +643,10 @@ inline const ::flatbuffers::TypeTable *ProviderRoutedInputTypeTable();
 inline const ::flatbuffers::TypeTable *ProviderProgramTypeTable();
 
 inline const ::flatbuffers::TypeTable *WindowedOpTypeTable();
+
+inline const ::flatbuffers::TypeTable *ExportEntryTypeTable();
+
+inline const ::flatbuffers::TypeTable *ExportCatalogTypeTable();
 
 inline const ::flatbuffers::TypeTable *FileTypeTable();
 
@@ -2369,6 +2381,148 @@ inline const char *EnumNameCrossDomainReadKind(CrossDomainReadKind e) {
   if (::flatbuffers::IsOutRange(e, CrossDomainReadKind::PointElement, CrossDomainReadKind::Points)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesCrossDomainReadKind()[index];
+}
+
+/// The payload layout an export answers with, spelled by the demand
+/// contract's handle types (rigExecGraph/outputDemand.h): "double",
+/// "matrix4d" and "point3d[]". Append only.
+enum class ExportPayload : uint8_t {
+  Double = 0,
+  Matrix4d = 1,
+  Point3dArray = 2,
+  MIN = Double,
+  MAX = Point3dArray
+};
+
+inline const ExportPayload (&EnumValuesExportPayload())[3] {
+  static const ExportPayload values[] = {
+    ExportPayload::Double,
+    ExportPayload::Matrix4d,
+    ExportPayload::Point3dArray
+  };
+  return values;
+}
+
+inline const char * const *EnumNamesExportPayload() {
+  static const char * const names[4] = {
+    "Double",
+    "Matrix4d",
+    "Point3dArray",
+    nullptr
+  };
+  return names;
+}
+
+inline const char *EnumNameExportPayload(ExportPayload e) {
+  if (::flatbuffers::IsOutRange(e, ExportPayload::Double, ExportPayload::Point3dArray)) return "";
+  const size_t index = static_cast<size_t>(e);
+  return EnumNamesExportPayload()[index];
+}
+
+/// The runtime kind of an export: RigExecOutputKind, in the same order.
+enum class ExportKind : uint8_t {
+  Scalar = 0,
+  Transform = 1,
+  Points = 2,
+  MIN = Scalar,
+  MAX = Points
+};
+
+inline const ExportKind (&EnumValuesExportKind())[3] {
+  static const ExportKind values[] = {
+    ExportKind::Scalar,
+    ExportKind::Transform,
+    ExportKind::Points
+  };
+  return values;
+}
+
+inline const char * const *EnumNamesExportKind() {
+  static const char * const names[4] = {
+    "Scalar",
+    "Transform",
+    "Points",
+    nullptr
+  };
+  return names;
+}
+
+inline const char *EnumNameExportKind(ExportKind e) {
+  if (::flatbuffers::IsOutRange(e, ExportKind::Scalar, ExportKind::Points)) return "";
+  const size_t index = static_cast<size_t>(e);
+  return EnumNamesExportKind()[index];
+}
+
+/// The retained storage an extractor reads: RigExecOutputStorage, in the
+/// same order. A scratch packet, candidate, chunk or staging slot has no
+/// enumerator here, and a file that binds one is refused.
+enum class ExportStorage : uint8_t {
+  PropertyValue = 0,
+  ProviderMatrix = 1,
+  FrameMatrix = 2,
+  PointVersion = 3,
+  MIN = PropertyValue,
+  MAX = PointVersion
+};
+
+inline const ExportStorage (&EnumValuesExportStorage())[4] {
+  static const ExportStorage values[] = {
+    ExportStorage::PropertyValue,
+    ExportStorage::ProviderMatrix,
+    ExportStorage::FrameMatrix,
+    ExportStorage::PointVersion
+  };
+  return values;
+}
+
+inline const char * const *EnumNamesExportStorage() {
+  static const char * const names[5] = {
+    "PropertyValue",
+    "ProviderMatrix",
+    "FrameMatrix",
+    "PointVersion",
+    nullptr
+  };
+  return names;
+}
+
+inline const char *EnumNameExportStorage(ExportStorage e) {
+  if (::flatbuffers::IsOutRange(e, ExportStorage::PropertyValue, ExportStorage::PointVersion)) return "";
+  const size_t index = static_cast<size_t>(e);
+  return EnumNamesExportStorage()[index];
+}
+
+/// Whether this file's runtime can produce the payload. Unusable names an
+/// address the compiled rig retained but cannot extract here, a GPU-only
+/// points chain among them; `reason` says which.
+enum class ExportCapability : uint8_t {
+  Extractable = 0,
+  Unusable = 1,
+  MIN = Extractable,
+  MAX = Unusable
+};
+
+inline const ExportCapability (&EnumValuesExportCapability())[2] {
+  static const ExportCapability values[] = {
+    ExportCapability::Extractable,
+    ExportCapability::Unusable
+  };
+  return values;
+}
+
+inline const char * const *EnumNamesExportCapability() {
+  static const char * const names[3] = {
+    "Extractable",
+    "Unusable",
+    nullptr
+  };
+  return names;
+}
+
+inline const char *EnumNameExportCapability(ExportCapability e) {
+  if (::flatbuffers::IsOutRange(e, ExportCapability::Extractable, ExportCapability::Unusable)) return "";
+  const size_t index = static_cast<size_t>(e);
+  return EnumNamesExportCapability()[index];
 }
 
 FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(8) Vec3d FLATBUFFERS_FINAL_CLASS {
@@ -21568,6 +21722,292 @@ struct WindowedOp::Traits {
 
 ::flatbuffers::Offset<WindowedOp> CreateWindowedOp(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireWindowedOp *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
 
+struct RigExecWireExportEntry : public ::flatbuffers::NativeTable {
+  typedef ExportEntry TableType;
+  std::string semanticKey{};
+  std::string phase{};
+  rigExec::fb::ExportPayload payload = rigExec::fb::ExportPayload::Double;
+  rigExec::fb::ExportKind kind = rigExec::fb::ExportKind::Scalar;
+  rigExec::fb::ExportStorage storage = rigExec::fb::ExportStorage::PropertyValue;
+  uint32_t object = 0;
+  uint32_t version = 0;
+  int32_t producerValue = -1;
+  rigExec::fb::ExportCapability capability = rigExec::fb::ExportCapability::Extractable;
+  std::string reason{};
+};
+
+/// One export: its semantic address, the layout it answers with, and the
+/// retained storage behind it. The semantic key is the address the demand
+/// contract uses (target, public computation and read phase, each
+/// length-prefixed); dense slots and value ids never enter it. Entries are
+/// sorted strictly by semantic_key, so a duplicate is a rule violation
+/// rather than a second answer.
+struct ExportEntry FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef RigExecWireExportEntry NativeTableType;
+  typedef ExportEntryBuilder Builder;
+  struct Traits;
+  static const ::flatbuffers::TypeTable *MiniReflectTypeTable() {
+    return ExportEntryTypeTable();
+  }
+  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
+    VT_SEMANTICKEY = 4,
+    VT_PHASE = 6,
+    VT_PAYLOAD = 8,
+    VT_KIND = 10,
+    VT_STORAGE = 12,
+    VT_OBJECT = 14,
+    VT_VERSION = 16,
+    VT_PRODUCERVALUE = 18,
+    VT_CAPABILITY = 20,
+    VT_REASON = 22
+  };
+  /// The canonical semantic key of the output.
+  const ::flatbuffers::String *semanticKey() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_SEMANTICKEY);
+  }
+  /// The read phase the key addresses: "base", "final", or the mover path
+  /// that published it.
+  const ::flatbuffers::String *phase() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_PHASE);
+  }
+  rigExec::fb::ExportPayload payload() const {
+    return static_cast<rigExec::fb::ExportPayload>(GetField<uint8_t>(VT_PAYLOAD, 0));
+  }
+  /// The kind that agrees with payload.
+  rigExec::fb::ExportKind kind() const {
+    return static_cast<rigExec::fb::ExportKind>(GetField<uint8_t>(VT_KIND, 0));
+  }
+  /// Storage plus the object and version it names: a property chain and
+  /// its value version, a provider slot, a pose.frame_records index, or a
+  /// geometry chain and its point version.
+  rigExec::fb::ExportStorage storage() const {
+    return static_cast<rigExec::fb::ExportStorage>(GetField<uint8_t>(VT_STORAGE, 0));
+  }
+  uint32_t object() const {
+    return GetField<uint32_t>(VT_OBJECT, 0);
+  }
+  uint32_t version() const {
+    return GetField<uint32_t>(VT_VERSION, 0);
+  }
+  /// common_graph.value_specs id of the canonical producer, or -1 for an
+  /// address the compiled graph retains no producer for.
+  int32_t producerValue() const {
+    return GetField<int32_t>(VT_PRODUCERVALUE, -1);
+  }
+  rigExec::fb::ExportCapability capability() const {
+    return static_cast<rigExec::fb::ExportCapability>(GetField<uint8_t>(VT_CAPABILITY, 0));
+  }
+  /// Why the export is not extractable; empty when it is.
+  const ::flatbuffers::String *reason() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_REASON);
+  }
+  template <bool B = false>
+  bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
+    return VerifyTableStart(verifier) &&
+           VerifyOffsetRequired(verifier, VT_SEMANTICKEY) &&
+           verifier.VerifyString(semanticKey()) &&
+           VerifyOffsetRequired(verifier, VT_PHASE) &&
+           verifier.VerifyString(phase()) &&
+           VerifyField<uint8_t>(verifier, VT_PAYLOAD, 1) &&
+           VerifyField<uint8_t>(verifier, VT_KIND, 1) &&
+           VerifyField<uint8_t>(verifier, VT_STORAGE, 1) &&
+           VerifyField<uint32_t>(verifier, VT_OBJECT, 4) &&
+           VerifyField<uint32_t>(verifier, VT_VERSION, 4) &&
+           VerifyField<int32_t>(verifier, VT_PRODUCERVALUE, 4) &&
+           VerifyField<uint8_t>(verifier, VT_CAPABILITY, 1) &&
+           VerifyOffset(verifier, VT_REASON) &&
+           verifier.VerifyString(reason()) &&
+           verifier.EndTable();
+  }
+  RigExecWireExportEntry *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  void UnPackTo(RigExecWireExportEntry *_o, const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  static ::flatbuffers::Offset<ExportEntry> Pack(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportEntry* _o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+};
+
+struct ExportEntryBuilder {
+  typedef ExportEntry Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  void add_semanticKey(::flatbuffers::Offset<::flatbuffers::String> semanticKey) {
+    fbb_.AddOffset(ExportEntry::VT_SEMANTICKEY, semanticKey);
+  }
+  void add_phase(::flatbuffers::Offset<::flatbuffers::String> phase) {
+    fbb_.AddOffset(ExportEntry::VT_PHASE, phase);
+  }
+  void add_payload(rigExec::fb::ExportPayload payload) {
+    fbb_.AddElement<uint8_t>(ExportEntry::VT_PAYLOAD, static_cast<uint8_t>(payload), 0);
+  }
+  void add_kind(rigExec::fb::ExportKind kind) {
+    fbb_.AddElement<uint8_t>(ExportEntry::VT_KIND, static_cast<uint8_t>(kind), 0);
+  }
+  void add_storage(rigExec::fb::ExportStorage storage) {
+    fbb_.AddElement<uint8_t>(ExportEntry::VT_STORAGE, static_cast<uint8_t>(storage), 0);
+  }
+  void add_object(uint32_t object) {
+    fbb_.AddElement<uint32_t>(ExportEntry::VT_OBJECT, object, 0);
+  }
+  void add_version(uint32_t version) {
+    fbb_.AddElement<uint32_t>(ExportEntry::VT_VERSION, version, 0);
+  }
+  void add_producerValue(int32_t producerValue) {
+    fbb_.AddElement<int32_t>(ExportEntry::VT_PRODUCERVALUE, producerValue, -1);
+  }
+  void add_capability(rigExec::fb::ExportCapability capability) {
+    fbb_.AddElement<uint8_t>(ExportEntry::VT_CAPABILITY, static_cast<uint8_t>(capability), 0);
+  }
+  void add_reason(::flatbuffers::Offset<::flatbuffers::String> reason) {
+    fbb_.AddOffset(ExportEntry::VT_REASON, reason);
+  }
+  explicit ExportEntryBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<ExportEntry> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<ExportEntry>(end);
+    fbb_.Required(o, ExportEntry::VT_SEMANTICKEY);
+    fbb_.Required(o, ExportEntry::VT_PHASE);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<ExportEntry> CreateExportEntry(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    ::flatbuffers::Offset<::flatbuffers::String> semanticKey = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> phase = 0,
+    rigExec::fb::ExportPayload payload = rigExec::fb::ExportPayload::Double,
+    rigExec::fb::ExportKind kind = rigExec::fb::ExportKind::Scalar,
+    rigExec::fb::ExportStorage storage = rigExec::fb::ExportStorage::PropertyValue,
+    uint32_t object = 0,
+    uint32_t version = 0,
+    int32_t producerValue = -1,
+    rigExec::fb::ExportCapability capability = rigExec::fb::ExportCapability::Extractable,
+    ::flatbuffers::Offset<::flatbuffers::String> reason = 0) {
+  ExportEntryBuilder builder_(_fbb);
+  builder_.add_reason(reason);
+  builder_.add_producerValue(producerValue);
+  builder_.add_version(version);
+  builder_.add_object(object);
+  builder_.add_phase(phase);
+  builder_.add_semanticKey(semanticKey);
+  builder_.add_capability(capability);
+  builder_.add_storage(storage);
+  builder_.add_kind(kind);
+  builder_.add_payload(payload);
+  return builder_.Finish();
+}
+
+struct ExportEntry::Traits {
+  using type = ExportEntry;
+  static auto constexpr Create = CreateExportEntry;
+};
+
+inline ::flatbuffers::Offset<ExportEntry> CreateExportEntryDirect(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    const char *semanticKey = nullptr,
+    const char *phase = nullptr,
+    rigExec::fb::ExportPayload payload = rigExec::fb::ExportPayload::Double,
+    rigExec::fb::ExportKind kind = rigExec::fb::ExportKind::Scalar,
+    rigExec::fb::ExportStorage storage = rigExec::fb::ExportStorage::PropertyValue,
+    uint32_t object = 0,
+    uint32_t version = 0,
+    int32_t producerValue = -1,
+    rigExec::fb::ExportCapability capability = rigExec::fb::ExportCapability::Extractable,
+    const char *reason = nullptr) {
+  auto semanticKey__ = semanticKey ? _fbb.CreateString(semanticKey) : 0;
+  auto phase__ = phase ? _fbb.CreateString(phase) : 0;
+  auto reason__ = reason ? _fbb.CreateString(reason) : 0;
+  return rigExec::fb::CreateExportEntry(
+      _fbb,
+      semanticKey__,
+      phase__,
+      payload,
+      kind,
+      storage,
+      object,
+      version,
+      producerValue,
+      capability,
+      reason__);
+}
+
+::flatbuffers::Offset<ExportEntry> CreateExportEntry(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportEntry *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+
+struct RigExecWireExportCatalog : public ::flatbuffers::NativeTable {
+  typedef ExportCatalog TableType;
+  std::vector<rigExec::fb::RigExecWireExportEntry> entries{};
+};
+
+/// The exports of one compiled program. Absent below format 32: those files
+/// name no intermediate export, so a new reader exposes none for them.
+struct ExportCatalog FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef RigExecWireExportCatalog NativeTableType;
+  typedef ExportCatalogBuilder Builder;
+  struct Traits;
+  static const ::flatbuffers::TypeTable *MiniReflectTypeTable() {
+    return ExportCatalogTypeTable();
+  }
+  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
+    VT_ENTRIES = 4
+  };
+  const ::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::ExportEntry>> *entries() const {
+    return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::ExportEntry>> *>(VT_ENTRIES);
+  }
+  template <bool B = false>
+  bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
+    return VerifyTableStart(verifier) &&
+           VerifyOffset(verifier, VT_ENTRIES) &&
+           verifier.VerifyVector(entries()) &&
+           verifier.VerifyVectorOfTables(entries()) &&
+           verifier.EndTable();
+  }
+  RigExecWireExportCatalog *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  void UnPackTo(RigExecWireExportCatalog *_o, const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  static ::flatbuffers::Offset<ExportCatalog> Pack(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportCatalog* _o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+};
+
+struct ExportCatalogBuilder {
+  typedef ExportCatalog Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  void add_entries(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::ExportEntry>>> entries) {
+    fbb_.AddOffset(ExportCatalog::VT_ENTRIES, entries);
+  }
+  explicit ExportCatalogBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<ExportCatalog> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<ExportCatalog>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<ExportCatalog> CreateExportCatalog(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::ExportEntry>>> entries = 0) {
+  ExportCatalogBuilder builder_(_fbb);
+  builder_.add_entries(entries);
+  return builder_.Finish();
+}
+
+struct ExportCatalog::Traits {
+  using type = ExportCatalog;
+  static auto constexpr Create = CreateExportCatalog;
+};
+
+inline ::flatbuffers::Offset<ExportCatalog> CreateExportCatalogDirect(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    const std::vector<::flatbuffers::Offset<rigExec::fb::ExportEntry>> *entries = nullptr) {
+  auto entries__ = entries ? _fbb.CreateVector<::flatbuffers::Offset<rigExec::fb::ExportEntry>>(*entries) : 0;
+  return rigExec::fb::CreateExportCatalog(
+      _fbb,
+      entries__);
+}
+
+::flatbuffers::Offset<ExportCatalog> CreateExportCatalog(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportCatalog *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+
 struct RigExecWireFile : public ::flatbuffers::NativeTable {
   typedef File TableType;
   uint32_t formatVersion = 0;
@@ -21604,6 +22044,7 @@ struct RigExecWireFile : public ::flatbuffers::NativeTable {
   std::vector<rigExec::fb::RigExecWireBoolArray> boolArrays{};
   std::vector<rigExec::fb::RigExecWireWindowedOp> windowedOps{};
   std::vector<uint32_t> scalarPrimvarChains{};
+  std::unique_ptr<rigExec::fb::RigExecWireExportCatalog> exportCatalog{};
   RigExecWireFile() = default;
   RigExecWireFile(const RigExecWireFile &o);
   RigExecWireFile(RigExecWireFile&&) FLATBUFFERS_NOEXCEPT = default;
@@ -21651,7 +22092,8 @@ struct File FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_TOKENARRAYS = 64,
     VT_BOOLARRAYS = 66,
     VT_WINDOWEDOPS = 68,
-    VT_SCALARPRIMVARCHAINS = 70
+    VT_SCALARPRIMVARCHAINS = 70,
+    VT_EXPORTCATALOG = 72
   };
   /// RigExecFormatVersion.
   uint32_t formatVersion() const {
@@ -21772,6 +22214,10 @@ struct File FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const ::flatbuffers::Vector<uint32_t> *scalarPrimvarChains() const {
     return GetPointer<const ::flatbuffers::Vector<uint32_t> *>(VT_SCALARPRIMVARCHAINS);
   }
+  /// Format 32: the outputs this program exports explicitly.
+  const rigExec::fb::ExportCatalog *exportCatalog() const {
+    return GetPointer<const rigExec::fb::ExportCatalog *>(VT_EXPORTCATALOG);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -21858,6 +22304,8 @@ struct File FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            verifier.VerifyVectorOfTables(windowedOps()) &&
            VerifyOffset(verifier, VT_SCALARPRIMVARCHAINS) &&
            verifier.VerifyVector(scalarPrimvarChains()) &&
+           VerifyOffset(verifier, VT_EXPORTCATALOG) &&
+           verifier.VerifyTable(exportCatalog()) &&
            verifier.EndTable();
   }
   RigExecWireFile *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -21971,6 +22419,9 @@ struct FileBuilder {
   void add_scalarPrimvarChains(::flatbuffers::Offset<::flatbuffers::Vector<uint32_t>> scalarPrimvarChains) {
     fbb_.AddOffset(File::VT_SCALARPRIMVARCHAINS, scalarPrimvarChains);
   }
+  void add_exportCatalog(::flatbuffers::Offset<rigExec::fb::ExportCatalog> exportCatalog) {
+    fbb_.AddOffset(File::VT_EXPORTCATALOG, exportCatalog);
+  }
   explicit FileBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -22025,8 +22476,10 @@ inline ::flatbuffers::Offset<File> CreateFile(
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::TokenArray>>> tokenArrays = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::BoolArray>>> boolArrays = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rigExec::fb::WindowedOp>>> windowedOps = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<uint32_t>> scalarPrimvarChains = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint32_t>> scalarPrimvarChains = 0,
+    ::flatbuffers::Offset<rigExec::fb::ExportCatalog> exportCatalog = 0) {
   FileBuilder builder_(_fbb);
+  builder_.add_exportCatalog(exportCatalog);
   builder_.add_scalarPrimvarChains(scalarPrimvarChains);
   builder_.add_windowedOps(windowedOps);
   builder_.add_boolArrays(boolArrays);
@@ -22104,7 +22557,8 @@ inline ::flatbuffers::Offset<File> CreateFileDirect(
     const std::vector<::flatbuffers::Offset<rigExec::fb::TokenArray>> *tokenArrays = nullptr,
     const std::vector<::flatbuffers::Offset<rigExec::fb::BoolArray>> *boolArrays = nullptr,
     const std::vector<::flatbuffers::Offset<rigExec::fb::WindowedOp>> *windowedOps = nullptr,
-    const std::vector<uint32_t> *scalarPrimvarChains = nullptr) {
+    const std::vector<uint32_t> *scalarPrimvarChains = nullptr,
+    ::flatbuffers::Offset<rigExec::fb::ExportCatalog> exportCatalog = 0) {
   auto names__ = names ? _fbb.CreateVector<::flatbuffers::Offset<::flatbuffers::String>>(*names) : 0;
   auto paths__ = paths ? _fbb.CreateVectorOfStructs<rigExec::fb::PathNode>(*paths) : 0;
   auto values__ = values ? _fbb.CreateVector<::flatbuffers::Offset<rigExec::fb::Value>>(*values) : 0;
@@ -22163,7 +22617,8 @@ inline ::flatbuffers::Offset<File> CreateFileDirect(
       tokenArrays__,
       boolArrays__,
       windowedOps__,
-      scalarPrimvarChains__);
+      scalarPrimvarChains__,
+      exportCatalog);
 }
 
 ::flatbuffers::Offset<File> CreateFile(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireFile *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -27991,6 +28446,85 @@ inline ::flatbuffers::Offset<WindowedOp> WindowedOp::Pack(::flatbuffers::FlatBuf
       _frames);
 }
 
+inline RigExecWireExportEntry *ExportEntry::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
+  auto _o = std::make_unique<RigExecWireExportEntry>();
+  UnPackTo(_o.get(), _resolver);
+  return _o.release();
+}
+
+inline void ExportEntry::UnPackTo(RigExecWireExportEntry *_o, const ::flatbuffers::resolver_function_t *_resolver) const {
+  (void)_o;
+  (void)_resolver;
+  { auto _e = semanticKey(); if (_e) _o->semanticKey = _e->str(); }
+  { auto _e = phase(); if (_e) _o->phase = _e->str(); }
+  { auto _e = payload(); _o->payload = _e; }
+  { auto _e = kind(); _o->kind = _e; }
+  { auto _e = storage(); _o->storage = _e; }
+  { auto _e = object(); _o->object = _e; }
+  { auto _e = version(); _o->version = _e; }
+  { auto _e = producerValue(); _o->producerValue = _e; }
+  { auto _e = capability(); _o->capability = _e; }
+  { auto _e = reason(); if (_e) _o->reason = _e->str(); }
+}
+
+inline ::flatbuffers::Offset<ExportEntry> CreateExportEntry(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportEntry *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  return ExportEntry::Pack(_fbb, _o, _rehasher);
+}
+
+inline ::flatbuffers::Offset<ExportEntry> ExportEntry::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportEntry* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  (void)_rehasher;
+  (void)_o;
+  struct _VectorArgs { ::flatbuffers::FlatBufferBuilder *__fbb; const RigExecWireExportEntry* __o; const ::flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
+  auto _semanticKey = _fbb.CreateString(_o->semanticKey);
+  auto _phase = _fbb.CreateString(_o->phase);
+  auto _payload = _o->payload;
+  auto _kind = _o->kind;
+  auto _storage = _o->storage;
+  auto _object = _o->object;
+  auto _version = _o->version;
+  auto _producerValue = _o->producerValue;
+  auto _capability = _o->capability;
+  auto _reason = _o->reason.empty() ? 0 : _fbb.CreateString(_o->reason);
+  return rigExec::fb::CreateExportEntry(
+      _fbb,
+      _semanticKey,
+      _phase,
+      _payload,
+      _kind,
+      _storage,
+      _object,
+      _version,
+      _producerValue,
+      _capability,
+      _reason);
+}
+
+inline RigExecWireExportCatalog *ExportCatalog::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
+  auto _o = std::make_unique<RigExecWireExportCatalog>();
+  UnPackTo(_o.get(), _resolver);
+  return _o.release();
+}
+
+inline void ExportCatalog::UnPackTo(RigExecWireExportCatalog *_o, const ::flatbuffers::resolver_function_t *_resolver) const {
+  (void)_o;
+  (void)_resolver;
+  { auto _e = entries(); if (_e) { _o->entries.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->entries[_i] = *std::unique_ptr<rigExec::fb::RigExecWireExportEntry>(_e->Get(_i)->UnPack(_resolver)); } } else { _o->entries.resize(0); } }
+}
+
+inline ::flatbuffers::Offset<ExportCatalog> CreateExportCatalog(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportCatalog *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  return ExportCatalog::Pack(_fbb, _o, _rehasher);
+}
+
+inline ::flatbuffers::Offset<ExportCatalog> ExportCatalog::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireExportCatalog* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  (void)_rehasher;
+  (void)_o;
+  struct _VectorArgs { ::flatbuffers::FlatBufferBuilder *__fbb; const RigExecWireExportCatalog* __o; const ::flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
+  auto _entries = _o->entries.size() ? _fbb.CreateVector<::flatbuffers::Offset<rigExec::fb::ExportEntry>> (_o->entries.size(), [](size_t i, _VectorArgs *__va) { return CreateExportEntry(*__va->__fbb, &(__va->__o->entries[i]), __va->__rehasher); }, &_va ) : 0;
+  return rigExec::fb::CreateExportCatalog(
+      _fbb,
+      _entries);
+}
+
 inline RigExecWireFile::RigExecWireFile(const RigExecWireFile &o)
       : formatVersion(o.formatVersion),
         rig(o.rig),
@@ -28025,7 +28559,8 @@ inline RigExecWireFile::RigExecWireFile(const RigExecWireFile &o)
         tokenArrays(o.tokenArrays),
         boolArrays(o.boolArrays),
         windowedOps(o.windowedOps),
-        scalarPrimvarChains(o.scalarPrimvarChains) {
+        scalarPrimvarChains(o.scalarPrimvarChains),
+        exportCatalog((o.exportCatalog) ? new rigExec::fb::RigExecWireExportCatalog(*o.exportCatalog) : nullptr) {
 }
 
 inline RigExecWireFile &RigExecWireFile::operator=(RigExecWireFile o) FLATBUFFERS_NOEXCEPT {
@@ -28063,6 +28598,7 @@ inline RigExecWireFile &RigExecWireFile::operator=(RigExecWireFile o) FLATBUFFER
   std::swap(boolArrays, o.boolArrays);
   std::swap(windowedOps, o.windowedOps);
   std::swap(scalarPrimvarChains, o.scalarPrimvarChains);
+  std::swap(exportCatalog, o.exportCatalog);
   return *this;
 }
 
@@ -28109,6 +28645,7 @@ inline void File::UnPackTo(RigExecWireFile *_o, const ::flatbuffers::resolver_fu
   { auto _e = boolArrays(); if (_e) { _o->boolArrays.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->boolArrays[_i] = *std::unique_ptr<rigExec::fb::RigExecWireBoolArray>(_e->Get(_i)->UnPack(_resolver)); } } else { _o->boolArrays.resize(0); } }
   { auto _e = windowedOps(); if (_e) { _o->windowedOps.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->windowedOps[_i] = *std::unique_ptr<rigExec::fb::RigExecWireWindowedOp>(_e->Get(_i)->UnPack(_resolver)); } } else { _o->windowedOps.resize(0); } }
   { auto _e = scalarPrimvarChains(); if (_e) { _o->scalarPrimvarChains.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->scalarPrimvarChains[_i] = _e->Get(_i); } } else { _o->scalarPrimvarChains.resize(0); } }
+  { auto _e = exportCatalog(); if (_e) { if(_o->exportCatalog) { _e->UnPackTo(_o->exportCatalog.get(), _resolver); } else { _o->exportCatalog = std::unique_ptr<rigExec::fb::RigExecWireExportCatalog>(_e->UnPack(_resolver)); } } else if (_o->exportCatalog) { _o->exportCatalog.reset(); } }
 }
 
 inline ::flatbuffers::Offset<File> CreateFile(::flatbuffers::FlatBufferBuilder &_fbb, const RigExecWireFile *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -28154,6 +28691,7 @@ inline ::flatbuffers::Offset<File> File::Pack(::flatbuffers::FlatBufferBuilder &
   auto _boolArrays = _o->boolArrays.size() ? _fbb.CreateVector<::flatbuffers::Offset<rigExec::fb::BoolArray>> (_o->boolArrays.size(), [](size_t i, _VectorArgs *__va) { return CreateBoolArray(*__va->__fbb, &(__va->__o->boolArrays[i]), __va->__rehasher); }, &_va ) : 0;
   auto _windowedOps = _o->windowedOps.size() ? _fbb.CreateVector<::flatbuffers::Offset<rigExec::fb::WindowedOp>> (_o->windowedOps.size(), [](size_t i, _VectorArgs *__va) { return CreateWindowedOp(*__va->__fbb, &(__va->__o->windowedOps[i]), __va->__rehasher); }, &_va ) : 0;
   auto _scalarPrimvarChains = _o->scalarPrimvarChains.size() ? _fbb.CreateVector(_o->scalarPrimvarChains) : 0;
+  auto _exportCatalog = _o->exportCatalog ? CreateExportCatalog(_fbb, _o->exportCatalog.get(), _rehasher) : 0;
   return rigExec::fb::CreateFile(
       _fbb,
       _formatVersion,
@@ -28189,7 +28727,8 @@ inline ::flatbuffers::Offset<File> File::Pack(::flatbuffers::FlatBufferBuilder &
       _tokenArrays,
       _boolArrays,
       _windowedOps,
-      _scalarPrimvarChains);
+      _scalarPrimvarChains,
+      _exportCatalog);
 }
 
 inline const ::flatbuffers::TypeTable *InputTagTypeTable() {
@@ -28889,6 +29428,66 @@ inline const ::flatbuffers::TypeTable *CrossDomainReadKindTypeTable() {
   };
   static const ::flatbuffers::TypeTable tt = {
     ::flatbuffers::ST_ENUM, 5, type_codes, type_refs, nullptr, nullptr, nullptr
+  };
+  return &tt;
+}
+
+inline const ::flatbuffers::TypeTable *ExportPayloadTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 }
+  };
+  static const ::flatbuffers::TypeFunction type_refs[] = {
+    rigExec::fb::ExportPayloadTypeTable
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_ENUM, 3, type_codes, type_refs, nullptr, nullptr, nullptr
+  };
+  return &tt;
+}
+
+inline const ::flatbuffers::TypeTable *ExportKindTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 }
+  };
+  static const ::flatbuffers::TypeFunction type_refs[] = {
+    rigExec::fb::ExportKindTypeTable
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_ENUM, 3, type_codes, type_refs, nullptr, nullptr, nullptr
+  };
+  return &tt;
+}
+
+inline const ::flatbuffers::TypeTable *ExportStorageTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 }
+  };
+  static const ::flatbuffers::TypeFunction type_refs[] = {
+    rigExec::fb::ExportStorageTypeTable
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_ENUM, 4, type_codes, type_refs, nullptr, nullptr, nullptr
+  };
+  return &tt;
+}
+
+inline const ::flatbuffers::TypeTable *ExportCapabilityTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 }
+  };
+  static const ::flatbuffers::TypeFunction type_refs[] = {
+    rigExec::fb::ExportCapabilityTypeTable
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_ENUM, 2, type_codes, type_refs, nullptr, nullptr, nullptr
   };
   return &tt;
 }
@@ -31210,6 +31809,44 @@ inline const ::flatbuffers::TypeTable *WindowedOpTypeTable() {
   return &tt;
 }
 
+inline const ::flatbuffers::TypeTable *ExportEntryTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_UCHAR, 0, 0 },
+    { ::flatbuffers::ET_UCHAR, 0, 1 },
+    { ::flatbuffers::ET_UCHAR, 0, 2 },
+    { ::flatbuffers::ET_UINT, 0, -1 },
+    { ::flatbuffers::ET_UINT, 0, -1 },
+    { ::flatbuffers::ET_INT, 0, -1 },
+    { ::flatbuffers::ET_UCHAR, 0, 3 },
+    { ::flatbuffers::ET_STRING, 0, -1 }
+  };
+  static const ::flatbuffers::TypeFunction type_refs[] = {
+    rigExec::fb::ExportPayloadTypeTable,
+    rigExec::fb::ExportKindTypeTable,
+    rigExec::fb::ExportStorageTypeTable,
+    rigExec::fb::ExportCapabilityTypeTable
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_TABLE, 10, type_codes, type_refs, nullptr, nullptr, nullptr
+  };
+  return &tt;
+}
+
+inline const ::flatbuffers::TypeTable *ExportCatalogTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_SEQUENCE, 1, 0 }
+  };
+  static const ::flatbuffers::TypeFunction type_refs[] = {
+    rigExec::fb::ExportEntryTypeTable
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_TABLE, 1, type_codes, type_refs, nullptr, nullptr, nullptr
+  };
+  return &tt;
+}
+
 inline const ::flatbuffers::TypeTable *FileTypeTable() {
   static const ::flatbuffers::TypeCode type_codes[] = {
     { ::flatbuffers::ET_UINT, 0, -1 },
@@ -31245,7 +31882,8 @@ inline const ::flatbuffers::TypeTable *FileTypeTable() {
     { ::flatbuffers::ET_SEQUENCE, 1, 24 },
     { ::flatbuffers::ET_SEQUENCE, 1, 25 },
     { ::flatbuffers::ET_SEQUENCE, 1, 26 },
-    { ::flatbuffers::ET_UINT, 1, -1 }
+    { ::flatbuffers::ET_UINT, 1, -1 },
+    { ::flatbuffers::ET_SEQUENCE, 0, 27 }
   };
   static const ::flatbuffers::TypeFunction type_refs[] = {
     rigExec::fb::F64TypeTable,
@@ -31274,10 +31912,11 @@ inline const ::flatbuffers::TypeTable *FileTypeTable() {
     rigExec::fb::Matrix4dArrayTypeTable,
     rigExec::fb::TokenArrayTypeTable,
     rigExec::fb::BoolArrayTypeTable,
-    rigExec::fb::WindowedOpTypeTable
+    rigExec::fb::WindowedOpTypeTable,
+    rigExec::fb::ExportCatalogTypeTable
   };
   static const ::flatbuffers::TypeTable tt = {
-    ::flatbuffers::ST_TABLE, 34, type_codes, type_refs, nullptr, nullptr, nullptr
+    ::flatbuffers::ST_TABLE, 35, type_codes, type_refs, nullptr, nullptr, nullptr
   };
   return &tt;
 }

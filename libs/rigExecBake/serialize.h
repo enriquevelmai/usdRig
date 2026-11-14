@@ -20,6 +20,7 @@ struct RigExecBakedProgramImpl;
 struct RigExecBakeInputs;
 class RigExecBakePathTable;
 class RigExecBakePools;
+class RigExecOutputCatalog;
 
 /// Builds \p file's tables from \p program, plus the input list of
 /// \p inputs (a collection over the same program interning through
@@ -38,6 +39,19 @@ bool RigExecBakeFillFile(const RigExecBakedProgramImpl &program,
                          const RigExecBakeInputs &inputs,
                          RigExecBakePathTable *paths, RigExecBakePools *pools,
                          fb::RigExecWireFile *file, std::string *error);
+
+/// The file's export catalog (format 33): one entry per output \p catalog
+/// exports, each bound to the retained storage the format validator
+/// accepts, and an unusable export kept with its reason. The rig identity
+/// and compile epoch the catalog carries are the bake's own: a file names
+/// neither, because the reader mints them when it opens. \p catalog is the
+/// output of RigExecDiscoverOutputs over the same program \p file's tables
+/// came from. A program that exports nothing leaves the field absent.
+/// False, naming the export, for an enumerator or payload spelling this
+/// format cannot carry.
+bool RigExecBakeFillExportCatalog(const RigExecOutputCatalog &catalog,
+                                  fb::RigExecWireFile *file,
+                                  std::string *error);
 
 }  // namespace rigExec
 
