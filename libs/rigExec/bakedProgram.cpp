@@ -4905,49 +4905,6 @@ RigExecBakedProgramImpl::ConstraintArrays::Names()
     return kConstraintArrayNames;
 }
 
-namespace {
-// The facts a requested run leaves behind, read after the join while its mask
-// still stands: which bodies ran, and per value the closure writes whether
-// this run produced it or clean retained storage stood.
-void
-FillRequestedRunReport(RigExecBakedProgramImpl &B,
-                       RigExecRequestedRunReport *report)
-{
-    report->executed.clear();
-    report->values.clear();
-    std::vector<char> counted(B.opAdapter.values.size(), 0);
-    for (uint32_t op : B.requestedOps) {
-        if (op >= B.opGraph.ops.size())
-            continue;
-        const bool ran =
-            op < B.opExecution.ran.size() && B.opExecution.ran[op] != 0;
-        if (ran)
-            report->executed.push_back(op);
-        for (RigExecValueId id : B.opGraph.ops[op].descriptor.writes) {
-            if (id >= B.opAdapter.values.size() || counted[size_t(id)])
-                continue;
-            counted[size_t(id)] = 1;
-            const RigExecOpValueState &value = B.opAdapter.values[size_t(id)];
-            RigExecValueMaterialization fact;
-            fact.value = id;
-            fact.produced = ran;
-            fact.reused = !ran && value.initialized;
-            fact.wasAbsent = id < B.requestedAbsent.size() &&
-                             B.requestedAbsent[size_t(id)] != 0;
-            fact.revision = value.revision;
-            report->values.push_back(fact);
-        }
-    }
-    std::sort(
-        report->values.begin(), report->values.end(),
-        [](const RigExecValueMaterialization &a,
-           const RigExecValueMaterialization &b) { return a.value < b.value; });
-    report->requestedOperations = B.requestedOps.size();
-    report->executedOperations = report->executed.size();
-    report->clustersRun = B.lastClosedClusters;
-}
-} // namespace
-
 bool
 RigExecBakedProgram::_RunFrame(UsdTimeCode time, RigExecRigPose *pose,
                                bool requested, _FrameMarks *marks)
@@ -5379,43 +5336,16 @@ RigExecBakedProgram::RunRequested(UsdTimeCode time,
         return fail("no requested-run report");
     *report = RigExecRequestedRunReport{};
     RigExecBakedProgramImpl &B = *_impl;
-    const size_t opCount = B.opGraph.ops.size();
-    if (!B.opAdapter.compiled || opCount == 0)
-        return fail("baked program has no canonical operation graph");
-    if (requested.ops.empty())
-        return fail("requested run names no operation");
-    uint32_t previous = 0;
-    bool leading = true;
-    for (uint32_t op : requested.ops) {
-        if (op >= opCount)
-            return fail("requested run names an operation outside the graph");
-        if (!leading && op <= previous)
-            return fail("requested run names operations out of order, or the "
-                        "same one twice");
-        previous = op;
-        leading = false;
-    }
     std::string reason;
-    if (!RigExecClosureIsClosed(B.opGraph, requested, &reason))
-        return fail("requested closure: " + reason);
-
-    std::vector<char> mask(opCount, 0);
-    for (uint32_t op : requested.ops)
-        mask[size_t(op)] = 1;
+    if (!RigExecBakedBeginRequestedRun(&B, requested, &reason))
+        return fail(reason);
     struct RequestedRunReset {
         RigExecBakedProgramImpl &program;
         ~RequestedRunReset()
         {
-            program.requestedRun = false;
-            program.requestedMask.clear();
-            program.requestedOps.clear();
-            program.requestedSkipEffects.clear();
-            program.requestedAbsent.clear();
+            RigExecBakedEndRequestedRun(&program);
         }
     } reset{B};
-    B.requestedMask = std::move(mask);
-    B.requestedOps = requested.ops;
-    B.requestedRun = true;
 
     // A requested run publishes nothing, so the pose it hands the shared
     // frame is scratch: the prologue's source capture takes one, and the
@@ -5423,7 +5353,7 @@ RigExecBakedProgram::RunRequested(UsdTimeCode time,
     RigExecRigPose scratch;
     _FrameMarks marks;
     const bool ran = _RunFrame(time, &scratch, /*requested = */ true, &marks);
-    FillRequestedRunReport(B, report);
+    RigExecBakedFillRequestedRunReport(B, report);
     if (!ran)
         return fail("requested execution did not complete");
     return true;
@@ -5437,6 +5367,18 @@ RigExecBakedProgram::ExtractRequestedOutputs(
     const std::vector<RigExecOutputHandle> &outputs,
     std::vector<RigExecOutputPacket> *packets, std::string *error) const
 {
+    return RigExecBakedExtractRequestedOutputs(
+        *_impl, catalog, report, time, captured, outputs, packets, error);
+}
+
+bool
+RigExecBakedExtractRequestedOutputs(
+    const RigExecBakedProgramImpl &program, const RigExecOutputCatalog &catalog,
+    const RigExecRequestedRunReport &report, UsdTimeCode time,
+    const RigExecOutputGeneration &captured,
+    const std::vector<RigExecOutputHandle> &outputs,
+    std::vector<RigExecOutputPacket> *packets, std::string *error)
+{
     const auto fail = [&](const std::string &message) {
         if (error)
             *error = message;
@@ -5445,7 +5387,7 @@ RigExecBakedProgram::ExtractRequestedOutputs(
     if (!packets)
         return fail("no output packet list");
     *packets = {};
-    const RigExecBakedProgramImpl &B = *_impl;
+    const RigExecBakedProgramImpl &B = program;
     if (!B.opAdapter.compiled)
         return fail("baked program has no canonical operation graph");
     if (catalog.GetDemandIndex().OperationCount() != B.opGraph.ops.size())
@@ -5462,8 +5404,9 @@ RigExecBakedProgram::ExtractRequestedOutputs(
     // The generation the caller captured names the compiled program by its
     // compile epoch, as the explicit admission keys it. A request captured
     // against another epoch is answered, never answered current.
-    const bool staleGeneration = captured.programIdentity != 0 &&
-                                 captured.programIdentity != catalog.GetCompileEpoch();
+    const bool staleGeneration =
+        captured.programIdentity != 0 &&
+        captured.programIdentity != catalog.GetCompileEpoch();
 
     // Gather and conversion buffers are the call's, not the program's: a
     // requested run owns none of this, and one payload's bytes are copied
@@ -5521,7 +5464,8 @@ RigExecBakedProgram::ExtractRequestedOutputs(
         }
         // A handle that names a revision asks for that revision. The value
         // moved past it, so this run's bytes are a different answer.
-        if (output.valueRevision != 0 && output.valueRevision != fact->revision) {
+        if (output.valueRevision != 0 &&
+            output.valueRevision != fact->revision) {
             packet.status = RigExecOutputStatus::Invalidated;
             packet.reason = binding->descriptor.semanticKey + " stands at " +
                             std::to_string(fact->revision) + "; the request " +
@@ -5539,26 +5483,24 @@ RigExecBakedProgram::ExtractRequestedOutputs(
                 &reason);
             break;
         case RigExecOutputKind::Transform:
-            packed = RigExecBakedExtractTransform(B,
-                                                  RigExecBakedSlotDomain(domain),
-                                                  *binding, &packet.payload,
-                                                  &reason);
+            packed = RigExecBakedExtractTransform(
+                B, RigExecBakedSlotDomain(domain), *binding, &packet.payload,
+                &reason);
             break;
         case RigExecOutputKind::Points:
-            packed = RigExecBakedExtractPoints(B, RigExecBakedSlotDomain(domain),
-                                               *binding, &gather, &cells,
-                                               &packet.payload, &reason);
+            packed = RigExecBakedExtractPoints(
+                B, RigExecBakedSlotDomain(domain), *binding, &gather, &cells,
+                &packet.payload, &reason);
             break;
         }
         std::string mismatch;
-        if (!packed ||
-            !RigExecPayloadMatchesHandle(binding->handle, packet.payload,
-                                         &mismatch)) {
+        if (!packed || !RigExecPayloadMatchesHandle(
+                           binding->handle, packet.payload, &mismatch)) {
             packet.payload = RigExecOutputPayload{};
             packet.status = RigExecOutputStatus::Failed;
-            packet.reason = packed ? binding->descriptor.semanticKey + " " +
-                                         mismatch
-                                   : std::move(reason);
+            packet.reason =
+                packed ? binding->descriptor.semanticKey + " " + mismatch
+                       : std::move(reason);
             answers.push_back(std::move(packet));
             continue;
         }

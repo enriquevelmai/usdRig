@@ -6698,8 +6698,7 @@ bool
 RigExecBakedExtractTransform(const RigExecBakedProgramImpl &program,
                              RigExecBakedSlotDomain domain,
                              const RigExecOutputBinding &binding,
-                             RigExecOutputPayload *payload,
-                             std::string *reason)
+                             RigExecOutputPayload *payload, std::string *reason)
 {
     const auto fail = [&](const std::string &message) {
         if (reason)

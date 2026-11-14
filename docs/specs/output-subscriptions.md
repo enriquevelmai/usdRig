@@ -167,6 +167,40 @@ is no second evaluator, no fallback walk and no operation named by text.
   was missing when the run began. An extractor reads a value only when the
   closure names its producer and the facts say it materialized.
 
+## Running it on a lane
+
+The same mechanism runs a request behind the owner thread. The mask,
+the run's facts and the extraction are library entries shared by the live
+program and a detached lane's clone: `RigExecBakedBeginRequestedRun`,
+`RigExecBakedEndRequestedRun` and `RigExecBakedFillRequestedRunReport`
+(`libs/rigExec/bakedOpGraph.h`), and `RigExecBakedExtractRequestedOutputs`
+(`libs/rigExec/bakedProgramImpl.h`). A lane installs the mask the owner
+thread closed, runs the shared executor over its own arena, gathers the
+facts after the join, answers the outputs from that arena, and clears the
+mask — same prologue, schedule, kernels and skip effects as the lane's
+whole-frame job, and nothing published: a partial run is not a full pose.
+
+| Declaration | Says |
+| --- | --- |
+| `RigExecMakeFrozenRequestedRun(catalog, demand, captured, out, error)` | Owner thread: resolve one exact frame's demand into the job a lane runs — the union of the named handles' closures, the handles, and the captured generation. False, having dispatched nothing, when the catalog does not know a handle or an output has no producer: the caller recaptures. |
+| `RigExecFrozenRequestedRun` | That job: closure, output handles, captured generation, and the catalog of the epoch that minted the handles. Inputs and history ride the same `RigExecFrameInputs` a warming job carries. |
+| `RigExecEvaluateFrozenRequested(context, inputs, requested, runner, scheduler, rig, trace)` | Run the job over `requested`'s closure under the entry point's checks and both generation fences, and answer its outputs. `RigExecFrozenRequestedResult` says which outputs answered, and `error` says why a run declined or was dropped. |
+| `RigExecMakeProductionRequestedStepRunner()` | The serial runner behind that entry: the lane's clone, the job's inputs, the masked executor, the extraction, no publication. |
+
+- **Capture stays on the owner thread.** The catalog, the demand index and the
+  closure read compiled tables; the lane sees a shared_ptr to the frozen
+  snapshot, the sampled vector and the job. No stage, evaluator, registry or
+  live handle reaches a worker, and the lane's mutable storage stays its own.
+- **A refusal is reported, never papered over.** An open closure, a catalog of
+  another epoch, a lane that cannot place the inputs, a retired generation or
+  an unadmitted frame answers with no packets and a reason; an output the run
+  did not materialize answers `Pending` with a reason even when the arena
+  holds another generation's bytes for it. There is no fallback evaluation:
+  the owner recaptures and re-admits, or reports the miss.
+- **The trace says so.** With a report, the entry point's run leaves the
+  ordinary operation trace, so a caller can check that no body outside the
+  closure ran and that an output outside the closure was not asked about.
+
 ## Where the entries come from
 
 `RigExecDiscoverOutputs` (`libs/rigExec/outputCatalog.h`) builds the catalog of

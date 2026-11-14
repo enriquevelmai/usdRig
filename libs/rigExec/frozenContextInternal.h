@@ -463,6 +463,16 @@ bool _RunFrozenHistoryTick(const RigExecFrozenEvalContext &context,
                            const std::vector<RigExecWindowRing> &rings,
                            std::vector<RigExecWindowPacketPtr> *captures);
 
+// One requested run (RigExecEvaluateFrozenRequested): the closure's mask over
+// the shared graph, no publication, and the outputs answered from the lane's
+// own storage after the join.
+bool _RunFrozenRequested(const RigExecFrozenEvalContext &context,
+                         const RigExecFrameInputs &inputs,
+                         const RigExecFrozenRequestedRun &requested,
+                         RigExecRequestedRunReport *report,
+                         std::vector<RigExecOutputPacket> *packets,
+                         std::string *error);
+
 } // namespace frozenDetail
 
 } // namespace rigExec

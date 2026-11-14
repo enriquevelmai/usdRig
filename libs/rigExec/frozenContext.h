@@ -32,6 +32,8 @@
 #define RIGEXEC_FROZEN_CONTEXT_H
 
 #include "bakedTrace.h"
+#include "bakedProgram.h"
+#include "outputCatalog.h"
 #include "rigEvaluator.h"
 #include "scalarReferenceAdapter.h"
 
@@ -688,6 +690,85 @@ bool RigExecRunFrozenHistoryTick(const RigExecFrozenEvalContext &context,
                                  std::vector<RigExecWindowPacketPtr> *captures,
                                  std::string *error = nullptr);
 
+/// What one detached requested run executes and answers. The closure is the
+/// owner thread's union of demand-index closures for the outputs a host asked
+/// for (rigExecGraph/outputDemand.h); \p outputs are the handles to answer
+/// from what that run leaves, \p captured the generation the request belongs
+/// to, and \p catalog the catalog of the compile epoch that minted those
+/// handles. The owner thread builds all four -- the closure and the catalog
+/// read compiled tables, never a worker -- and the run's inputs and history
+/// ride the same sampled vector a full-frame job carries (RigExecFrameInputs).
+/// Nothing here names a stage, an evaluator or a live handle.
+struct RigExecFrozenRequestedRun {
+    RigExecDemandClosure closure;
+    std::vector<RigExecOutputHandle> outputs;
+    RigExecOutputGeneration captured;
+    std::shared_ptr<const RigExecOutputCatalog> catalog;
+};
+
+/// What a detached requested run answered. `ran` false means `packets` holds
+/// no answers: the worker ran no body, or a fence retired the job before its
+/// packets were accepted. `error` says which, which is the honest report the
+/// owner uses to recapture on the owner thread. A run that executed answers
+/// every output through its own status; a requested run never falls back to a
+/// live or whole-rig evaluation.
+struct RigExecFrozenRequestedResult {
+    bool ran = false;
+    std::vector<RigExecOutputPacket> packets;
+    /// The run's materialization facts: which bodies ran, and per value the
+    /// closure writes whether this run produced it or clean retained storage
+    /// stands.
+    RigExecRequestedRunReport report;
+    std::string error;
+};
+
+/// The serial step runner a detached requested job executes: the baked
+/// program's executor over the private arena, restricted to \p requested's
+/// closure, reading nothing but \p context and \p inputs. It fills \p report
+/// with the run's facts and \p packets with one answer per output the job
+/// named, names its reason in \p error when it declines, and returns false to
+/// hand the generation back.
+using RigExecFrozenRequestedStepRunner = std::function<bool(
+    const RigExecFrozenEvalContext &context, const RigExecFrameInputs &inputs,
+    RigExecFrozenArena &arena, const RigExecFrozenRequestedRun &requested,
+    RigExecRequestedRunReport *report,
+    std::vector<RigExecOutputPacket> *packets, std::string *error)>;
+
+/// Runs \p inputs under \p context through \p runner over \p requested's
+/// closure only, and answers the outputs it names. The checks, in order: the
+/// context must carry an admitted program; the input vector's count must equal
+/// the context's sampled count; the job must name a closure, outputs and a
+/// catalog; when \p scheduler is given, the generation must be current (start
+/// check); the runner executes under a serial scope against a private arena
+/// sized from the context; when \p scheduler is given, the generation must
+/// STILL be current (publish check). Anything a detached run cannot prove --
+/// an open closure, a catalog of another epoch, a lane that cannot name the
+/// storage, a stale generation -- is reported in `error` and through the
+/// per-output statuses, never answered by evaluating the rig another way.
+///
+/// \p trace, when given, is cleared and then filled by a production runner
+/// that ran the job (RigExecFrozenRunReport): the ordinary trace, so a caller
+/// can check that no body outside the closure ran.
+RigExecFrozenRequestedResult RigExecEvaluateFrozenRequested(
+    const RigExecFrozenEvalContext &context, const RigExecFrameInputs &inputs,
+    const RigExecFrozenRequestedRun &requested,
+    RigExecFrozenRequestedStepRunner runner,
+    const RigExecBackgroundScheduler *scheduler = nullptr,
+    const SdfPath &rig = SdfPath(), RigExecFrozenRunReport *trace = nullptr);
+
+/// Owner thread: resolve one exact frame's demand against \p catalog into the
+/// job a frozen worker runs -- the union of the named handles' closures, the
+/// handles themselves, and the generation the caller captured with the
+/// request. False, leaving \p out untouched, when the demand names an output
+/// this catalog does not know or has no producer for, or when its handles
+/// belong to another rig or epoch: the caller recaptures, it does not dispatch
+/// a partial mask.
+bool RigExecMakeFrozenRequestedRun(
+    const std::shared_ptr<const RigExecOutputCatalog> &catalog,
+    const RigExecOutputTimeDemand &demand,
+    const RigExecOutputGeneration &captured, RigExecFrozenRequestedRun *out,
+    std::string *error = nullptr);
+
 /// One chain input as the compiled rig currency check pins it, the way the live
 /// path pins it on its first run: the attribute and a query over it,
 /// whether it carries authored connections (read as a walk then, never as
@@ -1000,6 +1081,13 @@ bool RigExecSampleFrameInputsWithBurstCache(
 /// mismatches decline the job without publishing. Numerical kernels use
 /// the calling thread's frozen serial scope.
 RigExecFrozenStepRunner RigExecMakeProductionStepRunner();
+
+/// The requested-execution twin of RigExecMakeProductionStepRunner: the same
+/// clone, the same input placement, the shared executor restricted to the
+/// job's closure, and the extraction read from that lane's own storage after
+/// the join and before the lane is released. No stage or evaluator access
+/// occurs on the worker, and nothing is published.
+RigExecFrozenRequestedStepRunner RigExecMakeProductionRequestedStepRunner();
 
 /// Hashes \p inputs to the control-state digest the frame cache keys on
 /// (the frame cache feeds this into RigExecFrameCacheKey::controlDigest). Time is

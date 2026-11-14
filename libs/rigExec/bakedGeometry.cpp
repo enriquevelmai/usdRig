@@ -6296,8 +6296,8 @@ RigExecBakedExtractPoints(const RigExecBakedProgramImpl &program,
                           RigExecBakedSlotDomain domain,
                           const RigExecOutputBinding &binding,
                           std::vector<GfVec3f> *gather,
-                          std::vector<double> *cells, RigExecOutputPayload *payload,
-                          std::string *reason)
+                          std::vector<double> *cells,
+                          RigExecOutputPayload *payload, std::string *reason)
 {
     const auto fail = [&](const std::string &message) {
         if (reason)

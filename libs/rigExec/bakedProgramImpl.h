@@ -5937,6 +5937,18 @@ bool RigExecBakedExtractPoints(const RigExecBakedProgramImpl &program,
                                RigExecOutputPayload *payload,
                                std::string *reason);
 
+/// Answers \p outputs as payload leases read from the storage \p program
+/// holds, gated by the materialization facts of the run that left them
+/// (RigExecBakedProgram::ExtractRequestedOutputs). Shared by the live program
+/// and a frozen lane's clone: the extraction names no evaluator, so a worker
+/// running its own arena answers the same way.
+bool RigExecBakedExtractRequestedOutputs(
+    const RigExecBakedProgramImpl &program, const RigExecOutputCatalog &catalog,
+    const RigExecRequestedRunReport &report, UsdTimeCode time,
+    const RigExecOutputGeneration &captured,
+    const std::vector<RigExecOutputHandle> &outputs,
+    std::vector<RigExecOutputPacket> *packets, std::string *error);
+
 /// What ChainStatus publishes for \p chain: its points, or in shader mode
 /// its program (RigExecGpuDeformPublication).
 VtValue

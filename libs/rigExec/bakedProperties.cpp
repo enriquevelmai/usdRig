@@ -2369,8 +2369,8 @@ RigExecBakedExtractPropertyValue(const RigExecBakedProgramImpl &program,
                     " at phase " + binding.descriptor.phase +
                     " produced no value");
     const RigExecBakedPropertyValue &stored = program.propertyValues[version];
-    const double value = chain.arm == Chain::Arm::Float ? double(stored.f)
-                                                        : stored.d;
+    const double value =
+        chain.arm == Chain::Arm::Float ? double(stored.f) : stored.d;
     return RigExecPackPayload(RigExecPayloadKind::Scalar, 1, &value, payload,
                               reason);
 }

@@ -701,6 +701,21 @@ _FrozenPublishGeometry(RigExecBakedProgramImpl &B, RigExecRigPose *pose)
     }
 }
 
+// The trace the caller's report asked for, read after the join.
+void
+_FillFrozenTraceReport(RigExecBakedProgramImpl &B)
+{
+    RigExecFrozenRunReport *report = _frozenRunReport;
+    if (!report) {
+        return;
+    }
+    report->region = RigExecBakedLastRunTrace(B);
+    report->ran = true;
+    report->sourceKeysBuilt = B.sourceKeysBuilt;
+    report->sourceKeyMismatches = B.sourceKeyMismatches;
+    report->avarConstantSerial = B.avarConstantSerial;
+}
+
 } // namespace
 
 namespace frozenDetail {
@@ -730,9 +745,23 @@ struct _HistoryTick {
     std::vector<RigExecWindowPacketPtr> *captures = nullptr;
 };
 
+// A requested run: the closure the owner thread closed over the outputs a host
+// asked for, the outputs to answer from what the run leaves, and where the
+// run's facts and packets go. Nothing is published for a requested run.
+struct _RequestedRun {
+    const RigExecDemandClosure *closure = nullptr;
+    const RigExecOutputCatalog *catalog = nullptr;
+    RigExecOutputGeneration captured;
+    const std::vector<RigExecOutputHandle> *outputs = nullptr;
+    RigExecRequestedRunReport *report = nullptr;
+    std::vector<RigExecOutputPacket> *packets = nullptr;
+    std::string *error = nullptr;
+};
+
 bool _RunFrozenWith(const RigExecFrozenEvalContext &context,
                     const RigExecFrameInputs &inputs, RigExecRigPose *pose,
-                    const _HistoryTick *history);
+                    const _HistoryTick *history,
+                    const _RequestedRun *requested);
 
 } // namespace
 
@@ -740,7 +769,7 @@ bool
 _RunFrozen(const RigExecFrozenEvalContext &context,
            const RigExecFrameInputs &inputs, RigExecRigPose *pose)
 {
-    return _RunFrozenWith(context, inputs, pose, nullptr);
+    return _RunFrozenWith(context, inputs, pose, nullptr, nullptr);
 }
 
 bool
@@ -753,7 +782,29 @@ _RunFrozenHistoryTick(const RigExecFrozenEvalContext &context,
     tick.rings = &rings;
     tick.captures = captures;
     RigExecRigPose scratch;
-    return _RunFrozenWith(context, inputs, &scratch, &tick);
+    return _RunFrozenWith(context, inputs, &scratch, &tick, nullptr);
+}
+
+bool
+_RunFrozenRequested(const RigExecFrozenEvalContext &context,
+                    const RigExecFrameInputs &inputs,
+                    const RigExecFrozenRequestedRun &requested,
+                    RigExecRequestedRunReport *report,
+                    std::vector<RigExecOutputPacket> *packets,
+                    std::string *error)
+{
+    if (!report || !packets || !requested.catalog)
+        return false;
+    _RequestedRun run;
+    run.closure = &requested.closure;
+    run.catalog = requested.catalog.get();
+    run.captured = requested.captured;
+    run.outputs = &requested.outputs;
+    run.report = report;
+    run.packets = packets;
+    run.error = error;
+    RigExecRigPose scratch;
+    return _RunFrozenWith(context, inputs, &scratch, nullptr, &run);
 }
 
 namespace {
@@ -765,7 +816,7 @@ namespace {
 bool
 _RunFrozenWith(const RigExecFrozenEvalContext &context,
                const RigExecFrameInputs &inputs, RigExecRigPose *pose,
-               const _HistoryTick *history)
+               const _HistoryTick *history, const _RequestedRun *requested)
 {
     if (!pose || !context.frozen) {
         return false;
@@ -914,8 +965,59 @@ _RunFrozenWith(const RigExecFrozenEvalContext &context,
     if (!RigExecBakedRolesStand(B)) {
         return false;
     }
+    // A requested run restricts the shared executor to the closure the owner
+    // thread closed over the outputs a host asked for: same prologue, same
+    // schedule, same kernels, same skip effects (bakedOpGraph.h).
+    if (requested) {
+        std::string refusal;
+        if (!RigExecBakedBeginRequestedRun(&B, *requested->closure, &refusal)) {
+            if (requested->error) {
+                *requested->error = refusal;
+            }
+            return false;
+        }
+    }
+    struct RequestedRunReset {
+        RigExecBakedProgramImpl &program;
+        const bool active;
+        ~RequestedRunReset()
+        {
+            if (active) {
+                RigExecBakedEndRequestedRun(&program);
+            }
+        }
+    } requestedReset{B, requested != nullptr};
     if (!_FrozenExecuteGraph(&worker, time)) {
+        if (requested && requested->error) {
+            *requested->error = "the requested execution did not complete";
+        }
         return false;
+    }
+    if (requested) {
+        // The run's own facts, then the answers read out of this lane's
+        // storage while the lane is still this job's alone. Nothing is
+        // published: a partial run is not a full pose, and the full-pose
+        // epilogue belongs to a whole request.
+        RigExecBakedFillRequestedRunReport(B, requested->report);
+        _FillFrozenTraceReport(B);
+        if (!B.requiredStageFramesAdmission.admitted) {
+            if (requested->error) {
+                *requested->error = "the frame's stage sources were refused";
+            }
+            return false;
+        }
+        std::string reason;
+        if (!RigExecBakedExtractRequestedOutputs(
+                B, *requested->catalog, *requested->report, time,
+                requested->captured, *requested->outputs, requested->packets,
+                &reason)) {
+            if (requested->error) {
+                *requested->error = reason;
+            }
+            return false;
+        }
+        release.complete = true;
+        return true;
     }
     if (history) {
         // Nothing is published at a history tick; an unadmitted frame
@@ -959,13 +1061,7 @@ _RunFrozenWith(const RigExecFrozenEvalContext &context,
     working.valid = scalarReferenceValid;
     working.time = time;
     *pose = std::move(working);
-    if (RigExecFrozenRunReport *report = _frozenRunReport) {
-        report->region = RigExecBakedLastRunTrace(B);
-        report->ran = true;
-        report->sourceKeysBuilt = B.sourceKeysBuilt;
-        report->sourceKeyMismatches = B.sourceKeyMismatches;
-        report->avarConstantSerial = B.avarConstantSerial;
-    }
+    _FillFrozenTraceReport(B);
     release.complete = true;
     return true;
 }

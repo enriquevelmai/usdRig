@@ -340,6 +340,193 @@ RigExecMakeProductionStepRunner()
     };
 }
 
+RigExecFrozenRequestedStepRunner
+RigExecMakeProductionRequestedStepRunner()
+{
+    return [](const RigExecFrozenEvalContext &context,
+              const RigExecFrameInputs &inputs, RigExecFrozenArena &arena,
+              const RigExecFrozenRequestedRun &requested,
+              RigExecRequestedRunReport *report,
+              std::vector<RigExecOutputPacket> *packets, std::string *error) {
+        if (!report || !packets) {
+            return false;
+        }
+        *report = RigExecRequestedRunReport{};
+        packets->clear();
+        if (!context.frozen || !requested.catalog) {
+            if (error)
+                *error = context.frozen ? "the job names no output catalog"
+                                        : "no frozen program to run";
+            return false;
+        }
+        if (context.flags & kRigExecFrozenBakeRefused) {
+            if (error)
+                *error = "no admitted compiled program";
+            return false;
+        }
+        // The arena sizes the private working state; the runner carries its
+        // own clone instead, so the check is only that the entry point sized
+        // what the context promised.
+        if (arena.Size() < context.slotCount) {
+            if (error)
+                *error = "the arena is smaller than the context promised";
+            return false;
+        }
+        return _RunFrozenRequested(context, inputs, requested, report, packets,
+                                   error);
+    };
+}
+
+bool
+RigExecMakeFrozenRequestedRun(
+    const std::shared_ptr<const RigExecOutputCatalog> &catalog,
+    const RigExecOutputTimeDemand &demand,
+    const RigExecOutputGeneration &captured, RigExecFrozenRequestedRun *out,
+    std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (!out)
+        return fail("no requested-run destination");
+    if (!catalog)
+        return fail("no output catalog to resolve the request against");
+    RigExecOutputRequest request;
+    request.demands.push_back(demand);
+    std::string reason;
+    if (!request.IsWellFormed(&reason))
+        return fail(reason);
+    const RigExecOutputDemandIndex &index = catalog->GetDemandIndex();
+    std::vector<size_t> slots;
+    if (!index.ResolveRequest(request, &slots, &reason))
+        return fail(reason);
+    // An output with no canonical producer would enter the union as nothing
+    // and answer Pending forever: the caller recaptures instead.
+    std::vector<size_t> producible;
+    producible.reserve(slots.size());
+    for (size_t slot : slots) {
+        if (index.ProducerStatus(slot) != RigExecOutputStatus::Pending) {
+            return fail("output " + index.Handle(slot).semanticKey +
+                        " has no canonical producer");
+        }
+        producible.push_back(slot);
+    }
+    RigExecFrozenRequestedRun job;
+    job.closure = index.Union(producible);
+    if (job.closure.Empty())
+        return fail("the request closes no operation of this program");
+    for (size_t slot : producible)
+        job.outputs.push_back(index.Handle(slot));
+    job.captured = captured;
+    job.catalog = catalog;
+    *out = std::move(job);
+    if (error)
+        error->clear();
+    return true;
+}
+
+RigExecFrozenRequestedResult
+RigExecEvaluateFrozenRequested(const RigExecFrozenEvalContext &context,
+                               const RigExecFrameInputs &inputs,
+                               const RigExecFrozenRequestedRun &requested,
+                               RigExecFrozenRequestedStepRunner runner,
+                               const RigExecBackgroundScheduler *scheduler,
+                               const SdfPath &rig,
+                               RigExecFrozenRunReport *trace)
+{
+    // Background lanes record nothing; see RigExecFrozenProgram.
+    std::optional<RigExecInputReplayComparisonScope> replayComparison;
+    if (context.frozen && context.frozen->RecordsInputReplay()) {
+        replayComparison.emplace("RigExecEvaluateFrozenRequested");
+    }
+    if (trace) {
+        trace->Clear();
+    }
+    RigExecFrozenRequestedResult result;
+    // A refusal rig has no program a worker could run, and a vector sampled
+    // for another frame is a job no digest names: both decline here rather
+    // than run a closure over inputs nobody sampled for it.
+    if (context.flags & kRigExecFrozenBakeRefused) {
+        result.error = "no admitted compiled program";
+        return result;
+    }
+    if (inputs.values.size() != context.varyingInputCount) {
+        result.error = "the inputs were sampled for another frame";
+        return result;
+    }
+    if (!requested.catalog) {
+        result.error = "the job names no output catalog";
+        return result;
+    }
+    if (requested.closure.Empty()) {
+        result.error = "the job names no operation";
+        return result;
+    }
+    if (requested.outputs.empty()) {
+        result.error = "the job names no output to answer";
+        return result;
+    }
+    if (!runner) {
+        result.error = "no requested-run step runner";
+        return result;
+    }
+    if (scheduler &&
+        !RigExecGenerationCheckAtStart(*scheduler, rig, context.generation)) {
+        result.error = "the generation was retired before the job started";
+        return result;
+    }
+    RigExecFrozenArena arena;
+    if (!arena.ResizeFor(context)) {
+        result.error = "the context's slot count is absurd";
+        return result;
+    }
+    bool ran = false;
+    {
+        RigExecFrozenSerialScope serial;
+        struct TraceScope {
+            explicit TraceScope(RigExecFrozenRunReport *t)
+            {
+                _frozenRunReport = t;
+            }
+            ~TraceScope()
+            {
+                _frozenRunReport = nullptr;
+            }
+        } traceScope(trace);
+        ran = runner(context, inputs, arena, requested, &result.report,
+                     &result.packets, &result.error);
+    }
+    if (!ran) {
+        // Nothing stands: an executed-but-refused run's facts and packets are
+        // as unverifiable as a declined one's, and the owner recaptures.
+        result.ran = false;
+        result.packets.clear();
+        result.report = RigExecRequestedRunReport{};
+        if (trace)
+            trace->Clear();
+        if (result.error.empty())
+            result.error = "the requested run declined";
+        return result;
+    }
+    if (scheduler && !RigExecGenerationCheckBeforePublish(*scheduler, rig,
+                                                          context.generation)) {
+        // The bodies ran, but the generation they ran under is retired: these
+        // bytes answer a frame no request owns, so they are reported and
+        // dropped rather than served.
+        result.ran = false;
+        result.packets.clear();
+        result.report = RigExecRequestedRunReport{};
+        if (trace)
+            trace->Clear();
+        result.error = "the generation was retired while the job ran";
+        return result;
+    }
+    result.ran = true;
+    return result;
+}
+
 bool
 RigExecBindChainSampleInputs(const RigExecRigEvaluator &evaluator,
                              RigExecChainSampleBindings *out,

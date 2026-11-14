@@ -27,6 +27,7 @@
 #include "rigExec/backgroundScheduler.h"
 #include "rigExec/bakedProgram.h"
 #include "rigExec/frameCache.h"
+#include "rigExec/outputCatalog.h"
 #include "rigExec/frameCacheSparsity.h"
 #include "rigExec/generation.h"
 #include "rigExec/parallel.h"
@@ -48,6 +49,7 @@
 #include "pxr/usd/usd/relationship.h"
 #include "pxr/usd/usd/resolveInfo.h"
 #include "pxr/usd/usd/stage.h"
+#include "pxr/usd/usdGeom/tokens.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8917,11 +8919,959 @@ def RigExecRoot "Rig" {
     }
 }
 
+// Requested execution in the detached lane. A job that names outputs at one
+// exact frame runs only their closure over its private arena, answers them as
+// payload leases read from the storage that run left, and reports honestly
+// when it cannot: no fallback evaluation, no stale read back as an answer.
+// The reference is the same rig evaluated live, so the lane's scalar,
+// transform and point payloads are the values native evaluation publishes at
+// every frame the request names.
+//
+// The stage is the extraction suite's phase rig in miniature: an animated
+// control, a joint a constraint revises, the two point chains that read them,
+// and a float math chain -- one compiled rig that exports scalars, transforms
+// and points, with time samples so consecutive frames differ.
+
+const char *const kRequestedStageText = R"USDA(#usda 1.0
+
+def Xform "FrozenAsset"
+{
+    def Scope "Container"
+    {
+        def RigExecRoot "Character"
+        {
+            def Scope "Controls"
+            {
+                def RigExecControl "Lead"
+                {
+                    double avars:tx = 1
+                    double avars:tx.timeSamples = {
+                        2: 1,
+                        8: 3,
+                    }
+                    matrix4d rest:space = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+                }
+            }
+
+            def Scope "Joints"
+            {
+                def RigExecJoint "X"
+                {
+                    matrix4d rest:space = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0.5, 0, 1) )
+                }
+            }
+
+            def Scope "PropertyHome"
+            {
+                float amount = 3
+
+                def RigExecFloatMathMover "AmountDoubler" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    uniform token rigExec:operation = "multiply"
+                    float inputs:value = 2
+                    rel rigExec:moves = </FrozenAsset/Container/Character/PropertyHome.amount>
+                }
+            }
+
+            # The last child runs first: Constrain revises X before Readers.
+            def Scope "Movers"
+            {
+                def Scope "Readers"
+                {
+                    def RigExecMatrixMover "LegReader" (
+                        prepend apiSchemas = ["RigExecMoverAPI"]
+                    )
+                    {
+                        float inputs:defaultWeight = 1
+                        rel rigExec:moves = </FrozenAsset/Container/Geometry/Leg.points>
+                        rel rigExec:transform = </FrozenAsset/Container/Character/Joints/X> (
+                            rigExecReadPhase = "/FrozenAsset/Container/Character/Movers/Constrain/Hold"
+                        )
+                    }
+                    def RigExecMatrixMover "ArmReader" (
+                        prepend apiSchemas = ["RigExecMoverAPI"]
+                    )
+                    {
+                        float inputs:defaultWeight = 1
+                        rel rigExec:moves = </FrozenAsset/Container/Geometry/Arm.points>
+                        rel rigExec:transform = </FrozenAsset/Container/Character/Controls/Lead>
+                    }
+                }
+
+                def Scope "Constrain"
+                {
+                    def RigExecPositionConstraint "Hold" (
+                        prepend apiSchemas = ["RigExecMoverAPI"]
+                    )
+                    {
+                        rel rigExec:moves = </FrozenAsset/Container/Character/Joints/X>
+                        rel rigExec:sources = </FrozenAsset/Container/Character/Controls/Lead>
+                    }
+                }
+            }
+        }
+
+        def Scope "Geometry"
+        {
+            def Points "Leg"
+            {
+                point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+            }
+            def Points "Arm"
+            {
+                point3f[] points = [(0, 0, 0), (0, 0, 1), (0, 1, 1)]
+            }
+        }
+    }
+}
+)USDA";
+
+const char *const kRequestedRigPath = "/FrozenAsset/Container/Character";
+const char *const kRequestedAmount =
+    "/FrozenAsset/Container/Character/PropertyHome.amount";
+const char *const kRequestedJoint = "/FrozenAsset/Container/Character/Joints/X";
+const char *const kRequestedLeg = "/FrozenAsset/Container/Geometry/Leg.points";
+const char *const kRequestedArm = "/FrozenAsset/Container/Geometry/Arm.points";
+
+std::shared_ptr<const RigExecOutputCatalog>
+RequestedCatalog(const RigExecBakedProgram &program)
+{
+    auto catalog = std::make_shared<RigExecOutputCatalog>();
+    std::string error;
+    const bool discovered = RigExecDiscoverOutputs(
+        program, "frozen-requested-rig", 1, catalog.get(), &error);
+    CHECK(discovered);
+    if (!error.empty())
+        std::printf("    catalog: %s\n", error.c_str());
+    if (!discovered || catalog->GetBindings().empty())
+        return {};
+    return catalog;
+}
+
+struct RequestedRig {
+    UsdStageRefPtr stage;
+    std::unique_ptr<RigExecRigEvaluator> evaluator;
+    std::shared_ptr<const RigExecOutputCatalog> catalog;
+    std::shared_ptr<const RigExecFrozenProgram> frozen;
+    std::unique_ptr<RigExecFrozenWorkspace> lane;
+};
+
+/// Compiles the mini rig and freezes it without evaluating a generation, so a
+/// lane cloned from the snapshot owns no published value.
+RequestedRig
+BuildRequestedRig(bool evaluateFirst)
+{
+    RequestedRig rig;
+    const SdfLayerRefPtr layer = SdfLayer::CreateAnonymous(".usda");
+    CHECK(layer->ImportFromString(kRequestedStageText));
+    rig.stage = UsdStage::Open(layer);
+    CHECK(rig.stage);
+    rig.evaluator = std::make_unique<RigExecRigEvaluator>(
+        rig.stage, SdfPath(kRequestedRigPath));
+    std::vector<std::string> errors;
+    CHECK(rig.evaluator->Compile(&errors));
+    for (const std::string &message : errors)
+        std::printf("    compile: %s\n", message.c_str());
+    const RigExecBakedProgram *program = rig.evaluator->GetBakedProgram();
+    CHECK(program != nullptr);
+    if (!program)
+        return rig;
+    rig.catalog = RequestedCatalog(*program);
+    if (!rig.catalog)
+        return rig;
+    if (evaluateFirst)
+        CHECK(rig.evaluator->Evaluate(UsdTimeCode::Default()).valid);
+    std::string error;
+    CHECK(RigExecFreezeProgram(*rig.evaluator, &rig.frozen, &error));
+    if (!rig.frozen) {
+        std::printf("FAIL frozen requested: freeze refused: %s\n",
+                    error.c_str());
+        ++failures;
+    }
+    return rig;
+}
+
+/// Every catalog slot a dispatch can answer: an exported output with a
+/// producer, not one the rig reports unsupported from the start.
+std::vector<size_t>
+RequestedSlots(const RigExecOutputCatalog &catalog)
+{
+    std::vector<size_t> slots;
+    for (const RigExecOutputBinding &binding : catalog.GetBindings()) {
+        if (binding.status != RigExecOutputStatus::Pending)
+            continue;
+        size_t slot = 0;
+        if (catalog.GetDemandIndex().Find(binding.handle, &slot))
+            slots.push_back(slot);
+    }
+    return slots;
+}
+
+/// The slot of one semantic address, or -1 when the catalog exports none.
+size_t
+RequestedSlotFor(const RigExecOutputCatalog &catalog, const std::string &target,
+                 const std::string &phase)
+{
+    for (const RigExecOutputBinding &binding : catalog.GetBindings()) {
+        if (binding.descriptor.target != target ||
+            binding.descriptor.phase != phase)
+            continue;
+        size_t slot = 0;
+        if (catalog.GetDemandIndex().Find(binding.handle, &slot))
+            return slot;
+    }
+    return size_t(-1);
+}
+
+std::vector<RigExecOutputHandle>
+RequestedHandles(const RigExecOutputCatalog &catalog,
+                 const std::vector<size_t> &slots)
+{
+    std::vector<RigExecOutputHandle> handles;
+    handles.reserve(slots.size());
+    for (size_t slot : slots)
+        handles.push_back(catalog.GetDemandIndex().Handle(slot));
+    return handles;
+}
+
+/// The generation these handles belong to: this catalog's compile epoch as the
+/// program identity, with no input, preview or history revision moved.
+RigExecOutputGeneration
+RequestedCaptured(const RigExecOutputCatalog &catalog)
+{
+    RigExecOutputGeneration captured;
+    captured.programIdentity = catalog.GetCompileEpoch();
+    return captured;
+}
+
+RigExecOutputTimeDemand
+RequestedDemand(const RigExecOutputCatalog &catalog,
+                const std::vector<size_t> &slots, UsdTimeCode time)
+{
+    RigExecOutputTimeDemand demand;
+    if (!time.IsDefault())
+        RigExecOutputTime::TryTimeCode(time.GetValue(), &demand.time);
+    demand.handles = RequestedHandles(catalog, slots);
+    return demand;
+}
+
+/// The context one detached requested job runs under: the same sampled-count,
+/// program-pin and flag surface a warming job carries.
+RigExecFrozenEvalContext
+RequestedContext(const RigExecRigEvaluator &evaluator,
+                 const RigExecFrozenProgram &frozen,
+                 const RigExecFrameInputs &inputs, RigExecFrozenWorkspace *lane)
+{
+    RigExecFrozenEvalContext context;
+    context.compiledRigSignature = evaluator.GetCompiledRigSignature();
+    context.generation = 0;
+    context.slotCount = evaluator.GetBakedProgram()->GetProviderCount();
+    context.programDigest = 0;
+    context.varyingInputCount = inputs.values.size();
+    context.flags = 0;
+    if (evaluator.GetPublishWeightFields())
+        context.flags |= kRigExecFrozenPublishWeightFields;
+    if (evaluator.GetSolverGuidesEnabled())
+        context.flags |= kRigExecFrozenSolverGuidesEnabled;
+    context.frozen = &frozen;
+    context.workspace = lane;
+    return context;
+}
+
+RigExecFrozenRequestedResult
+RunFrozenRequested(const RequestedRig &rig, const RigExecFrameInputs &inputs,
+                   const RigExecFrozenRequestedRun &job,
+                   RigExecBackgroundScheduler *scheduler,
+                   RigExecFrozenRunReport *trace)
+{
+    RigExecFrozenEvalContext context =
+        RequestedContext(*rig.evaluator, *rig.frozen, inputs, rig.lane.get());
+    if (scheduler)
+        context.generation =
+            scheduler->CurrentGeneration(SdfPath(kRequestedRigPath));
+    return RigExecEvaluateFrozenRequested(
+        context, inputs, job, RigExecMakeProductionRequestedStepRunner(),
+        scheduler, SdfPath(kRequestedRigPath), trace);
+}
+
+void
+CheckRequestedPackets(const char *what,
+                      const std::vector<RigExecOutputPacket> &reference,
+                      const std::vector<RigExecOutputPacket> &warmed)
+{
+    if (reference.size() != warmed.size()) {
+        std::printf("FAIL %s: native answered %zu outputs, the lane %zu\n",
+                    what, reference.size(), warmed.size());
+        ++failures;
+    }
+    for (const RigExecOutputPacket &expected : reference) {
+        const RigExecOutputPacket *answer = nullptr;
+        for (const RigExecOutputPacket &packet : warmed)
+            if (packet.handle.semanticKey == expected.handle.semanticKey)
+                answer = &packet;
+        if (!answer) {
+            std::printf("FAIL %s: the lane answered no packet for %s\n", what,
+                        expected.handle.semanticKey.c_str());
+            ++failures;
+            continue;
+        }
+        if (answer->status != expected.status) {
+            std::printf("FAIL %s: %s answered %s (%s), native answered %s\n",
+                        what, expected.handle.semanticKey.c_str(),
+                        RigExecOutputStatusText(answer->status),
+                        answer->reason.c_str(),
+                        RigExecOutputStatusText(expected.status));
+            ++failures;
+            continue;
+        }
+        const std::vector<uint8_t> expectedBytes = expected.payload.bytes
+                                                       ? *expected.payload.bytes
+                                                       : std::vector<uint8_t>{};
+        const std::vector<uint8_t> warmedBytes = answer->payload.bytes
+                                                     ? *answer->payload.bytes
+                                                     : std::vector<uint8_t>{};
+        CHECK(answer->payload.kind == expected.payload.kind);
+        CHECK(answer->payload.elementCount == expected.payload.elementCount);
+        if (expectedBytes != warmedBytes) {
+            std::printf("FAIL %s: %s payload bytes differ (%zu vs %zu)\n", what,
+                        expected.handle.semanticKey.c_str(),
+                        expectedBytes.size(), warmedBytes.size());
+            ++failures;
+        }
+    }
+}
+
+double
+RequestedScalar(const RigExecOutputPacket &packet)
+{
+    RigExecPayloadView view;
+    std::string error;
+    double value = 0.0;
+    if (!view.Open(packet.handle, packet.payload, &error) ||
+        !view.ReadScalar(0, &value)) {
+        std::printf("FAIL %s: unreadable scalar payload (%s)\n",
+                    packet.handle.semanticKey.c_str(), error.c_str());
+        ++failures;
+    }
+    return value;
+}
+
+GfMatrix4d
+RequestedMatrix(const RigExecOutputPacket &packet)
+{
+    RigExecPayloadView view;
+    std::string error;
+    double cells[16] = {};
+    GfMatrix4d matrix(1.0);
+    if (!view.Open(packet.handle, packet.payload, &error) ||
+        !view.ReadMatrix4x4Row(0, cells)) {
+        std::printf("FAIL %s: unreadable matrix payload (%s)\n",
+                    packet.handle.semanticKey.c_str(), error.c_str());
+        ++failures;
+        return matrix;
+    }
+    for (size_t row = 0; row < 4; ++row)
+        for (size_t column = 0; column < 4; ++column)
+            matrix[row][column] = cells[row * 4 + column];
+    return matrix;
+}
+
+std::vector<double>
+PointDoubles(const VtValue &held)
+{
+    std::vector<double> out;
+    if (!held.IsHolding<VtVec3fArray>())
+        return out;
+    for (const GfVec3f &point : held.Get<VtVec3fArray>()) {
+        out.push_back(double(point[0]));
+        out.push_back(double(point[1]));
+        out.push_back(double(point[2]));
+    }
+    return out;
+}
+
+/// The points a payload carries, x y z as doubles in order.
+std::vector<double>
+RequestedPoints(const RigExecOutputPacket &packet)
+{
+    RigExecPayloadView view;
+    std::string error;
+    std::vector<double> out;
+    if (!view.Open(packet.handle, packet.payload, &error)) {
+        std::printf("FAIL %s: unreadable point payload (%s)\n",
+                    packet.handle.semanticKey.c_str(), error.c_str());
+        ++failures;
+        return out;
+    }
+    out.assign(size_t(view.ElementCount()) * 3, 0.0);
+    for (size_t i = 0; i < view.ElementCount(); ++i) {
+        if (!view.ReadPoint3(i, out.data() + i * 3))
+            break;
+    }
+    return out;
+}
+
+std::vector<double>
+AuthoredPoints(const UsdStageRefPtr &stage, const char *attributePath)
+{
+    const UsdPrim prim =
+        stage->GetPrimAtPath(SdfPath(attributePath).GetPrimPath());
+    VtValue value;
+    if (prim) {
+        prim.GetAttribute(UsdGeomTokens->points)
+            .Get(&value, UsdTimeCode::Default());
+    }
+    return PointDoubles(value);
+}
+
+const RigExecOutputPacket *
+RequestedPacket(const std::vector<RigExecOutputPacket> &packets,
+                const std::string &semanticKey)
+{
+    for (const RigExecOutputPacket &packet : packets)
+        if (packet.handle.semanticKey == semanticKey)
+            return &packet;
+    return nullptr;
+}
+
+const RigExecValueMaterialization *
+RequestedFact(const RigExecRequestedRunReport &report, RigExecValueId value)
+{
+    for (const RigExecValueMaterialization &fact : report.values)
+        if (fact.value == value)
+            return &fact;
+    return nullptr;
+}
+
+// Scalar, transform and point payloads from one detached requested run are
+// the values native evaluation publishes at that frame, at the default frame,
+// at two sampled frames and at a negative subframe code.
+void
+TestFrozenRequestedMatchesNativeEvaluation()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/true);
+    if (!rig.frozen || !rig.catalog)
+        return;
+
+    // The native half of the same request: a program of this compiled rig
+    // answering its own extraction.
+    RequestedRig native = BuildRequestedRig(/*evaluateFirst=*/false);
+    std::vector<std::string> reasons;
+    auto holder = RigExecBakedProgram::Build(native.evaluator.get(), &reasons);
+    CHECK(holder != nullptr);
+    const std::shared_ptr<const RigExecOutputCatalog> nativeCatalog =
+        holder ? RequestedCatalog(*holder) : nullptr;
+    if (!holder || !nativeCatalog)
+        return;
+
+    const std::vector<size_t> slots = RequestedSlots(*rig.catalog);
+    CHECK(!slots.empty());
+    const std::vector<size_t> nativeSlots = RequestedSlots(*nativeCatalog);
+    const RigExecDemandClosure wholeClosure =
+        nativeCatalog->GetDemandIndex().Union(nativeSlots);
+
+    for (const UsdTimeCode time : {UsdTimeCode::Default(), UsdTimeCode(2.0),
+                                   UsdTimeCode(8.0), UsdTimeCode(-1.5)}) {
+        RigExecFrameInputs inputs;
+        std::string error;
+        CHECK(RigExecSampleFrameInputs(*rig.evaluator, time, {}, &inputs,
+                                       &error));
+        CHECK(error.empty());
+        RigExecFrozenRequestedRun job;
+        CHECK(RigExecMakeFrozenRequestedRun(
+            rig.catalog, RequestedDemand(*rig.catalog, slots, time),
+            RequestedCaptured(*rig.catalog), &job, &error));
+        CHECK(error.empty());
+        RigExecFrozenRequestedResult warmed =
+            RunFrozenRequested(rig, inputs, job, nullptr, nullptr);
+        const char *frame = time.IsDefault()
+                                ? "default"
+                                : std::to_string(time.GetValue()).c_str();
+        if (!warmed.ran) {
+            std::printf("FAIL frozen requested at %s: %s\n", frame,
+                        warmed.error.c_str());
+            ++failures;
+            continue;
+        }
+
+        RigExecRequestedRunReport nativeReport;
+        CHECK(holder->RunRequested(time, wholeClosure, &nativeReport, &error));
+        std::vector<RigExecOutputPacket> reference;
+        CHECK(holder->ExtractRequestedOutputs(
+            *nativeCatalog, nativeReport, time,
+            RequestedCaptured(*nativeCatalog),
+            RequestedHandles(*nativeCatalog, nativeSlots), &reference, &error));
+        CHECK(error.empty());
+        CheckRequestedPackets("a detached requested run against native "
+                              "requested execution",
+                              reference, warmed.packets);
+
+        // And the whole-rig values live evaluation publishes at that frame.
+        const RigExecRigPose pose = rig.evaluator->Evaluate(time);
+        CHECK(pose.valid);
+        const size_t amountFinal =
+            RequestedSlotFor(*rig.catalog, kRequestedAmount, "final");
+        const size_t jointFinal =
+            RequestedSlotFor(*rig.catalog, kRequestedJoint, "final");
+        const size_t legFinal =
+            RequestedSlotFor(*rig.catalog, kRequestedLeg, "final");
+        const size_t armFinal =
+            RequestedSlotFor(*rig.catalog, kRequestedArm, "final");
+        CHECK(amountFinal != size_t(-1));
+        CHECK(jointFinal != size_t(-1));
+        CHECK(legFinal != size_t(-1));
+        CHECK(armFinal != size_t(-1));
+        if (amountFinal == size_t(-1) || jointFinal == size_t(-1) ||
+            legFinal == size_t(-1) || armFinal == size_t(-1)) {
+            return;
+        }
+        const RigExecOutputPacket *scalar = RequestedPacket(
+            warmed.packets,
+            rig.catalog->GetDemandIndex().Handle(amountFinal).semanticKey);
+        const RigExecOutputPacket *matrix = RequestedPacket(
+            warmed.packets,
+            rig.catalog->GetDemandIndex().Handle(jointFinal).semanticKey);
+        const RigExecOutputPacket *leg = RequestedPacket(
+            warmed.packets,
+            rig.catalog->GetDemandIndex().Handle(legFinal).semanticKey);
+        const RigExecOutputPacket *arm = RequestedPacket(
+            warmed.packets,
+            rig.catalog->GetDemandIndex().Handle(armFinal).semanticKey);
+        CHECK(scalar && matrix && leg && arm);
+        if (!scalar || !matrix || !leg || !arm)
+            continue;
+        CHECK(scalar->status == RigExecOutputStatus::Ready);
+        CHECK(matrix->status == RigExecOutputStatus::Ready);
+        CHECK(leg->status == RigExecOutputStatus::Ready);
+        CHECK(arm->status == RigExecOutputStatus::Ready);
+        CHECK(scalar->payload.elementCount == 1);
+        CHECK(matrix->payload.elementCount == 1);
+        CHECK(leg->payload.elementCount == 4);
+        CHECK(arm->payload.elementCount == 3);
+
+        const auto amount =
+            pose.movedProperties.find(SdfPath(kRequestedAmount));
+        CHECK(amount != pose.movedProperties.end());
+        if (amount != pose.movedProperties.end() &&
+            amount->second.IsHolding<float>()) {
+            CHECK(RequestedScalar(*scalar) ==
+                  double(amount->second.UncheckedGet<float>()));
+        }
+        const auto joint =
+            pose.jointMatricesFinal.find(SdfPath(kRequestedJoint));
+        CHECK(joint != pose.jointMatricesFinal.end());
+        if (joint != pose.jointMatricesFinal.end())
+            CHECK(RequestedMatrix(*matrix) == joint->second);
+        const auto legPoints =
+            pose.movedProperties.find(SdfPath(kRequestedLeg));
+        const auto armPoints =
+            pose.movedProperties.find(SdfPath(kRequestedArm));
+        CHECK(legPoints != pose.movedProperties.end());
+        CHECK(armPoints != pose.movedProperties.end());
+        if (legPoints != pose.movedProperties.end()) {
+            CHECK(RequestedPoints(*leg) == PointDoubles(legPoints->second));
+            // The mover moved the points: the payload is not the authored
+            // array read back.
+            CHECK(RequestedPoints(*leg) !=
+                  AuthoredPoints(rig.stage, kRequestedLeg));
+        }
+        if (armPoints != pose.movedProperties.end())
+            CHECK(RequestedPoints(*arm) == PointDoubles(armPoints->second));
+    }
+}
+
+// A request runs nothing outside its closure, and an output the closure does
+// not name is answered Pending with a reason, never read back from storage.
+void
+TestFrozenRequestedRunsNothingOutsideItsClosure()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/true);
+    if (!rig.frozen || !rig.catalog)
+        return;
+    const size_t amountFinal =
+        RequestedSlotFor(*rig.catalog, kRequestedAmount, "final");
+    const size_t legFinal =
+        RequestedSlotFor(*rig.catalog, kRequestedLeg, "final");
+    CHECK(amountFinal != size_t(-1));
+    CHECK(legFinal != size_t(-1));
+    if (amountFinal == size_t(-1) || legFinal == size_t(-1))
+        return;
+
+    // The snapshot was frozen off a generation evaluated at the default
+    // frame, so a request at frame 8 finds the point chain dirty: the run has
+    // bodies to run, and the trace has steps to name.
+    RigExecFrameInputs inputs;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode(8.0), {},
+                                   &inputs, &error));
+    RigExecFrozenRequestedRun job;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode(8.0)),
+        RequestedCaptured(*rig.catalog), &job, &error));
+    CHECK(!job.closure.Empty());
+
+    RigExecFrozenRunReport trace;
+    const RigExecFrozenRequestedResult ran =
+        RunFrozenRequested(rig, inputs, job, nullptr, &trace);
+    CHECK(ran.ran);
+    CHECK(trace.ran);
+    CHECK(!ran.report.executed.empty());
+    CHECK(!trace.region.empty());
+    for (const RigExecOpTraceEntry &entry : trace.region) {
+        if (!job.closure.Contains(uint32_t(entry.step))) {
+            std::printf("FAIL closure containment: step %zu ran outside the "
+                        "closure\n",
+                        entry.step);
+            ++failures;
+        }
+    }
+    for (uint32_t op : ran.report.executed)
+        CHECK(job.closure.Contains(op));
+    CHECK(ran.report.executedOperations <= job.closure.Size());
+
+    // Ask for the scalar too, with the point chain's closure: the run
+    // materializes only what that closure names, so the scalar answers Pending
+    // with a reason even though this lane's storage holds the value a whole
+    // run left -- a stale read is never served as an answer.
+    job.outputs = RequestedHandles(*rig.catalog, {legFinal, amountFinal});
+    const RigExecFrozenRequestedResult partial =
+        RunFrozenRequested(rig, inputs, job, nullptr, nullptr);
+    CHECK(partial.ran);
+    CHECK(partial.packets.size() == 2);
+    const RigExecOutputPacket *leg = RequestedPacket(
+        partial.packets,
+        rig.catalog->GetDemandIndex().Handle(legFinal).semanticKey);
+    const RigExecOutputPacket *scalar = RequestedPacket(
+        partial.packets,
+        rig.catalog->GetDemandIndex().Handle(amountFinal).semanticKey);
+    CHECK(leg && scalar);
+    if (leg)
+        CHECK(leg->status == RigExecOutputStatus::Ready);
+    if (scalar) {
+        CHECK(scalar->status == RigExecOutputStatus::Pending);
+        CHECK(scalar->payload.IsEmpty());
+        CHECK(!scalar->reason.empty());
+    }
+    // The point answer is the value live evaluation publishes at frame 8.
+    const RigExecRigPose pose = rig.evaluator->Evaluate(UsdTimeCode(8.0));
+    CHECK(pose.valid);
+    const auto moved = pose.movedProperties.find(SdfPath(kRequestedLeg));
+    CHECK(moved != pose.movedProperties.end());
+    if (leg && moved != pose.movedProperties.end())
+        CHECK(RequestedPoints(*leg) == PointDoubles(moved->second));
+}
+
+// A lane that has published nothing computes what a request needs: a value
+// this arena never materialized is not read back as clean storage, and the
+// answer matches a live evaluation of the same rig.
+void
+TestFrozenRequestedExpandsAFreshArena()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/false);
+    if (!rig.frozen || !rig.catalog)
+        return;
+    rig.lane = RigExecCreateFrozenWorkspace(rig.frozen);
+    CHECK(rig.lane != nullptr);
+    if (!rig.lane)
+        return;
+
+    const size_t legBase =
+        RequestedSlotFor(*rig.catalog, kRequestedLeg, "base");
+    const size_t legFinal =
+        RequestedSlotFor(*rig.catalog, kRequestedLeg, "final");
+    CHECK(legBase != size_t(-1));
+    CHECK(legFinal != size_t(-1));
+    if (legBase == size_t(-1) || legFinal == size_t(-1))
+        return;
+
+    RigExecFrameInputs inputs;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode::Default(), {},
+                                   &inputs, &error));
+
+    RigExecFrozenRequestedRun shallowJob;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, {legBase}, UsdTimeCode::Default()),
+        RequestedCaptured(*rig.catalog), &shallowJob, &error));
+    const RigExecFrozenRequestedResult first =
+        RunFrozenRequested(rig, inputs, shallowJob, nullptr, nullptr);
+    CHECK(first.ran);
+
+    // The same lane, the deeper output: its producer never wrote this arena,
+    // so the run expands to it whatever its input keys say.
+    RigExecFrozenRequestedRun deepJob;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode::Default()),
+        RequestedCaptured(*rig.catalog), &deepJob, &error));
+    const RigExecFrozenRequestedResult second =
+        RunFrozenRequested(rig, inputs, deepJob, nullptr, nullptr);
+    CHECK(second.ran);
+    const RigExecOutputPacket *leg = RequestedPacket(
+        second.packets,
+        rig.catalog->GetDemandIndex().Handle(legFinal).semanticKey);
+    CHECK(leg && leg->status == RigExecOutputStatus::Ready);
+    if (!leg)
+        return;
+    const RigExecOutputBinding *binding = nullptr;
+    CHECK(rig.catalog->Resolve(leg->handle, &binding) ==
+          RigExecOutputStatus::Pending);
+    CHECK(binding != nullptr);
+    if (binding) {
+        const RigExecValueMaterialization *fact =
+            RequestedFact(second.report, binding->producerValue);
+        CHECK(fact && fact->produced && fact->wasAbsent);
+    }
+    // The base the shallow run published stands: the deep run reuses it
+    // instead of recomputing it.
+    const RigExecOutputBinding *baseBinding = nullptr;
+    if (rig.catalog->Resolve(rig.catalog->GetDemandIndex().Handle(legBase),
+                             &baseBinding) == RigExecOutputStatus::Pending) {
+        const RigExecValueMaterialization *baseFact =
+            RequestedFact(second.report, baseBinding->producerValue);
+        CHECK(baseFact && baseFact->reused && !baseFact->wasAbsent);
+    }
+
+    const RigExecRigPose pose = rig.evaluator->Evaluate(UsdTimeCode::Default());
+    CHECK(pose.valid);
+    const auto moved = pose.movedProperties.find(SdfPath(kRequestedLeg));
+    CHECK(moved != pose.movedProperties.end());
+    if (moved != pose.movedProperties.end())
+        CHECK(RequestedPoints(*leg) == PointDoubles(moved->second));
+
+    // What the two partial runs left out is owed, not trusted: the whole
+    // frame this lane runs next lands on the live answer, bit for bit.
+    RigExecBackgroundScheduler afterExpansion;
+    const RigExecRigPose rebuilt =
+        RunWarmingJob(rig.evaluator.get(), SdfPath(kRequestedRigPath),
+                      rig.frozen, inputs, &afterExpansion, nullptr);
+    CheckPosesBitIdentical("a whole frame on a lane that ran two partial runs",
+                           rig.evaluator->Evaluate(UsdTimeCode::Default()),
+                           rebuilt);
+}
+
+// A payload a requested run handed out is an immutable lease: every later run
+// on that lane -- another request, then a whole frame job -- leaves the bytes a
+// retained packet describes exactly as they were.
+void
+TestFrozenRequestedPayloadsStandAcrossLaterRuns()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/false);
+    if (!rig.frozen || !rig.catalog)
+        return;
+    rig.lane = RigExecCreateFrozenWorkspace(rig.frozen);
+    CHECK(rig.lane != nullptr);
+    if (!rig.lane)
+        return;
+
+    RigExecFrameInputs at2;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode(2.0), {}, &at2,
+                                   &error));
+    RigExecFrozenRequestedRun job;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, RequestedSlots(*rig.catalog),
+                        UsdTimeCode(2.0)),
+        RequestedCaptured(*rig.catalog), &job, &error));
+    const RigExecFrozenRequestedResult first =
+        RunFrozenRequested(rig, at2, job, nullptr, nullptr);
+    CHECK(first.ran);
+    CHECK(!first.packets.empty());
+
+    struct Retained {
+        std::shared_ptr<const std::vector<uint8_t>> bytes;
+        RigExecPayloadKind kind = RigExecPayloadKind::Unknown;
+        uint64_t elementCount = 0;
+        std::string key;
+    };
+    std::vector<Retained> retained;
+    for (const RigExecOutputPacket &packet : first.packets) {
+        if (!packet.payload.bytes || packet.payload.bytes->empty())
+            continue;
+        retained.push_back({packet.payload.bytes, packet.payload.kind,
+                            packet.payload.elementCount,
+                            packet.handle.semanticKey});
+    }
+    CHECK(retained.size() >= 3);
+
+    // Another request on the same lane: the earlier run's leases still name
+    // the bytes they were handed out with, and the new answers match them.
+    const RigExecFrozenRequestedResult again =
+        RunFrozenRequested(rig, at2, job, nullptr, nullptr);
+    CHECK(again.ran);
+    for (const RigExecOutputPacket &packet : again.packets) {
+        for (const Retained &held : retained) {
+            if (held.key != packet.handle.semanticKey)
+                continue;
+            CHECK(packet.payload.kind == held.kind);
+            CHECK(packet.payload.elementCount == held.elementCount);
+            CHECK(packet.payload.bytes);
+            if (packet.payload.bytes)
+                CHECK(*packet.payload.bytes == *held.bytes);
+        }
+    }
+    // Then a whole frame job on the same lane: the retained leases are still
+    // the bytes they were, and their owners still hold them.
+    RigExecBackgroundScheduler scheduler;
+    const RigExecRigPose warmed =
+        RunWarmingJob(rig.evaluator.get(), SdfPath(kRequestedRigPath),
+                      rig.frozen, at2, &scheduler, nullptr);
+    CheckPosesBitIdentical("a whole frame after requested runs on one lane",
+                           rig.evaluator->Evaluate(UsdTimeCode(2.0)), warmed);
+    for (const Retained &held : retained) {
+        CHECK(held.bytes.use_count() >= 1);
+        CHECK(!held.bytes->empty());
+    }
+}
+
+// Every refusal is reported rather than papered over: a demand the catalog
+// cannot resolve, a mask that is not predecessor closed, a generation retired
+// before or during the job, handles from another compile epoch, and a job that
+// names nothing all answer with no packets and a reason. Nothing here
+// evaluates the rig another way.
+void
+TestFrozenRequestedDeclinesAndReports()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/true);
+    if (!rig.frozen || !rig.catalog)
+        return;
+    const size_t legFinal =
+        RequestedSlotFor(*rig.catalog, kRequestedLeg, "final");
+    CHECK(legFinal != size_t(-1));
+    if (legFinal == size_t(-1))
+        return;
+    RigExecFrameInputs inputs;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode::Default(), {},
+                                   &inputs, &error));
+    RigExecFrozenRequestedRun job;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode::Default()),
+        RequestedCaptured(*rig.catalog), &job, &error));
+
+    // A demand naming an output this catalog does not know is refused before
+    // any dispatch, so no partial mask ever runs.
+    RigExecOutputTimeDemand foreign =
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode::Default());
+    foreign.handles.back().semanticKey = "not-an-output";
+    RigExecFrozenRequestedRun foreignJob;
+    CHECK(!RigExecMakeFrozenRequestedRun(rig.catalog, foreign,
+                                         RequestedCaptured(*rig.catalog),
+                                         &foreignJob, &error));
+    CHECK(!error.empty());
+    CHECK(foreignJob.outputs.empty());
+
+    // A mask that is not predecessor closed runs no body.
+    RigExecFrozenRequestedRun open = job;
+    open.closure.kinds.clear();
+    if (open.closure.ops.size() > 1)
+        open.closure.ops.erase(open.closure.ops.begin());
+    const RigExecFrozenRequestedResult declined =
+        RunFrozenRequested(rig, inputs, open, nullptr, nullptr);
+    CHECK(!declined.ran);
+    CHECK(declined.packets.empty());
+    CHECK(declined.report.values.empty());
+    CHECK(!declined.error.empty());
+
+    // A job whose generation is already retired never starts, and one retired
+    // while it ran has its answers dropped: the bodies ran, the bytes do not
+    // stand for a frame any request owns.
+    RigExecBackgroundScheduler scheduler;
+    RigExecFrozenEvalContext pinned =
+        RequestedContext(*rig.evaluator, *rig.frozen, inputs, nullptr);
+    pinned.generation = scheduler.CurrentGeneration(SdfPath(kRequestedRigPath));
+    const RigExecFrozenRequestedStepRunner production =
+        RigExecMakeProductionRequestedStepRunner();
+    const RigExecFrozenRequestedResult started = RigExecEvaluateFrozenRequested(
+        pinned, inputs, job, production, &scheduler, SdfPath(kRequestedRigPath),
+        nullptr);
+    CHECK(started.ran);
+    scheduler.CancelGeneration(SdfPath(kRequestedRigPath));
+    // The same pinned token, retired while the job sat in the queue.
+    const RigExecFrozenRequestedResult retired = RigExecEvaluateFrozenRequested(
+        pinned, inputs, job, production, &scheduler, SdfPath(kRequestedRigPath),
+        nullptr);
+    CHECK(!retired.ran);
+    CHECK(retired.packets.empty());
+    CHECK(!retired.error.empty());
+
+    {
+        RigExecBackgroundScheduler midRun;
+        RigExecFrozenEvalContext context =
+            RequestedContext(*rig.evaluator, *rig.frozen, inputs, nullptr);
+        context.generation =
+            midRun.CurrentGeneration(SdfPath(kRequestedRigPath));
+        const RigExecFrozenRequestedStepRunner production =
+            RigExecMakeProductionRequestedStepRunner();
+        bool bodiesRan = false;
+        auto retiring =
+            [&](const RigExecFrozenEvalContext &contextIn,
+                const RigExecFrameInputs &in, RigExecFrozenArena &arena,
+                const RigExecFrozenRequestedRun &requested,
+                RigExecRequestedRunReport *report,
+                std::vector<RigExecOutputPacket> *packets, std::string *err) {
+                bodiesRan = production(contextIn, in, arena, requested, report,
+                                       packets, err);
+                midRun.CancelGeneration(SdfPath(kRequestedRigPath));
+                return bodiesRan;
+            };
+        const RigExecFrozenRequestedResult fence =
+            RigExecEvaluateFrozenRequested(context, inputs, job, retiring,
+                                           &midRun, SdfPath(kRequestedRigPath),
+                                           nullptr);
+        CHECK(bodiesRan);
+        CHECK(!fence.ran);
+        CHECK(fence.packets.empty());
+        CHECK(!fence.error.empty());
+    }
+
+    // Handles minted by another compile epoch answer Invalidated with a
+    // reason, never Ready.
+    RigExecFrozenRequestedRun staleEpoch = job;
+    for (RigExecOutputHandle &handle : staleEpoch.outputs)
+        handle.compileEpoch = 99;
+    const RigExecFrozenRequestedResult epoch =
+        RunFrozenRequested(rig, inputs, staleEpoch, nullptr, nullptr);
+    CHECK(epoch.ran);
+    CHECK(epoch.packets.size() == staleEpoch.outputs.size());
+    for (const RigExecOutputPacket &packet : epoch.packets) {
+        CHECK(packet.status == RigExecOutputStatus::Invalidated);
+        CHECK(packet.payload.IsEmpty());
+        CHECK(!packet.reason.empty());
+    }
+
+    // A job that names nothing, and one with no catalog, decline at the entry
+    // point without touching a lane.
+    RigExecFrozenRequestedRun empty;
+    empty.catalog = job.catalog;
+    const RigExecFrozenRequestedResult emptyRun =
+        RunFrozenRequested(rig, inputs, empty, nullptr, nullptr);
+    CHECK(!emptyRun.ran);
+    CHECK(!emptyRun.error.empty());
+    RigExecFrozenRequestedRun noCatalog = job;
+    noCatalog.catalog.reset();
+    const RigExecFrozenRequestedResult orphan =
+        RunFrozenRequested(rig, inputs, noCatalog, nullptr, nullptr);
+    CHECK(!orphan.ran);
+    CHECK(!orphan.error.empty());
+}
+
 int
 main(int argc, char **argv)
 {
     TestFrozenPropertySkinLayoutRecovery();
     TestNormalsLayoutWarmsBitIdentical();
+    TestFrozenRequestedMatchesNativeEvaluation();
+    TestFrozenRequestedRunsNothingOutsideItsClosure();
+    TestFrozenRequestedExpandsAFreshArena();
+    TestFrozenRequestedPayloadsStandAcrossLaterRuns();
+    TestFrozenRequestedDeclinesAndReports();
     if (argc > 1)
         TestFrozenEnvelopeVolumesRecovery(argv[1]);
     TestValuesAreFoundByPath();

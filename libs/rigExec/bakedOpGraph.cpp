@@ -1552,6 +1552,94 @@ OutsideRequested(const RigExecBakedProgramImpl &B, uint32_t op)
 } // namespace
 
 bool
+RigExecBakedBeginRequestedRun(RigExecBakedProgramImpl *program,
+                              const RigExecDemandClosure &requested,
+                              std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    auto &B = *program;
+    const size_t opCount = B.opGraph.ops.size();
+    if (!B.opAdapter.compiled || opCount == 0)
+        return fail("baked program has no canonical operation graph");
+    if (requested.ops.empty())
+        return fail("requested run names no operation");
+    uint32_t previous = 0;
+    bool leading = true;
+    for (uint32_t op : requested.ops) {
+        if (op >= opCount)
+            return fail("requested run names an operation outside the graph");
+        if (!leading && op <= previous)
+            return fail("requested run names operations out of order, or the "
+                        "same one twice");
+        previous = op;
+        leading = false;
+    }
+    std::string reason;
+    if (!RigExecClosureIsClosed(B.opGraph, requested, &reason))
+        return fail("requested closure: " + reason);
+    std::vector<char> mask(opCount, 0);
+    for (uint32_t op : requested.ops)
+        mask[size_t(op)] = 1;
+    B.requestedMask = std::move(mask);
+    B.requestedOps = requested.ops;
+    B.requestedRun = true;
+    return true;
+}
+
+void
+RigExecBakedEndRequestedRun(RigExecBakedProgramImpl *program)
+{
+    program->requestedRun = false;
+    program->requestedMask.clear();
+    program->requestedOps.clear();
+    program->requestedSkipEffects.clear();
+    program->requestedAbsent.clear();
+}
+
+void
+RigExecBakedFillRequestedRunReport(const RigExecBakedProgramImpl &program,
+                                   RigExecRequestedRunReport *report)
+{
+    const auto &B = program;
+    report->executed.clear();
+    report->values.clear();
+    std::vector<char> counted(B.opAdapter.values.size(), 0);
+    for (uint32_t op : B.requestedOps) {
+        if (op >= B.opGraph.ops.size())
+            continue;
+        const bool ran =
+            op < B.opExecution.ran.size() && B.opExecution.ran[op] != 0;
+        if (ran)
+            report->executed.push_back(op);
+        for (RigExecValueId id : B.opGraph.ops[op].descriptor.writes) {
+            if (id >= B.opAdapter.values.size() || counted[size_t(id)])
+                continue;
+            counted[size_t(id)] = 1;
+            const RigExecOpValueState &value = B.opAdapter.values[size_t(id)];
+            RigExecValueMaterialization fact;
+            fact.value = id;
+            fact.produced = ran;
+            fact.reused = !ran && value.initialized;
+            fact.wasAbsent = id < B.requestedAbsent.size() &&
+                             B.requestedAbsent[size_t(id)] != 0;
+            fact.revision = value.revision;
+            report->values.push_back(fact);
+        }
+    }
+    std::sort(
+        report->values.begin(), report->values.end(),
+        [](const RigExecValueMaterialization &a,
+           const RigExecValueMaterialization &b) { return a.value < b.value; });
+    report->requestedOperations = B.requestedOps.size();
+    report->executedOperations = report->executed.size();
+    report->clustersRun = B.lastClosedClusters;
+}
+
+bool
 RigExecBakedExecuteOpGraph(RigExecBakedProgramImpl *program, UsdTimeCode time,
                            bool force)
 {
