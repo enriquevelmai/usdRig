@@ -350,3 +350,32 @@ lanes.
 - **Callbacks are queued, never run on a worker.** A completion lands at the
   owner's `PumpCallbacks`, and an event for a client that closed first is
   dropped.
+
+## The Python host surface
+
+`rigexec.subscriptions` is this lifecycle for a host with no viewer: a
+`SubscriptionService` per rig and pool, driven by the host's own calls, with no
+Qt event loop and no evaluation on a reader's thread. The Python facade wraps
+the native transport, which speaks dictionaries: discovered outputs and frames
+go in, packets of copied bytes come out, and no Python value crosses to a
+worker.
+
+| Call | Says |
+| --- | --- |
+| `SubscriptionService(rig, workers=None)` | The subscriptions of one compiled `rigexec.Rig`. The service owns the pool and the coverage cache under it; unset `workers` takes the scheduler's default lane count, and `workers=0` leaves the queue to `run_next_queued()`. The `workers` property reports which one it is. |
+| `discover()` | Every explicitly retained output of the rig's standing compiled program, each with the handle a subscription names back. |
+| `subscribe(outputs, times)` | Demand those outputs at those frames. `None` is the default frame and never frame zero; any other value is one exact finite time code, so zero, negative frames and subframes are real times. A refusal reports `status`, `reason` and the outputs the catalog can name but cannot produce, and moves no demand. |
+| `Subscription.update(outputs, times)` | Replace the request, reported on the returned receipt. A refusal leaves the old request, its demand and its answers standing. |
+| `Subscription.poll()` | One `Packet` per demanded output and frame, in request order: `status`, `reason`, the exact `time` it answers for, and a Ready packet's `value`. Polling evaluates and dispatches nothing. |
+| `OutputValue` | The answer as read-only arrays: `scalar`, `matrix` (row-major, USD row-vector form), `point(i)`. A poll copies the published bytes, so a held answer never aliases a live result and never moves under its holder. |
+| `pump()`, `settle(timeout=5.0)` | The host's own tick: deliver what the pool completed and re-dispatch what a retired generation or a widened demand left owed. `settle` pumps and runs until nothing is in flight. |
+| `Subscription.close()`, `close_all()` | End one subscription or all of them, with the same release for each demand no other client holds. Leaving a subscription's `with` block closes it. |
+| `stats()` | The service's counters: subscriptions, frames demanded, in flight, coverage hits, dispatches, declines and pinned bytes. |
+
+A service holds its `rigexec.Rig` alive, because the capture hook samples it
+on the owner thread and is the only live-USD read in the lifecycle. Every entry
+point gives up the GIL for its duration, and closing one subscription never
+touches a frame another client holds. `tests/python/test_rigexec_subscriptions.py`
+is the executable version of the time semantics: the default frame kept apart
+from frame zero, negative and subframe codes, two clients on one frame, and an
+answer that outlives its subscription unchanged.

@@ -103,6 +103,11 @@ from .bake import export_baked
 from .inverse import InverseResult, solve_parameters
 from . import binding
 from .binding import generate_skin_weights
+# Headless output subscriptions (docs/specs/output-subscriptions.md): the
+# facade a host or an inspector drives, never the native transport under it.
+from . import subscriptions
+from .subscriptions import (OutputBinding, OutputValue, Packet, Subscription,
+                            SubscriptionService)
 
 # Re-exported native surface.
 

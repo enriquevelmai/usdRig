@@ -2518,6 +2518,13 @@ if (RIGEXEC_BUILD_PYTHON AND RIGEXEC_BUILD_TESTS AND Python3_FOUND)
     add_test(NAME testRigExecInverse COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_rigexec_inverse.py"
         "${CMAKE_CURRENT_BINARY_DIR}/usd/rigExecSchema/resources")
+    # Subscriptions answered at exact frames with no viewer and no timer: the
+    # default frame kept apart from frame zero, negative and subframe codes,
+    # read-only retention across a later run, context-manager release, handles
+    # gone stale by a recompile, and two clients sharing one job.
+    add_test(NAME testRigExecSubscriptionsPython COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_rigexec_subscriptions.py"
+        "${CMAKE_CURRENT_BINARY_DIR}/usd/rigExecSchema/resources")
     add_test(NAME testRigExecSkinLayoutOverrides COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_rigexec_skin_layout_overrides.py"
         "${CMAKE_CURRENT_BINARY_DIR}/usd/rigExecSchema/resources")
@@ -2745,7 +2752,8 @@ if (RIGEXEC_BUILD_PYTHON AND RIGEXEC_BUILD_TESTS AND Python3_FOUND)
                          testRigExecPoseCyclePython testRigExecPoseRotationsPython
                          testRigExecTrsMastersPython testRigExecWireInvariantPython
                          testRigExecCurveKeyOverrides testRigExecPathPointOverrides
-                         testRigExecSkinLayoutOverrides)
+                         testRigExecSkinLayoutOverrides
+                         testRigExecSubscriptionsPython)
         set_tests_properties(${_python_test} PROPERTIES ENVIRONMENT
             "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python")
         set_property(TEST ${_python_test} APPEND PROPERTY ENVIRONMENT

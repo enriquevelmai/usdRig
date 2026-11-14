@@ -47,14 +47,18 @@ endif()
 
 # Keep the pure-Python package importable from ONE build-tree PYTHONPATH entry:
 # copy it next to the extension module. A standalone target (not POST_BUILD)
-# so editing a .py file re-copies even when no C++ target relinks. The
-# installed layout is handled by install() below, where both land in
-# RIGEXEC_INSTALL_PYTHONDIR.
+# so editing a .py file re-copies even when no C++ target relinks; the glob
+# re-checks the package's own sources at build time, so any module a developer
+# edits re-copies. The installed layout is handled by install() below, where
+# both land in RIGEXEC_INSTALL_PYTHONDIR.
+file(GLOB_RECURSE _rigexec_python_sources
+     RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+     CONFIGURE_DEPENDS "rigexec/*.py")
 add_custom_target(rigexec_python_package ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/rigexec"
         "$<TARGET_FILE_DIR:_rigexec>/rigexec"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rigexec/__init__.py")
+    DEPENDS ${_rigexec_python_sources})
 
 install(TARGETS _rigexec LIBRARY DESTINATION "${RIGEXEC_INSTALL_PYTHONDIR}")
 # No trailing slash: install the rigexec/ directory itself so the package

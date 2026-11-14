@@ -20,6 +20,7 @@
 #include "pxr/usd/usd/timeCode.h"
 #include "pxr/external/boost/python/extract.hpp"
 
+#include "rigExec/outputSubscription.h"
 #include "rigExec/rigEvaluator.h"
 #include "rigExecGpu/gpuDeformExecutor.h"
 #include "rigExecMath/pointFrame.h"
@@ -723,6 +724,530 @@ _RbfSolverFromTable(const py::dict &table)
     }
     return solver;
 }
+
+// Headless output subscriptions (libs/rigExec/outputSubscription.h).
+//
+// One subscription host for one rig: it owns the frame cache and the pool the
+// service is handed (the service owns neither), and supplies the service's two
+// owner-thread hooks -- the catalog for the rig's current compile epoch, and
+// one exact frame's capture, which is the only live-USD read in the lifecycle.
+// The lane runs the production requested step runner, so a subscription answer
+// comes from the same operation graph a full frame does.
+//
+// Every entry point gives the GIL up for the duration: a capture samples the
+// stage and clones a frozen snapshot, and closing joins the pool's lanes.
+// Nothing crosses to a worker as a Python value: a host polls and pumps on the
+// owner thread.
+class _Subscriptions {
+public:
+    _Subscriptions(py::object rigObject, int workers)
+        : _rigObject(std::move(rigObject))
+    {
+        try {
+            _rig = py::cast<_Rig *>(_rigObject);
+        } catch (py::cast_error &) {
+            _rig = nullptr;
+        }
+        if (!_rig || !_rig->evaluator) {
+            throw py::type_error(
+                "subscriptions need a rigexec.Rig: one host per rig");
+        }
+        // Declared before the scheduler so it outlives the lanes that publish
+        // into it.
+        _frameCache = std::make_unique<rigExec::RigExecFrameCache>();
+        _scheduler =
+            std::make_unique<rigExec::RigExecBackgroundScheduler>(workers);
+        rigExec::RigExecSubscriptionHost host;
+        host.scheduler = _scheduler.get();
+        host.frameCache = _frameCache.get();
+        host.resolveCatalog = [this](const SdfPath &rigPath) {
+            return _CatalogFor(rigPath);
+        };
+        host.capture = [this](const SdfPath &rigPath,
+                              const rigExec::RigExecOutputTimeDemand &demand,
+                              const rigExec::RigExecOutputCatalog &catalog,
+                              rigExec::RigExecSubscriptionCapture *out,
+                              std::string *error) {
+            return _Capture(rigPath, demand, catalog, out, error);
+        };
+        _service = std::make_unique<rigExec::RigExecOutputSubscriptionService>(
+            std::move(host));
+    }
+
+    ~_Subscriptions()
+    {
+        py::gil_scoped_release release;
+        _handles.clear();
+        _service.reset();
+        _scheduler.reset();
+    }
+
+    py::list Discover()
+    {
+        std::shared_ptr<const rigExec::RigExecOutputCatalog> catalog;
+        {
+            py::gil_scoped_release release;
+            catalog = _CatalogFor(_rig->rigPath);
+        }
+        if (!catalog) {
+            throw py::value_error(
+                "no output catalog: this rig has no baked program to "
+                "discover outputs from");
+        }
+        py::list out;
+        for (const rigExec::RigExecOutputBinding &binding :
+             catalog->GetBindings()) {
+            out.append(_BindingToDict(binding));
+        }
+        return out;
+    }
+
+    py::dict Subscribe(const py::object &outputs, const py::object &times)
+    {
+        const rigExec::RigExecOutputRequest request = _Request(outputs, times);
+        rigExec::RigExecSubscriptionReceipt receipt;
+        rigExec::RigExecSubscriptionHandle handle;
+        {
+            py::gil_scoped_release release;
+            handle = _service->Subscribe(_rig->rigPath, request, &receipt);
+        }
+        // The returned handle owns the subscription: holding it is what keeps
+        // the demand alive, and closing goes through Close.
+        if (handle.IsValid()) {
+            _handles.emplace(handle.Id(), std::move(handle));
+        }
+        return _ReceiptToDict(receipt);
+    }
+
+    py::dict Update(const uint64_t subscription, const py::object &outputs,
+                    const py::object &times)
+    {
+        const rigExec::RigExecOutputRequest request = _Request(outputs, times);
+        rigExec::RigExecSubscriptionReceipt receipt;
+        {
+            py::gil_scoped_release release;
+            receipt = _service->UpdateSubscription(subscription, request);
+        }
+        return _ReceiptToDict(receipt);
+    }
+
+    py::list Poll(const uint64_t subscription)
+    {
+        std::vector<rigExec::RigExecOutputPacket> packets;
+        {
+            py::gil_scoped_release release;
+            packets = _service->PollResults(subscription);
+        }
+        py::list out;
+        for (const rigExec::RigExecOutputPacket &packet : packets) {
+            out.append(_PacketToDict(packet));
+        }
+        return out;
+    }
+
+    size_t Pump()
+    {
+        py::gil_scoped_release release;
+        return _service->PumpCallbacks();
+    }
+
+    /// The pool's lane count. Zero is manual mode: nothing runs until the
+    /// host calls RunNextQueued.
+    int Workers() const
+    {
+        return _scheduler->GetWorkerCount();
+    }
+
+    /// Zero-worker mode's driver: run the highest-priority queued job on the
+    /// calling thread under the same fence a pool lane applies. A host with
+    /// workers set leaves the queue to the pool and pumps instead.
+    bool RunNextQueued()
+    {
+        py::gil_scoped_release release;
+        return _scheduler->RunNextQueuedForTesting();
+    }
+
+    void Close(const uint64_t subscription)
+    {
+        {
+            py::gil_scoped_release release;
+            _service->Close(subscription);
+        }
+        _handles.erase(subscription);
+    }
+
+    void CloseAll()
+    {
+        {
+            py::gil_scoped_release release;
+            _service->CloseAll();
+        }
+        _handles.clear();
+    }
+
+    py::dict Stats()
+    {
+        const rigExec::RigExecSubscriptionStats stats = _service->Stats();
+        py::dict out;
+        out["subscriptions"] = stats.subscriptions;
+        out["frames_demanded"] = stats.framesDemanded;
+        out["demands_in_flight"] = stats.demandsInFlight;
+        out["coverage_hits"] = stats.coverageHits;
+        out["dispatches"] = stats.dispatches;
+        out["redispatches"] = stats.redispatches;
+        out["declined_coverage_budget"] = stats.declinedCoverageBudget;
+        out["declined_admission"] = stats.declinedAdmission;
+        out["capture_failures"] = stats.captureFailures;
+        out["retired_in_flight"] = stats.retiredInFlight;
+        out["pinned_bytes"] = stats.pinnedBytes;
+        out["pinned_payloads"] = stats.pinnedPayloads;
+        out["callbacks_queued"] = stats.callbacksQueued;
+        out["stopping"] = _service->IsStopping();
+        return out;
+    }
+
+private:
+    // The catalog for the rig's standing compiled program, rediscovered
+    // whenever the program is rebuilt. Its epoch is the program build count,
+    // which every recompilation raises, so a rebuild is always a different
+    // demand and handles from the old program go stale rather than resolve.
+    std::shared_ptr<const rigExec::RigExecOutputCatalog>
+    _CatalogFor(const SdfPath &rigPath)
+    {
+        if (rigPath != _rig->rigPath) {
+            return nullptr;
+        }
+        const rigExec::RigExecBakedProgram *program =
+            _rig->evaluator->GetBakedProgram();
+        if (!program) {
+            return nullptr;
+        }
+        const uint64_t epoch =
+            uint64_t(_rig->evaluator->GetBakedProgramBuildCount());
+        if (_catalog && _catalogEpoch == epoch) {
+            return _catalog;
+        }
+        auto catalog = std::make_shared<rigExec::RigExecOutputCatalog>();
+        std::string error;
+        if (!rigExec::RigExecDiscoverOutputs(*program,
+                                             _rig->rigPath.GetString(), epoch,
+                                             catalog.get(), &error)) {
+            return nullptr;
+        }
+        _catalog = catalog;
+        _catalogEpoch = epoch;
+        return _catalog;
+    }
+
+    // One exact frame's capture, on the owner thread: the sampled input
+    // vector, a snapshot of the standing program, this job's own lane, and
+    // the generation the answers belong to. The input revision is the
+    // frame-cache control digest with the compiled rig's constant region
+    // folded in, so a scene edit at the same frame is a different generation
+    // and an answered frame that stands is a coverage hit.
+    bool _Capture(const SdfPath &rigPath,
+                  const rigExec::RigExecOutputTimeDemand &demand,
+                  const rigExec::RigExecOutputCatalog &catalog,
+                  rigExec::RigExecSubscriptionCapture *out, std::string *error)
+    {
+        if (rigPath != _rig->rigPath) {
+            *error = "this host subscribes " + _rig->rigPath.GetString();
+            return false;
+        }
+        const rigExec::RigExecBakedProgram *program =
+            _rig->evaluator->GetBakedProgram();
+        if (!program) {
+            *error = "the rig has no baked program to capture";
+            return false;
+        }
+        const UsdTimeCode time = demand.time.IsDefault()
+                                     ? UsdTimeCode::Default()
+                                     : UsdTimeCode(demand.time.TimeCode());
+        if (!rigExec::RigExecSampleFrameInputs(*_rig->evaluator, time, {}, {},
+                                               &out->inputs, error)) {
+            return false;
+        }
+        if (out->inputs.HasChainResolvedInputs()) {
+            *error = "the frame reads a property chain the sampler did not pin";
+            return false;
+        }
+        if (!rigExec::RigExecControlStateDigestible(out->inputs)) {
+            *error = "the frame holds a value the coverage key cannot digest";
+            return false;
+        }
+        out->context.compiledRigSignature =
+            _rig->evaluator->GetCompiledRigSignature();
+        out->context.slotCount = program->GetProviderCount();
+        out->context.programDigest =
+            out->context.compiledRigSignature ^
+            (uint64_t(program->GetBoundInputCount()) * 1099511628211ull) ^
+            (uint64_t(program->GetVaryingInputCount()) * 16777619ull);
+        out->context.varyingInputCount = out->inputs.values.size();
+        uint32_t flags = 0;
+        if (_rig->evaluator->GetPublishWeightFields()) {
+            flags |= rigExec::kRigExecFrozenPublishWeightFields;
+        }
+        if (_rig->evaluator->GetSolverGuidesEnabled()) {
+            flags |= rigExec::kRigExecFrozenSolverGuidesEnabled;
+        }
+        out->context.flags = flags;
+        if (!rigExec::RigExecFreezeProgram(*_rig->evaluator, &out->snapshot,
+                                           error)) {
+            return false;
+        }
+        out->workspace = rigExec::RigExecCreateFrozenWorkspace(out->snapshot);
+        if (!out->workspace) {
+            *error = "no execution lane for this frame";
+            return false;
+        }
+        out->captured.programIdentity = catalog.GetCompileEpoch();
+        out->captured.inputRevision =
+            rigExec::RigExecControlStateDigestWithConstants(
+                out->inputs, {}, out->inputs.upstream,
+                rigExec::RigExecFrozenAvarRegionDigest(*program));
+        // This host keeps no preview layer and carries its window history in
+        // the sampled vector the input revision folds.
+        out->captured.previewRevision = 0;
+        out->captured.historyRevision = 0;
+        out->upstreamRevision = 0;
+        out->bytes.capture = rigExec::RigExecEstimateCaptureBytes(out->inputs);
+        out->bytes.workspace = out->context.slotCount * sizeof(double);
+        return true;
+    }
+
+    rigExec::RigExecOutputRequest _Request(const py::object &outputs,
+                                           const py::object &times) const
+    {
+        if (py::isinstance<py::str>(outputs) ||
+            py::isinstance<py::bytes>(outputs)) {
+            throw py::type_error(
+                "outputs must be an iterable of discovered outputs");
+        }
+        std::vector<rigExec::RigExecOutputHandle> handles;
+        for (const py::handle &item : py::iterable(outputs)) {
+            handles.push_back(
+                _HandleFrom(py::reinterpret_borrow<py::object>(item)));
+        }
+        if (handles.empty()) {
+            throw py::value_error("a subscription names at least one output");
+        }
+        rigExec::RigExecOutputRequest request;
+        for (const rigExec::RigExecOutputTime &time : _Times(times)) {
+            rigExec::RigExecOutputTimeDemand demand;
+            demand.time = time;
+            demand.handles = handles;
+            request.demands.push_back(std::move(demand));
+        }
+        return request;
+    }
+
+    py::dict
+    _ReceiptToDict(const rigExec::RigExecSubscriptionReceipt &receipt) const
+    {
+        py::dict out;
+        out["status"] = rigExec::RigExecSubscriptionStatusText(receipt.status);
+        out["ok"] = receipt.IsAccepted();
+        out["reason"] = receipt.reason;
+        out["subscription"] = receipt.subscription;
+        out["frames"] = receipt.frames;
+        py::list unsupported;
+        for (const rigExec::RigExecOutputHandle &handle : receipt.unsupported) {
+            unsupported.append(_HandleToDict(handle));
+        }
+        out["unsupported"] = unsupported;
+        return out;
+    }
+
+    py::dict _BindingToDict(const rigExec::RigExecOutputBinding &binding) const
+    {
+        py::dict out;
+        out["target"] = binding.descriptor.target;
+        out["computation"] = binding.descriptor.publicComputation;
+        out["phase"] = binding.descriptor.phase;
+        out["type"] = binding.descriptor.type;
+        out["semantic_key"] = binding.descriptor.semanticKey;
+        out["kind"] = _KindText(binding.kind);
+        out["status"] = rigExec::RigExecOutputStatusText(binding.status);
+        out["reason"] = binding.reason;
+        out["handle"] = _HandleToDict(binding.handle);
+        return out;
+    }
+
+    py::dict _PacketToDict(const rigExec::RigExecOutputPacket &packet) const
+    {
+        py::dict out;
+        out["handle"] = _HandleToDict(packet.handle);
+        out["time"] = packet.time.IsDefault()
+                          ? py::none()
+                          : py::cast(packet.time.TimeCode());
+        out["status"] = rigExec::RigExecOutputStatusText(packet.status);
+        out["reason"] = packet.reason;
+        out["type"] = packet.handle.type;
+        out["layout"] =
+            rigExec::RigExecPayloadTypeSpelling(packet.payload.kind);
+        out["elements"] = packet.payload.elementCount;
+        std::string error;
+        const bool readable = rigExec::RigExecPayloadMatchesHandle(
+            packet.handle, packet.payload, &error);
+        out["payload_error"] = error;
+        // An immutable copy of the answer's bytes: the coverage record's own
+        // buffer is never handed out, and the package reads this copy back as
+        // a read-only array.
+        out["bytes"] = readable ? py::bytes(reinterpret_cast<const char *>(
+                                                packet.payload.bytes->data()),
+                                            packet.payload.bytes->size())
+                                : py::bytes();
+        py::dict generation;
+        generation["program_identity"] = packet.programIdentity;
+        generation["input_revision"] = packet.inputRevision;
+        generation["preview_revision"] = packet.previewRevision;
+        generation["history_revision"] = packet.historyRevision;
+        out["generation"] = generation;
+        return out;
+    }
+
+    static const char *_KindText(rigExec::RigExecOutputKind kind)
+    {
+        switch (kind) {
+        case rigExec::RigExecOutputKind::Scalar:
+            return "scalar";
+        case rigExec::RigExecOutputKind::Transform:
+            return "transform";
+        case rigExec::RigExecOutputKind::Points:
+            return "points";
+        }
+        return "unknown";
+    }
+
+    static py::dict _HandleToDict(const rigExec::RigExecOutputHandle &handle)
+    {
+        py::dict out;
+        out["rig_identity"] = handle.rigIdentity;
+        out["compile_epoch"] = handle.compileEpoch;
+        out["semantic_key"] = handle.semanticKey;
+        out["type"] = handle.type;
+        out["read_phase"] = handle.readPhase;
+        out["value_revision"] = handle.valueRevision;
+        return out;
+    }
+
+    // A discovered output: its handle dict, or any object carrying one.
+    static rigExec::RigExecOutputHandle _HandleFrom(const py::object &value)
+    {
+        py::object source = value;
+        if (!py::isinstance<py::dict>(source)) {
+            if (!py::hasattr(source, "handle")) {
+                throw py::type_error(
+                    "a subscription output must be an output this host "
+                    "discovered");
+            }
+            source = py::reinterpret_borrow<py::object>(source.attr("handle"));
+        }
+        py::dict dict = py::reinterpret_borrow<py::dict>(source);
+        const auto text = [&dict](const char *key) {
+            if (!dict.contains(key)) {
+                return std::string();
+            }
+            return py::reinterpret_borrow<py::object>(dict[key])
+                .cast<std::string>();
+        };
+        const auto number = [&dict](const char *key) {
+            if (!dict.contains(key)) {
+                return uint64_t(0);
+            }
+            return py::reinterpret_borrow<py::object>(dict[key])
+                .cast<uint64_t>();
+        };
+        rigExec::RigExecOutputHandle handle;
+        handle.rigIdentity = text("rig_identity");
+        handle.compileEpoch = number("compile_epoch");
+        handle.semanticKey = text("semantic_key");
+        handle.type = text("type");
+        handle.readPhase = text("read_phase");
+        handle.valueRevision = number("value_revision");
+        if (handle.rigIdentity.empty() || handle.semanticKey.empty() ||
+            handle.type.empty()) {
+            throw py::value_error(
+                "a subscription output must name one discovered output");
+        }
+        return handle;
+    }
+
+    // None is the default frame and never numeric zero; any other value is
+    // one exact finite USD time code, negative and fractional included.
+    static rigExec::RigExecOutputTime _TimeFrom(const py::object &value)
+    {
+        if (value.is_none()) {
+            return rigExec::RigExecOutputTime::Default();
+        }
+        double timeCode = 0.0;
+        if (py::hasattr(value, "IsDefault")) {
+            // A pxr.Usd.TimeCode: its default is an identity of its own.
+            if (value.attr("IsDefault")().cast<bool>()) {
+                return rigExec::RigExecOutputTime::Default();
+            }
+            timeCode = value.attr("GetValue")().cast<double>();
+        } else if (PyBool_Check(value.ptr())) {
+            throw py::type_error(
+                "a subscription time is None, a frame number, or a "
+                "Usd.TimeCode -- never a bool");
+        } else if (!PyFloat_Check(value.ptr()) && !PyLong_Check(value.ptr())) {
+            throw py::type_error(
+                "a subscription time is None, a frame number, or a "
+                "Usd.TimeCode, not " +
+                std::string(py::str(value.get_type())));
+        } else {
+            timeCode = value.cast<double>();
+        }
+        rigExec::RigExecOutputTime time;
+        if (!rigExec::RigExecOutputTime::TryTimeCode(timeCode, &time)) {
+            throw py::value_error(
+                "a subscription time must be a finite frame number, or None "
+                "for the default frame");
+        }
+        return time;
+    }
+
+    static std::vector<rigExec::RigExecOutputTime>
+    _Times(const py::object &value)
+    {
+        std::vector<rigExec::RigExecOutputTime> out;
+        if (value.is_none()) {
+            out.push_back(rigExec::RigExecOutputTime::Default());
+            return out;
+        }
+        const bool oneTime =
+            PyFloat_Check(value.ptr()) || PyLong_Check(value.ptr()) ||
+            PyBool_Check(value.ptr()) || py::hasattr(value, "IsDefault");
+        if (oneTime) {
+            out.push_back(_TimeFrom(value));
+            return out;
+        }
+        if (py::isinstance<py::str>(value) ||
+            py::isinstance<py::bytes>(value)) {
+            throw py::type_error("times must be an iterable of frames");
+        }
+        for (const py::handle &item : py::iterable(value)) {
+            out.push_back(_TimeFrom(py::reinterpret_borrow<py::object>(item)));
+        }
+        if (out.empty()) {
+            throw py::value_error("a subscription demands at least one frame");
+        }
+        return out;
+    }
+
+    py::object _rigObject;
+    _Rig *_rig = nullptr;
+    std::map<uint64_t, rigExec::RigExecSubscriptionHandle> _handles;
+    std::shared_ptr<const rigExec::RigExecOutputCatalog> _catalog;
+    uint64_t _catalogEpoch = 0;
+    // Destruction order matters: the service joins the pool, the pool joins
+    // its lanes, and both publish into the cache, so the cache is declared
+    // first and dies last.
+    std::unique_ptr<rigExec::RigExecFrameCache> _frameCache;
+    std::unique_ptr<rigExec::RigExecBackgroundScheduler> _scheduler;
+    std::unique_ptr<rigExec::RigExecOutputSubscriptionService> _service;
+};
 
 } // namespace
 
@@ -4196,4 +4721,62 @@ PYBIND11_MODULE(_rigexec, m)
         "a converted rig). allow_negative is allowNegativeWeights: with\n"
         "it off the weights are clamped at zero AFTER normalisation, never\n"
         "before.");
+
+    // The subscription host. rigexec/subscriptions.py is the surface a host
+    // uses; this is the transport under it: dicts out, discovered outputs and
+    // frames in, and no value crossing to a worker.
+    py::class_<_Subscriptions>(
+        m, "Subscriptions",
+        "One rig's output subscriptions: the native service behind\n"
+        "rigexec.subscriptions. Use the Python facade, not this.")
+        .def(py::init([](py::object rig, int workers) {
+                 return std::make_unique<_Subscriptions>(std::move(rig),
+                                                         workers);
+             }),
+             py::arg("rig"),
+             py::arg("workers") =
+                 rigExec::kRigExecBackgroundSchedulerDefaultWorkers,
+             "Subscribe to one rig's evaluated outputs. The host owns the\n"
+             "background pool it admits work to and the coverage cache it\n"
+             "publishes into, both private to this object. workers is the\n"
+             "pool's lane count; zero leaves the queue to run_next_queued.")
+        .def("discover", &_Subscriptions::Discover,
+             "Every explicitly retained output of the rig's standing compiled\n"
+             "program, each with the handle a subscription names back.")
+        .def(
+            "subscribe", &_Subscriptions::Subscribe, py::arg("outputs"),
+            py::arg("times") = py::none(),
+            "Demand these outputs at these exact frames. times is None for\n"
+            "the default frame, one frame, or an iterable of frames; None\n"
+            "inside it is the default frame and never frame zero. The receipt\n"
+            "reports the status, the reason, the subscription id, and the\n"
+            "outputs the catalog can name but cannot produce.")
+        .def("update", &_Subscriptions::Update, py::arg("subscription"),
+             py::arg("outputs"), py::arg("times"),
+             "Replace a live subscription's request. The new request is\n"
+             "validated first, and a refusal leaves the old one standing.")
+        .def("poll", &_Subscriptions::Poll, py::arg("subscription"),
+             "What stands for each demanded (output, frame) pair, in request\n"
+             "order. Polling evaluates and dispatches nothing; a Ready packet\n"
+             "carries an immutable copy of the answer's bytes.")
+        .def("pump", &_Subscriptions::Pump,
+             "Run what the pool completed since the last pump and re-dispatch\n"
+             "the demand a retired generation or a widened demand left owed.\n"
+             "Returns the completion callbacks delivered (this host installs\n"
+             "none, so it is 0).")
+        .def_property_readonly(
+            "workers", &_Subscriptions::Workers,
+            "The pool's lane count; zero runs nothing until\n"
+            "run_next_queued().")
+        .def("run_next_queued", &_Subscriptions::RunNextQueued,
+             "Zero-worker mode: run the highest-priority queued job on the\n"
+             "calling thread under the same fence a pool lane applies. False\n"
+             "when the queue is empty.")
+        .def("close", &_Subscriptions::Close, py::arg("subscription"),
+             "End one subscription: its demand is dropped unless another live\n"
+             "client holds it, and its payload pins come back.")
+        .def("close_all", &_Subscriptions::CloseAll,
+             "End every subscription this host holds.")
+        .def("stats", &_Subscriptions::Stats,
+             "The service's lifecycle counters.");
 }
