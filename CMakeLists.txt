@@ -2692,6 +2692,20 @@ if (RIGEXEC_BUILD_PYTHON AND RIGEXEC_BUILD_TESTS AND Python3_FOUND)
     add_test(NAME testCacheStripPanel
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_cache_strip_panel.py")
+    # The output inspector's model over the subscriptions facade: an exact
+    # frame demanded without moving the viewer's, statuses and answers per
+    # exported handle, and a teardown that releases the demand.
+    add_test(NAME testOutputInspectorModel
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_output_inspector_model.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/usd/rigExecSchema/resources")
+    # The same inspection on the panel's own widgets, on Qt's offscreen
+    # platform: the chooser, the frame field, the painted lines, and the
+    # stage-replacement and close paths that end the demand.
+    add_test(NAME testOutputInspectorUI
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_output_inspector_ui.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/usd/rigExecSchema/resources")
     add_test(NAME testUsdviewFrameCacheDriver
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_usdview_frame_cache.py")
@@ -2739,6 +2753,7 @@ if (RIGEXEC_BUILD_PYTHON AND RIGEXEC_BUILD_TESTS AND Python3_FOUND)
                          testCacheStripModel testTimelineModel
                          testPlayblastModel
                          testCacheStripPanel testUsdviewFrameCacheDriver
+                         testOutputInspectorModel testOutputInspectorUI
                          testImagingHandle
                          testSessionState testRigExecProfilerModel
                          testGizmoMarquee testRigExecImagingPublishedPython

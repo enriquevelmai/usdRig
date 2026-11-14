@@ -5,7 +5,15 @@
 Read phases and dependency edges determine which produced values a consumer
 reads. The panel displays compiler diagnostics without inferring extra rules
 from operation types or their positions in the list.
+
+Selecting a row also inspects what that row writes: the exported output is
+demanded at one exact frame through outputInspectorModel, which runs on the
+rigexec.subscriptions facade. The panel's own timer is the tick; a host with
+a recurring tick of its own can drive PollTick() instead.
 """
+import os
+import sys
+
 from pxr.Usdviewq.qt import QtCore, QtGui, QtWidgets
 
 try:
@@ -15,6 +23,25 @@ except ImportError:                    # loader that did not add our dir
     import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import sessionRegistry
+
+# The inspector model imports rigexec, so it lands the way the panel imports
+# rigexec itself: a missing native module leaves the panel open with the
+# reason on its status line rather than failing the menu action.
+_inspectorImportError = ""
+try:
+    import outputInspectorModel
+except ImportError as _error:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import outputInspectorModel
+    except ImportError as _nested:
+        outputInspectorModel = None
+        _inspectorImportError = str(_nested) or "outputInspectorModel"
+
+# How often an open panel reads back what the subscription service
+# published. The service's own pool does the work; this only repaints, and
+# it stops while nothing is owed.
+_INSPECTOR_POLL_MS = 250
 
 
 # Schema-type tokens per filter. A type may appear in several groups -- a
@@ -40,6 +67,23 @@ _SOLVER_TYPES = ("RigExecFkChain", "RigExecTwoBoneIk",
 def _tail(path, keep=1):
     parts = str(path).split("/")
     return "/".join(parts[-keep:]) if len(parts) > keep else str(path)
+
+
+def _OutputLabel(binding):
+    """One exported handle as the chooser spells it."""
+    return "%s  [%s %s]" % (_tail(binding.target, 2), binding.kind,
+                            _PhaseLabel(binding.phase))
+
+
+def _PhaseLabel(phase):
+    """A read phase as the panel spells it.
+
+    A mover's own pass is exported at the phase named by its path, so it
+    keeps its last two segments: the chooser and the lines say which mover
+    produced the value rather than showing a full stage path.
+    """
+    text = str(phase)
+    return _tail(text, 2) if text.startswith("/") else text
 
 
 class ExecStackPanel(QtWidgets.QDialog):
@@ -108,8 +152,266 @@ class ExecStackPanel(QtWidgets.QDialog):
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
+        self._BuildInspector(layout)
+
         self._solvers = []
         self._movers = []
+        self._rig = None
+
+        # The host's own lifecycle: a replaced stage drops the rig this panel
+        # compiled and every demand made from it, and a prim picked in the
+        # viewport names the outputs to inspect. Optional as in the other
+        # panels: a bare api has neither signal.
+        try:
+            dataModel = self._api.dataModel
+            dataModel.signalStageReplaced.connect(self._OnStageReplaced)
+            dataModel.selection.signalPrimSelectionChanged.connect(
+                self._OnPrimSelection)
+        except Exception:
+            pass
+
+    # -- output inspector ------------------------------------------------
+
+    def _BuildInspector(self, layout):
+        """The inspector section: one exported output at one exact frame.
+
+        Every disposition, spelling and color comes from
+        outputInspectorModel, the same model the headless test drives; this
+        panel lists, demands and repaints.
+        """
+        group = QtWidgets.QGroupBox("Exported outputs")
+        groupLayout = QtWidgets.QVBoxLayout(group)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Inspect:"))
+        self._outputBox = QtWidgets.QComboBox()
+        self._outputBox.setMinimumWidth(240)
+        self._outputBox.currentIndexChanged.connect(
+            lambda _i: self._OnOutputChanged())
+        row.addWidget(self._outputBox)
+
+        self._allOutputsButton = QtWidgets.QPushButton("All of this rig")
+        self._allOutputsButton.clicked.connect(self._InspectAllOutputs)
+        row.addWidget(self._allOutputsButton)
+
+        row.addWidget(QtWidgets.QLabel("At frame:"))
+        self._frameEdit = QtWidgets.QLineEdit()
+        self._frameEdit.setPlaceholderText("blank = default, or -3, 2.5, 0")
+        self._frameEdit.returnPressed.connect(self._ApplyFrameEdit)
+        row.addWidget(self._frameEdit, 1)
+
+        self._shownFrameButton = QtWidgets.QPushButton("Shown frame")
+        self._shownFrameButton.clicked.connect(self._InspectShownFrame)
+        row.addWidget(self._shownFrameButton)
+        groupLayout.addLayout(row)
+
+        self._inspectorTree = QtWidgets.QTreeWidget()
+        self._inspectorTree.setHeaderLabels(
+            ["Output", "Kind", "Phase", "Frame", "Status", "Generation",
+             "Value"])
+        self._inspectorTree.setRootIsDecorated(False)
+        self._inspectorTree.setAlternatingRowColors(True)
+        groupLayout.addWidget(self._inspectorTree, 1)
+
+        self._inspectorStatus = QtWidgets.QLabel("")
+        self._inspectorStatus.setWordWrap(True)
+        groupLayout.addWidget(self._inspectorStatus)
+
+        layout.addWidget(group, 1)
+
+        self._inspector = (None if outputInspectorModel is None else
+                           outputInspectorModel.OutputInspectorModel(
+                               host=self))
+        # The panel's own tick, armed only while a demand is owed: pumping
+        # and polling are cheap, and a settled request repaints nothing. A
+        # host with a recurring tick can drive PollTick itself.
+        self._inspectorTimer = QtCore.QTimer(self)
+        self._inspectorTimer.setSingleShot(False)
+        self._inspectorTimer.setInterval(_INSPECTOR_POLL_MS)
+        self._inspectorTimer.timeout.connect(self.PollTick)
+        self._RefreshInspectorStatus()
+
+    def DisplayedTime(self):
+        """The frame usdview is showing, handed to the model to READ.
+
+        This is the only way the viewer's clock reaches an inspection, and it
+        goes one way: the panel has no path that sets the playhead, so
+        inspecting frame 2.5 while the artist sits at 12 asks for 2.5 and
+        leaves 12 where it was. Nothing here authors a stage opinion either:
+        the demand runs on the subscription service.
+        """
+        try:
+            return self._api.dataModel.currentFrame
+        except Exception:
+            return None
+
+    def _InspectorReason(self):
+        if outputInspectorModel is not None:
+            return ""
+        return _inspectorImportError or "the inspector model is not importable"
+
+    def _AttachInspector(self, rig):
+        """Inspect the rig this panel just compiled."""
+        if self._inspector is None:
+            return
+        # Attach closes the previous service first: its lanes join, and its
+        # handles belong to a compile epoch the recompile has already raised.
+        self._inspector.Attach(rig)
+        self._RepopulateOutputs(self._inspector.Bindings())
+        self._PollInspector()
+
+    def _CloseInspector(self):
+        """End every demand this panel holds: no subscription, no worker and
+        no pinned payload outlives the panel or its stage."""
+        if self._inspector is None:
+            return
+        self._inspector.Close()
+        try:
+            self._inspectorTimer.stop()
+        except Exception:
+            pass
+        self._RepopulateOutputs([])
+        self._RepaintInspector()
+        self._RefreshInspectorStatus()
+
+    def _RepopulateOutputs(self, bindings):
+        """Refill the output chooser, keeping the same handle when it lives."""
+        keep = self._outputBox.currentData()
+        self._outputBox.blockSignals(True)
+        self._outputBox.clear()
+        for binding in bindings:
+            self._outputBox.addItem(_OutputLabel(binding),
+                                    binding.semantic_key)
+        if keep is not None:
+            index = self._outputBox.findData(keep)
+            if index >= 0:
+                self._outputBox.setCurrentIndex(index)
+        self._outputBox.blockSignals(False)
+
+    def _CurrentBinding(self):
+        if self._inspector is None:
+            return None
+        key = self._outputBox.currentData()
+        if not key:
+            return None
+        return self._inspector.Binding(key)
+
+    def _OnOutputChanged(self):
+        """The chooser narrowed the request to one exported handle."""
+        binding = self._CurrentBinding()
+        if self._inspector is None or binding is None:
+            return
+        self._inspector.Select([binding])
+        self._PollInspector()
+
+    def _InspectAllOutputs(self):
+        if self._inspector is None:
+            return
+        self._inspector.Select(self._inspector.Bindings())
+        self._PollInspector()
+
+    def _InspectPath(self, path):
+        """Inspect what the prim at `path` writes, and list only those
+        handles in the chooser."""
+        if self._inspector is None:
+            return
+        matches = self._inspector.HandlesFor(path)
+        self._RepopulateOutputs(matches)
+        self._inspector.Select(matches)
+        self._PollInspector()
+        if not matches:
+            self._inspectorStatus.setText(
+                "%s writes no exported output of this rig." % path)
+
+    def _InspectShownFrame(self):
+        """Inspect at the frame the viewer shows -- read, never moved."""
+        if self._inspector is None:
+            return
+        self._inspector.DemandDisplayedFrame()
+        self._SyncFrameEdit()
+        self._PollInspector()
+
+    def _ApplyFrameEdit(self):
+        """Inspect at the typed absolute frame; blank is the default frame."""
+        if self._inspector is None:
+            return
+        text = self._frameEdit.text().strip()
+        frame = None
+        if text:
+            try:
+                frame = float(text)
+            except ValueError:
+                self._RefreshInspectorStatus(
+                    "%s is not a frame: blank is the default frame, or one "
+                    "number such as -3 or 2.5." % text)
+                return
+        try:
+            self._inspector.DemandFrame(frame)
+        except ValueError as error:
+            self._RefreshInspectorStatus(str(error))
+            return
+        self._SyncFrameEdit()
+        self._PollInspector()
+
+    def _SyncFrameEdit(self):
+        frame = self._inspector.Frame()
+        text = "" if frame is None else repr(frame)
+        if self._frameEdit.text().strip() != text:
+            self._frameEdit.setText(text)
+
+    def PollTick(self):
+        """One tick of the host's clock: read back what the service published
+        and repaint only on news.
+
+        The panel's own timer drives this while it is open; a host with a
+        recurring tick can call it directly. A hidden panel skips the read
+        and repaints when it is shown again.
+        """
+        if not self.isVisible():
+            return False
+        return self._PollInspector()
+
+    def _PollInspector(self):
+        if self._inspector is None:
+            return False
+        changed = self._inspector.Poll()
+        if changed:
+            self._RepaintInspector()
+        self._RefreshInspectorStatus()
+        if (self._inspector.attached and self._inspector.HasWork()
+                and self.isVisible()):
+            self._inspectorTimer.start()
+        else:
+            self._inspectorTimer.stop()
+        return changed
+
+    def _RepaintInspector(self):
+        self._inspectorTree.clear()
+        if self._inspector is None:
+            return
+        mono = QtGui.QFont("Consolas")
+        mono.setStyleHint(QtGui.QFont.Monospace)
+        for row in self._inspector.Rows():
+            item = QtWidgets.QTreeWidgetItem(
+                [_tail(row.target, 3), row.kind, _PhaseLabel(row.phase),
+                 row.frameText, row.label, row.GenerationText(),
+                 row.ValueText()])
+            for column in range(7):
+                item.setFont(column, mono)
+            item.setForeground(4, QtGui.QColor(row.color))
+            self._inspectorTree.addTopLevelItem(item)
+        self._inspectorTree.resizeColumnToContents(0)
+        self._inspectorTree.resizeColumnToContents(6)
+
+    def _RefreshInspectorStatus(self, override=""):
+        if self._inspector is None:
+            self._inspectorStatus.setText(
+                "No output inspector: %s." % self._InspectorReason())
+            return
+        if override:
+            self._inspectorStatus.setText(override)
+            return
+        self._inspectorStatus.setText(self._inspector.StatusText())
 
     # -- data ------------------------------------------------------------
 
@@ -130,6 +432,7 @@ class ExecStackPanel(QtWidgets.QDialog):
         if stage is None:
             self._status.setText("No stage open.")
             self._tree.clear()
+            self._CloseInspector()
             return
 
         roots = self._RigRoots(stage)
@@ -147,6 +450,7 @@ class ExecStackPanel(QtWidgets.QDialog):
                 "No RigExecRoot on this stage, so there is no execution "
                 "stack to show.")
             self._tree.clear()
+            self._CloseInspector()
             return
 
         root = self._rootBox.currentText() or roots[0]
@@ -170,7 +474,9 @@ class ExecStackPanel(QtWidgets.QDialog):
             import rigexec
         except ImportError:
             self._compileError = "The rigexec Python module is not importable."
+            self._rig = None
             self._Repopulate()
+            self._CloseInspector()
             return
         try:
             rig = rigexec.Rig(stage, root)
@@ -183,10 +489,19 @@ class ExecStackPanel(QtWidgets.QDialog):
                 "Skipped %s: %s" % (path, reason)
                 for path, reason in sorted(rig.skipped_operations().items())]
             self._compileError = None
+            self._rig = rig
         except Exception as exc:  # compile errors are expected while rigging
             self._movers = []
+            self._rig = None
             self._compileError = str(exc).strip() or type(exc).__name__
         self._Repopulate()
+        # The exported outputs come off that same compile: a rig that failed
+        # has nothing to inspect, and the demand made from its previous
+        # program ends here rather than going stale on a poll.
+        if self._rig is not None:
+            self._AttachInspector(self._rig)
+        else:
+            self._CloseInspector()
 
     # -- view ------------------------------------------------------------
 
@@ -259,7 +574,8 @@ class ExecStackPanel(QtWidgets.QDialog):
         return "  ".join(bits)
 
     def _OnSelect(self):
-        """Selecting a row selects the prim, so the usual panels follow."""
+        """Selecting a row selects the prim, so the usual panels follow, and
+        names the exported outputs to inspect."""
         items = self._tree.selectedItems()
         if not items:
             return
@@ -274,6 +590,48 @@ class ExecStackPanel(QtWidgets.QDialog):
             self._api.dataModel.selection.setPrim(prim)
         except Exception:
             pass
+        self._InspectPath(str(prim.GetPath()))
+
+    # -- lifecycle -------------------------------------------------------
+
+    def _OnStageReplaced(self):
+        """The stage changed under the panel: the rig it compiled is gone,
+        so every demand made from it ends before the new stage is read."""
+        self._CloseInspector()
+        self.Rebuild()
+
+    def _OnPrimSelection(self, added=None, removed=None):
+        """A prim picked in the viewport names the outputs to inspect."""
+        if not self.isVisible():
+            return
+        for prim in (added or ()):
+            try:
+                path = str(prim.GetPath())
+            except Exception:
+                continue
+            if path:
+                self._InspectPath(path)
+                return
+
+    def showEvent(self, event):
+        # A hidden panel skipped its ticks: catch up on what the service
+        # published and re-arm the tick if a demand is still owed.
+        super(ExecStackPanel, self).showEvent(event)
+        self._PollInspector()
+
+    def hideEvent(self, event):
+        super(ExecStackPanel, self).hideEvent(event)
+        try:
+            self._inspectorTimer.stop()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        """Panel teardown closes the subscriptions it holds: no demand, no
+        pool and no pinned payload outlives the panel."""
+        self._CloseInspector()
+        self._rig = None
+        super(ExecStackPanel, self).closeEvent(event)
 
 
 def OpenExecStackPanel(usdviewApi):
