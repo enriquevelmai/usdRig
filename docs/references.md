@@ -35,6 +35,20 @@ affiliation, endorsement, or ownership of the underlying techniques.
 | Forward and backward reaching IK | Aristidou and Lasenby, *FABRIK: A fast, iterative solver for the Inverse Kinematics problem*, Graphical Models 73(5):243–260 (2011), [DOI](https://doi.org/10.1016/j.gmod.2011.05.003) | `libs/rigExecMath/singleChainIk.cpp` (RigExecSingleChainIkConstraint) |
 | Linear blend skinning | Magnenat-Thalmann, Laperrière, and Thalmann, *Joint-Dependent Local Deformations for Hand Animation and Object Grasping*, Graphics Interface (1988), [DOI](https://doi.org/10.20380/GI1988.04); Lewis, Cordner, and Fong, *Pose Space Deformation: A Unified Approach to Shape Interpolation and Skeleton-Driven Deformation*, SIGGRAPH (2000), [DOI](https://doi.org/10.1145/344779.344862) | `libs/rigExec/moverGraph.cpp` (`RigExecApplySkinKernel`, RigExecSkinMover `classicLinear`) |
 | Cyclic coordinate descent | Wang and Chen, *A Combined Optimization Method for Solving the Inverse Kinematics Problems of Mechanical Manipulators*, IEEE Transactions on Robotics and Automation 7(4):489–499 (1991), [DOI](https://doi.org/10.1109/70.86079). The rules beyond the per-joint descent have no public source; see [2D skeleton rules without a public source](#2d-skeleton-rules-without-a-public-source) | `libs/rigExecMath/skeleton2dKernel.h` (RigExecSkeleton2d lock and target solves) |
+| Exact-frame output requests (background) | Gong et al. (2014), *Premo: A Natural-Interaction Animation Platform*, ACM SIGGRAPH Talks, [DOI](https://doi.org/10.1145/2614106.2614123); Bryson and Papp (2018), *LibEE 2 – Enabling Fast Edits and Evaluation*, DigiPro, [DOI](https://doi.org/10.1145/3233085.3233089). Background for the capability, in the sense of [requested output inspection at exact frames](specs/output-subscriptions.md). The implementation is RigExec's own: neither source is cited as its implementation reference, and neither is evidence of a measured result | `libs/rigExecGraph/outputDemand.h`, `libs/rigExec/outputCatalog.cpp`, `libs/rigExec/outputSubscription.cpp`, `libs/rigExec/backgroundScheduler.cpp`, `libs/rigExecRuntime/exports.cpp` |
+
+## Exact-frame output requests: what the background covers
+
+The two sources above are background reading for the capability, not sources
+for its implementation. Premo describes an animation platform in which
+animation stays live against a rig the animator keeps editing; LibEE 2
+describes inspecting arbitrary intermediate outputs of an evaluation while
+edits are cheap to make. RigExec's contract is its own, and it is written out
+in [output subscriptions](specs/output-subscriptions.md) and
+[frames on demand](specs/frames-on-demand.md): exact USD time codes as
+identity, one shared operation graph for native, frozen and runtime
+execution, and explicit refusals. No number, benchmark or comparison in this
+repository is taken from either paper.
 
 ## 2D skeleton rules without a public source
 

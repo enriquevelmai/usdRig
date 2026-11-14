@@ -38,6 +38,34 @@ a later or held generation cannot reuse stale cyclic results. Unsupported
 source declarations or failed compilation produce an invalid pose with a
 reason, rather than selecting a second evaluator.
 
+## Requested execution
+
+A host may ask for some of a rig's outputs instead of the whole rig. The same
+loop answers the request, restricted to a closure: the operations a demand
+index closed over the requested outputs under graph predecessors and the
+declared validity, effect and history edges
+(`rigExecGraph/outputDemand.h`). `RigExecBakedProgram::RunRequested` runs that
+closure on the live program, `RigExecEvaluateFrozenRequested` runs it on a
+detached lane's clone, and `RigExecRuntimeReader::ExecuteRequested` runs it on
+a `.rigexec` reader's store. Each uses the same prologue, executor, schedule,
+kernels and skip effects as a whole frame, and `RigExecOpCallbacks::active` is
+the only restriction mechanism: an operation the closure omits is never a
+seed, a candidate or a skip effect, so its body does not run and its dirty
+state and retained values stand for whichever run asks for it next.
+
+A requested run publishes nothing: a partial run is not a full pose, and the
+frame cache's full-pose store stays complete-only. Its answers travel as
+payload packets built by an extractor that reads the run's own materialization
+facts after the join (`RigExecRequestedRunReport`,
+`RigExecValueMaterialization`), never by a second walk beside the loop. What a
+restricted run left out is kept as debt, so the next run seeds the operations
+whose values its arena never published and offers the rest as candidates; a
+sequence of restricted runs lands on the whole run's answer. Selector
+endpoints never prune a branch on their own, and an output the rig cannot name
+or produce is reported rather than computed another way. Native, frozen and
+runtime evaluation share the closure rules, the payload layouts and the
+refusals; see [output subscriptions](../specs/output-subscriptions.md).
+
 ## Optional independent judges
 
 `Rig.cpu_reference` enables the independent scalar point reference. Its original

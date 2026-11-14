@@ -90,3 +90,43 @@ file's value, and a skin layout to the one `Open` expanded unless the layout
 standing equals it by value, which stays, as the evaluator's layout op keeps
 it. The input sampler samples the animated array inputs the file reads at
 the evaluation time.
+
+## Requested outputs
+
+Format 32 adds the file's `export_catalog`: the outputs the compiled program
+exports explicitly, each one a semantic address (target, public computation
+and read phase), the payload layout it answers with, and the retained storage
+behind it — a property chain's version, a provider slot's base or final
+matrix, a frame record, or one point version of a chain. `Open` validates that
+table (distinct addresses in ascending order, payload/kind/storage agreement,
+object and version bounds, and a producer value whose domain matches the
+storage the entry names) and binds each entry to this reader's own retained
+storage. The types and rules these calls speak are declared once, in
+`rigExecGraph/outputDemand.h`; see
+[output subscriptions](../../docs/specs/output-subscriptions.md).
+
+| Call | What it answers |
+| --- | --- |
+| `GetOutputCount` / `GetOutputAt` | The file's own list, as it wrote it, each entry with its status and the file's reason when it cannot be produced. |
+| `FindOutput(semanticKey, index)` | This reader's index of an address a host learned from another program, so it can mint the handle this reader answers. |
+| `GetOutputRigIdentity` / `GetOutputCompileEpoch` | The identity and epoch this reader's handles carry. `Open` mints the epoch from a process counter: a file never carries the live identity its exporter held, so a handle from another evaluator, or from another reader of the same file, resolves `Invalidated`. |
+| `ResolveOutput(handle, reason)` | What an address means to this reader before anything runs: `Pending` for an output it can answer, `Unsupported` for an address it does not export or cannot produce, `Invalidated` for another rig instance or compile epoch. |
+| `ExecuteRequested(requested, at, captured, packets, counts, error)` | Run exactly the union of the named closures over this reader's store, publish nothing, and answer each handle from the storage that run left. `RigExecRuntimeRequestedCounts` reports the operations the closure named, how many ran, and how many clusters the scheduler closed. One packet per handle, in request order, even when the call returns false because the request named no output or the run did not complete. |
+
+- **The inputs say the frame.** The runtime does not track time: set the
+  inputs for the frame being asked about first, as playback does.
+- **A GPU-only point chain stays `Unsupported`.** The file recorded the reason,
+  and the runtime reports it rather than producing those points on the CPU.
+- **An older bake names nothing.** A file older than format 32, or a program
+  assembled in memory, exposes no outputs and refuses a request with a reason
+  instead of resolving an address it never recorded.
+- **A restricted run trusts nothing the store never produced.** Inside its
+  closure, an operation whose writes were never published is seeded whatever
+  its inputs say, and if the run before it was restricted too, the closure is
+  recomputed rather than read from what that partial run left behind. What the
+  closure omits keeps its debt for the next run, and a whole `Execute` clears
+  that restricted state.
+- **A stale handle is reported, not answered.** A handle naming a revision it
+  no longer stands at, or a capture naming another program, answers
+  `Invalidated` with why; a handle this file does not name at all answers
+  `Unsupported` and never enters the closure.

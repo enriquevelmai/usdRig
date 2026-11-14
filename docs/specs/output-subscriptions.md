@@ -13,6 +13,10 @@ byte lease. Nothing here reads a stage. See
 [evaluated versus baked rigs](../concepts/baked-vs-dynamic.md) for the one
 loop these requests are answered by, and
 [frames on demand](frames-on-demand.md) for the imaging reader that uses it.
+The capability has public background in *Premo: A Natural-Interaction
+Animation Platform* and *LibEE 2 – Enabling Fast Edits and Evaluation*; see
+[method references](../references.md). Those sources are background only:
+nothing here claims their implementation or measures against them.
 
 ## The types
 
@@ -73,11 +77,14 @@ loop these requests are answered by, and
   never infers a status from an empty payload: `Ready` means the payload
   matches the handle at the requested time, `Invalidated` means a captured
   input or generation moved, `Unsupported` means the rig cannot name or produce
-  that output, and `Failed` means the owner's dispatch or callback failed. The
-  service answers a request from a packet only when program, input, preview
-  and history revision all match the generation the request belongs to; no
-  field is optional, and `RigExecOutputPacket::Answers` checks the handle, the
-  time, the generation key and the payload layout together.
+  that output, and `Failed` means the owner's dispatch or callback failed.
+  `RigExecOutputStatusText` spells each one for a host's message. The service
+  answers a request from a packet only when program, input, preview and
+  history revision all match the generation the request belongs to; no field
+  is optional, and `RigExecOutputPacket::Answers` checks the handle, the time,
+  the generation key and the payload layout together. A partial key — the
+  program alone, or the history revision alone — never identifies a
+  generation.
 - **The payload layout is declared once, here.** `Scalar` is one double,
   `Matrix4x4Row` is 16 doubles in row-major order with USD row-vector
   semantics (a point transforms as `p' = p * M`), and `Point3` is three
@@ -109,12 +116,15 @@ loop these requests are answered by, and
 
 `RigExecOutputDemandIndex::ResolveRequest` turns a request into the index
 slots it names, refusing a handle the index does not know instead of dropping
-it; `Union` and `ActiveMask` then give the operations one dispatch runs for
-those slots. `DemandedBy` answers the reverse question, which outputs need a
-canonical operation — the lookup invalidation and cache publication use to
-decide what to re-evaluate. The mask feeds `RigExecOpCallbacks::active`
-directly: operations it marks 0 are never candidates, and history ticks run
-only the operations a windowed operation depends on.
+it, so a partial demand never produces a partial mask; `Union` and
+`ActiveMask` then give the operations one dispatch runs for those slots.
+`DemandedBy` answers the reverse question, which outputs need a canonical
+operation — the lookup invalidation and cache publication use to decide what
+to re-evaluate. `ProducerStatus` reports an output with no canonical producer
+as `Unsupported` before any dispatch. The mask feeds
+`RigExecOpCallbacks::active` directly: operations it marks 0 are never
+candidates, and history ticks run only the operations a windowed operation
+depends on.
 
 ## Running what was asked for
 
@@ -131,6 +141,7 @@ is no second evaluator, no fallback walk and no operation named by text.
 | `RunRequested(time, closure, report, error)` | Run the frame over `closure` only. Nothing is published: a partial run is not a full pose. |
 | `RigExecRequestedRunReport` | Which operations ran, how many clusters they closed, and the per-value facts below. |
 | `RigExecValueMaterialization` | Per canonical value the closure writes: `produced` (this run's body wrote it), `reused` (clean retained storage stood), `wasAbsent` (the arena held no published value when the run began), and its `revision` after the run. |
+| `ExtractRequestedOutputs(catalog, report, time, captured, outputs, packets, error)` | Read the requested outputs out of the storage the run described by `report` left, after the join, each in the layout its handle declares. Nothing runs: a point payload gathers the chunks the run computed. |
 
 - **The closure is checked, not assumed.** The operations must belong to this
   program's canonical graph, and `RigExecClosureIsClosed` must accept the
@@ -166,6 +177,17 @@ is no second evaluator, no fallback walk and no operation named by text.
   produced it, whether clean retained storage stands for it, and whether it
   was missing when the run began. An extractor reads a value only when the
   closure names its producer and the facts say it materialized.
+- **An output that did not materialize is reported, not invented.** A value
+  the closure did not name answers `Pending` rather than being read out of
+  storage that may hold another generation's bytes. A producer that ran and
+  declined — a property chain with no authored base, a frame record the walk
+  refused to write, a chain that read no base at this frame — answers `Failed`
+  with a reason, never a `Ready` payload of zeros. An output the catalog does
+  not export, or whose rig instance or compile epoch is not this program's,
+  carries the status `RigExecOutputCatalog::Resolve` gave it. The packets
+  carry the caller's captured generation beside the compile epoch that
+  produced the value, so a stale generation is reported and never labeled
+  current.
 
 ## Running it on a lane
 
@@ -182,7 +204,7 @@ whole-frame job, and nothing published: a partial run is not a full pose.
 
 | Declaration | Says |
 | --- | --- |
-| `RigExecMakeFrozenRequestedRun(catalog, demand, captured, out, error)` | Owner thread: resolve one exact frame's demand into the job a lane runs — the union of the named handles' closures, the handles, and the captured generation. False, having dispatched nothing, when the catalog does not know a handle or an output has no producer: the caller recaptures. |
+| `RigExecMakeFrozenRequestedRun(catalog, demand, captured, out, error)` | Owner thread: resolve one exact frame's demand into the job a lane runs — the union of the named handles' closures, the handles, the captured generation, and the catalog of the epoch that minted them. False, having dispatched nothing, when the catalog does not know a handle, an output has no producer, or the handles belong to another rig or epoch: the caller recaptures rather than dispatching a partial mask. |
 | `RigExecFrozenRequestedRun` | That job: closure, output handles, captured generation, and the catalog of the epoch that minted the handles. Inputs and history ride the same `RigExecFrameInputs` a warming job carries. |
 | `RigExecEvaluateFrozenRequested(context, inputs, requested, runner, scheduler, rig, trace)` | Run the job over `requested`'s closure under the entry point's checks and both generation fences, and answer its outputs. `RigExecFrozenRequestedResult` says which outputs answered, and `error` says why a run declined or was dropped. |
 | `RigExecMakeProductionRequestedStepRunner()` | The serial runner behind that entry: the lane's clone, the job's inputs, the masked executor, the extraction, no publication. |
@@ -205,29 +227,46 @@ whole-frame job, and nothing published: a partial run is not a full pose.
 
 `RigExecDiscoverOutputs` (`libs/rigExec/outputCatalog.h`) builds the catalog of
 outputs one compiled program epoch can name, straight from the baked program's
-binding tables. Each entry is a semantic address — target, public computation
-and phase, spelled as a `RigExecValueAddress` — bound to the graph value its
-canonical producer writes, plus the retained storage an extractor reads after
-the graph joins.
+binding tables. Each entry is a `RigExecOutputBinding`: a semantic address —
+target, public computation and phase, spelled as a `RigExecValueAddress` — its
+durable `RigExecOutputSemanticKey`, the handle that names it, a kind
+(`Scalar`, `Transform`, `Points`), the retained storage an extractor reads,
+the graph value its canonical producer writes, the object and version that
+storage is indexed by, and a status with a reason when the entry cannot be
+produced. Discovery runs on the compile owner thread, reads compiled tables
+only, and sorts the bindings by semantic key.
 
-- **Only retained storage is exported.** Property results, provider base and
-  final matrices, frame records, chain bases, published chain points and a
-  revision fuse's publication record have an enumerator; scratch packets,
-  candidates, chunk and staging slots do not, and discovery refuses an entry
-  that binds one.
+- **Only retained storage is exported.** `RigExecOutputStorage` names four
+  kinds: `PropertyValue` (a property chain's per-revision and final results),
+  `ProviderMatrix` (a provider's base and final matrices), `FrameMatrix` (a
+  frame record), and `PointVersion` (one point version of a chain, its base
+  included). The producer value behind an entry must sit in a retained graph
+  domain: a property result, a base or final matrix, a frame matrix, a chain
+  base, chain points, or a revision fuse's publication record. Scratch
+  packets, candidates, chunk and staging slots have no enumerator and no
+  retained domain, and discovery fails on an entry that names one.
 - **The payload layout is checked before the entry is indexed.** `double` goes
   with a scalar, `matrix4d` with a transform, `point3d[]` with a point array; an
-  entry whose kind and layout disagree fails discovery.
-- **GPU-only point chains are exported as `Unsupported` with a reason.** There
-  is no CPU fallback for them, and no evaluator answers them specially.
-- **A missing output is refused, not guessed.** An address with no retained
-  producer resolves `Unsupported`; a handle naming another rig identity or an
-  older compile epoch resolves `Invalidated`. `Resolve` reports both before any
+  entry whose kind and layout disagree, or whose type names no layout at all,
+  fails discovery.
+- **GPU-only point chains are exported as `Unsupported` with a reason.** The
+  binding carries "GPU-only points export has no CPU payload" and no producer
+  value. There is no CPU fallback for them, and no evaluator answers them
+  specially; a `.rigexec` records the same refusal so the runtime reports the
+  file's reason instead of computing them another way.
+- **A missing output is refused, not guessed.** An address the catalog does not
+  export, or one whose producer the compiled graph does not retain, resolves
+  `Unsupported` with the reason; a handle naming another rig instance or any
+  other compile epoch resolves `Invalidated`. `Resolve` reports both before any
   dispatch, so no host reads a stage to fill in what the rig does not export.
 
 Scene lowering maps an authored value to one of those spellings in
 `RigExecResolveOutputDescriptor` (`libs/rigExecScene/outputDescriptors.h`),
-which reads stage identity and type metadata only and authors nothing.
+which reads stage identity and type metadata only and authors nothing. It
+resolves an authored property or public prim computation without assuming a
+scope, parent name, sibling layout or nesting depth; its supported public
+exports are scalar properties, matrix transforms and point arrays, and its
+type is the payload spelling, not the authored USD type name.
 
 ## Reading it from a `.rigexec`
 
@@ -272,7 +311,7 @@ it calls; the pool itself does not change, and no second queue appears.
 | `RigExecExplicitWork` | The job body: serial, from values captured at admission, no live stage, evaluator or registry access, reporting a `RigExecExplicitOutcome` the way warm work reports its disposition. |
 | `IsExplicitRequestCurrent`, `CurrentExplicitFenceToken` | The scheduler's half of the publish fence: the rig's edit generation and the time's fence token. The default frame has a token of its own, re-issued by `CancelGenerationTimes`, because a scoped edit moves its inputs too. |
 | `ExplicitInFlightCount`, `ReservedExplicitBytes`, `ReservedExplicitBytesFor`, `QueuedExplicitKeys`, `InFlightExplicitKeys` | What a rig has in flight, in jobs and in reserved bytes, and the exact keys behind them. |
-| `SetExplicitPerRigJobCap`, `SetExplicitByteCap` | The two bounds, independent of the warm job cap: how many requests one rig may hold, and how many bytes the pool may hold reserved across every rig. |
+| `SetExplicitPerRigJobCap`, `SetExplicitByteCap` | The two bounds, independent of the warm job cap: how many requests one rig may hold (default 64, against warming's 96), and how many bytes the pool may hold reserved across every rig (default 64 MiB). |
 
 - **Explicit demand is not warming.** `RIGEXEC_FRAME_CACHE=off`, `warm-off`,
   and `RIGEXEC_ENABLE_PARALLEL_EVAL=0` close speculative warming; they do not
@@ -288,9 +327,9 @@ it calls; the pool itself does not change, and no second queue appears.
 - **Fairness and bounds.** Warm rank is the priority (neighbors before
   sweep); explicit rank is the job's ordinal within its rig, so two rigs take
   turns instead of one rig's burst running first. Every queued job carries its
-  reservation, and every terminal path releases it -- published, declined
+  reservation, and every terminal path releases it — published, declined
   inside, threw, dropped stale, purged by `CancelGeneration`,
-  `CancelGenerationTimes` or `ResetRig`, or dropped at shutdown -- so
+  `CancelGenerationTimes` or `ResetRig`, or dropped at shutdown — so
   `ReservedExplicitBytes` is zero once the queue has drained. Byte counts come
   from `RigExecPayloadByteCount`, which refuses an overflowing element count
   before anything allocates.
@@ -310,7 +349,7 @@ lanes.
 
 | Declaration | Says |
 | --- | --- |
-| `Subscribe(rig, request, receipt)` | Validate the request against the rig's current catalog, then demand its frames. The receipt carries the refusal reason and the outputs the catalog can name but cannot produce. |
+| `Subscribe(rig, request, receipt)` | Validate the request against the rig's current catalog, then demand its frames. A handle naming another rig instance or compile epoch refuses the whole subscription rather than resolving to one of them. The receipt carries the refusal reason and the outputs the catalog can name but cannot produce. |
 | `RigExecSubscriptionHandle` | A live subscription: movable, not copyable. Destroying it closes the subscription, so a host cannot leak one by losing the handle. |
 | `UpdateSubscription(subscription, request)` | Replaces a subscription's request. The new request is validated before the old demand becomes unreferenced. |
 | `PollResults(subscription)` | What stands for each demanded (output, frame) pair, in request order: a packet copied from a coverage record, or the status that stopped it and the reason. Polling evaluates and dispatches nothing. |
@@ -318,8 +357,24 @@ lanes.
 | `SetCompletionCallback` | Installs the owner-thread completion callback (null uninstalls). |
 | `Close`, `CloseAll` | Ends one subscription, or every client, with the same release for each demand that no other client holds. |
 | `RigExecSubscriptionHost` | What the service needs from the host: the pool, the cache, a catalog hook, a capture hook, and the lane's step runner. |
-| `RigExecSubscriptionCapture` | One exact frame's captured job: the sampled vector, the frozen owners, the captured generation, and the byte estimate admission is bounded by. |
-| `RigExecEstimateCaptureBytes` | A coarse container-size estimate for one sampled vector, which is what the capture charges the coverage budget. |
+| `RigExecSubscriptionCapture` | One exact frame's captured job: the sampled vector, the frozen owners, the captured generation, the upstream revision half of the coverage key, and the byte estimate admission is bounded by. `BindContext` points its raw owners at the addresses the capture stays at, so a worker cannot read a moved pointer. |
+| `RigExecEstimateCaptureBytes` | The sampled vector's own container and element sizes — not what a `VtValue` points at — which is what a capture charges the coverage budget. A host whose samples carry large buffers adds its own measure beside it. |
+| `Stats` | `subscriptions`, `framesDemanded`, `demandsInFlight`, `coverageHits`, `dispatches`, `redispatches`, `declinedCoverageBudget`, `declinedAdmission`, `captureFailures`, `retiredInFlight`, `pinnedBytes`, `pinnedPayloads`, `callbacksQueued`. The two declines name which bound refused. |
+
+A refusal never moves demand, a reservation or a lease, and the receipt's
+`RigExecSubscriptionStatus` says why. An accepted receipt also carries the
+subscription id and the exact frames the request demands:
+
+| `RigExecSubscriptionStatus` | Says |
+| --- | --- |
+| `Accepted` | The request stands and its demand is reconciled toward dispatch. |
+| `InvalidRequest` | No demand, no handle, or handles naming more than one rig identity or compile epoch. |
+| `UnknownRig` | The host's catalog hook named no catalog for the rig. |
+| `StaleEpoch` | A handle names another rig instance or another compile epoch; re-subscribe with handles from the current catalog. |
+| `UnknownOutput` | A handle's semantic address is not one this catalog names. |
+| `NothingProducible` | Every named output is one the catalog cannot produce, so no dispatch could answer any of them. |
+| `UnknownSubscription` | The id names no live client. |
+| `Stopping` | The service is closing and accepts no new demand. |
 
 - **The owner thread owns the lifecycle.** `Subscribe`, `UpdateSubscription`,
   `PollResults`, `PumpCallbacks` and `Close` run there, and the capture hook is
@@ -343,13 +398,66 @@ lanes.
   fence token. A scoped edit retires only the times it names.
 - **Answers are pinned, not copied.** A poll that answers from a record pins
   that payload for as long as the subscription lives; the pin is shared between
-  clients that ask for the same output, and closing releases it. Byte bounds
-  refuse before allocation: the cache's coverage budget and the pool's job and
-  byte caps each decline in their own counter, and a refused admission returns
-  its reservation.
+  clients that ask for the same output, and closing releases it.
 - **Callbacks are queued, never run on a worker.** A completion lands at the
   owner's `PumpCallbacks`, and an event for a client that closed first is
   dropped.
+
+### What each status means where it comes from
+
+A poll answers each (output, frame) pair from the coverage records that
+frame's group remembers, newest captured first — at most eight generations are
+probed, and an older record stays in the cache until the cache retires it,
+simply unprobed. Each answer says which part of the machinery refused it:
+
+| Status | Where it comes from |
+| --- | --- |
+| `Ready` | A coverage record answers the handle at the frame's exact time and generation, and its payload matches the handle's declared layout. |
+| `Pending` | Nothing has answered yet: the demand is not reconciled, or the coverage budget or the pool declined the frame and the next pump retries it. |
+| `Invalidated` | The capture names another program epoch, the pool retired the frame while its job ran, or the record's value revision is not the one a non-zero request handle named. |
+| `Unsupported` | The catalog cannot produce the output, or a capture's demand could not be resolved into a job. |
+| `Failed` | The capture hook refused the frame, the run declined, the coverage budget refused the payloads at publish, the cache declined the record, or the run answered fewer outputs than the frame demanded. |
+
+A completion event carries the frame's disposition — `Ready` when the record
+answers every demanded output of that frame, otherwise the status that
+stopped it.
+
+### Retained bytes and backpressure
+
+An answer is a **coverage record** in the frame cache
+(`libs/rigExec/frameCache.h`), keyed by rig identity, compile epoch, the exact
+time, the whole captured generation and the capture's upstream revision. Time
+is key material here, unlike the full-pose store: a moved epoch, a shifted
+frame, or a moved input, preview, upstream or history revision is a different
+record that misses rather than serving a plausible partial. A record names
+exactly the handles it answers, is never a pose, and a full-pose lookup never
+reads one. Whether the workspace behind its payloads still stands is a
+separate fact (`CoverageArenaRetained`): payload reuse outlives the arena that
+produced it, so a coverage hit never implies the ancestors exist.
+
+- **Four byte domains, one budget.** `RigExecCoverageBytes` accounts `Capture`
+  (what the run captured), `Workspace` (the arena its payloads came from),
+  `Payload` (the packets) and `Pinned` (payload bytes a live lease holds). A
+  pin moves a payload's bytes out of `Payload` into `Pinned`, so the same
+  bytes are never counted twice.
+- **The bound is at admission, not at eviction.** Coverage shares the cache's
+  per-rig byte cap with the poses and is never read or dropped by the pose
+  store's LRU pass. `TryReserveCoverage` charges the budget before anything
+  allocates; a frame it declines answers `Pending` with a retry reason, counts
+  `declinedCoverageBudget`, and is tried again at the owner's next pump. A
+  capture that states no payload bytes is charged one element per demanded
+  handle as a floor.
+- **The run extends the charge before it publishes.** The lane's actual
+  payload bytes are added to the reservation before `PublishCoverage`, and a
+  payload that would pass the budget fails that frame rather than storing over
+  budget. A subscription job's arena dies with the lane, so its record
+  publishes claiming no retained workspace.
+- **Pins outlive records; records outlive demand.** A record with a standing
+  lease is never dropped, and closing every client releases only the charges
+  those clients held. `RetireCoverageArena` releases a record's workspace
+  charge and marks the arena retired while every payload stays reusable.
+  Publishing under a held key replaces the record and releases the bytes the
+  old one held, except what a live lease still owes.
 
 ## The Python host surface
 
@@ -366,11 +474,11 @@ worker.
 | `discover()` | Every explicitly retained output of the rig's standing compiled program, each with the handle a subscription names back. |
 | `subscribe(outputs, times)` | Demand those outputs at those frames. `None` is the default frame and never frame zero; any other value is one exact finite time code, so zero, negative frames and subframes are real times. A refusal reports `status`, `reason` and the outputs the catalog can name but cannot produce, and moves no demand. |
 | `Subscription.update(outputs, times)` | Replace the request, reported on the returned receipt. A refusal leaves the old request, its demand and its answers standing. |
-| `Subscription.poll()` | One `Packet` per demanded output and frame, in request order: `status`, `reason`, the exact `time` it answers for, and a Ready packet's `value`. Polling evaluates and dispatches nothing. |
-| `OutputValue` | The answer as read-only arrays: `scalar`, `matrix` (row-major, USD row-vector form), `point(i)`. A poll copies the published bytes, so a held answer never aliases a live result and never moves under its holder. |
-| `pump()`, `settle(timeout=5.0)` | The host's own tick: deliver what the pool completed and re-dispatch what a retired generation or a widened demand left owed. `settle` pumps and runs until nothing is in flight. |
-| `Subscription.close()`, `close_all()` | End one subscription or all of them, with the same release for each demand no other client holds. Leaving a subscription's `with` block closes it. |
-| `stats()` | The service's counters: subscriptions, frames demanded, in flight, coverage hits, dispatches, declines and pinned bytes. |
+| `Subscription.poll()` | One `Packet` per demanded output and frame, in request order: `status`, `reason`, the exact `time` it answers for (`None` for the default frame), its `generation`, and a Ready packet's `value`. A packet whose payload disagrees with its handle reports why in `payload_error` and hands back no bytes. Polling evaluates and dispatches nothing. |
+| `OutputValue` | The answer as read-only arrays: `doubles`, `scalar`, `matrix` (row-major, USD row-vector form), `points`, `point(i)`. A poll copies the published bytes, so a held answer never aliases a live result and never moves under its holder. |
+| `pump()`, `settle(timeout=5.0)`, `run_next_queued()` | The host's own tick: deliver what the pool completed and re-dispatch what a retired generation or a widened demand left owed. `settle` pumps and runs until nothing is in flight. `run_next_queued()` is `workers=0`'s manual mode: run the highest-priority queued job on this thread. |
+| `Subscription.close()`, `close_all()` | End one subscription or all of them, with the same release for each demand no other client holds. Leaving a subscription's `with` block closes it, and leaving the service's `with` block closes every client. |
+| `stats()` | The service's lifecycle counters: `subscriptions`, `frames_demanded`, `demands_in_flight`, `coverage_hits`, `dispatches`, `redispatches`, `declined_coverage_budget`, `declined_admission`, `capture_failures`, `retired_in_flight`, `pinned_bytes`, `pinned_payloads`, `callbacks_queued`, `stopping`. |
 
 A service holds its `rigexec.Rig` alive, because the capture hook samples it
 on the owner thread and is the only live-USD read in the lifecycle. Every entry
@@ -379,3 +487,13 @@ touches a frame another client holds. `tests/python/test_rigexec_subscriptions.p
 is the executable version of the time semantics: the default frame kept apart
 from frame zero, negative and subframe codes, two clients on one frame, and an
 answer that outlives its subscription unchanged.
+
+The editor consumer of the same facade is
+`plugin/rigExecUsdview/outputInspectorModel.py`, a Qt-free and pxr-free model
+the exec-stack panel drives. It hands over the frame the viewer is displaying
+and gets back the outputs demanded at that exact frame, so inspecting an
+intermediate at 2.5 while the artist sits at frame 12 demands 2.5 and leaves 12
+on screen: the module has no `SetTime` path, holds no evaluator, reads no stage,
+and has no route to a frame the service did not publish, so the panel, a
+headless host and the tests share one frame semantics and one set of
+dispositions.
