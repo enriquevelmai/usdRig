@@ -270,3 +270,55 @@ it calls; the pool itself does not change, and no second queue appears.
   warm equations as they were and adds the `explicit*` counters beside them;
   the transition hook tags every move with its class and says when the time
   names no frame at all.
+
+## The subscription lifecycle
+
+`libs/rigExec/outputSubscription.h` puts a bounded lifecycle on that admission.
+A host subscribes outputs at exact frames; the service captures one frame's job
+on the owner thread, admits it, stores the answer as a coverage record in the
+frame cache, and hands packets back at `PollResults`. One service per pool and
+cache: the host owns both and keeps them alive until the pool has joined its
+lanes.
+
+| Declaration | Says |
+| --- | --- |
+| `Subscribe(rig, request, receipt)` | Validate the request against the rig's current catalog, then demand its frames. The receipt carries the refusal reason and the outputs the catalog can name but cannot produce. |
+| `RigExecSubscriptionHandle` | A live subscription: movable, not copyable. Destroying it closes the subscription, so a host cannot leak one by losing the handle. |
+| `UpdateSubscription(subscription, request)` | Replaces a subscription's request. The new request is validated before the old demand becomes unreferenced. |
+| `PollResults(subscription)` | What stands for each demanded (output, frame) pair, in request order: a packet copied from a coverage record, or the status that stopped it and the reason. Polling evaluates and dispatches nothing. |
+| `PumpCallbacks()` | Runs what the pool completed since the last pump, delivers the queued events, and re-dispatches the demand a retired generation or a launched-mask expansion left owed. |
+| `SetCompletionCallback` | Installs the owner-thread completion callback (null uninstalls). |
+| `Close`, `CloseAll` | Ends one subscription, or every client, with the same release for each demand that no other client holds. |
+| `RigExecSubscriptionHost` | What the service needs from the host: the pool, the cache, a catalog hook, a capture hook, and the lane's step runner. |
+| `RigExecSubscriptionCapture` | One exact frame's captured job: the sampled vector, the frozen owners, the captured generation, and the byte estimate admission is bounded by. |
+| `RigExecEstimateCaptureBytes` | A coarse container-size estimate for one sampled vector, which is what the capture charges the coverage budget. |
+
+- **The owner thread owns the lifecycle.** `Subscribe`, `UpdateSubscription`,
+  `PollResults`, `PumpCallbacks` and `Close` run there, and the capture hook is
+  the only live-USD read in the path. A capture holds no stage, evaluator,
+  registry or live handle, which is what lets the job be queued. The state lock
+  is never held across the pool, a cache call, a fence or a run.
+- **Demand is shared; work is not.** Live subscriptions group by rig, exact
+  time and compile epoch, and their outputs union into that group's demand.
+  Two clients on one frame get one job, one coverage record, and one lease per
+  payload, and a second subscription for an already-answered frame captures and
+  admits nothing.
+- **A launched mask is fixed at admission.** An expansion noticed while the job
+  runs is owed the next launch, asked for as the union; the dispatched mask is
+  never rewritten.
+- **Unreferenced demand leaves.** The last client to close a frame retires its
+  queued job and returns its byte and coverage reservations. A coverage lease
+  another owner holds is never touched, and the record stays for the next host.
+- **The publish fence runs twice**, before the bodies and again before the
+  publish, so an edit that lands while a job runs publishes nothing: the frame
+  answers `Invalidated`, and the owner's next pump re-captures under the live
+  fence token. A scoped edit retires only the times it names.
+- **Answers are pinned, not copied.** A poll that answers from a record pins
+  that payload for as long as the subscription lives; the pin is shared between
+  clients that ask for the same output, and closing releases it. Byte bounds
+  refuse before allocation: the cache's coverage budget and the pool's job and
+  byte caps each decline in their own counter, and a refused admission returns
+  its reservation.
+- **Callbacks are queued, never run on a worker.** A completion lands at the
+  owner's `PumpCallbacks`, and an event for a client that closed first is
+  dropped.

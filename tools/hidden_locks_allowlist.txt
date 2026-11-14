@@ -193,6 +193,39 @@ libs/rigExec/observerHostExit.cpp | env | const char *inputs = std::getenv("RIGE
 
 libs/rigExec/oracleDispatch.cpp | env | const char *value = std::getenv("RIGEXEC_GOLDEN_SUITE");
 
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | mutable std::mutex _mutex;
+
 libs/rigExec/parallel.cpp | env | return TfGetEnvSetting(RIGEXEC_ENABLE_PARALLEL_EVAL);
 
 libs/rigExec/profiler.h | lock | std::lock_guard<std::mutex> lock(_mutex);

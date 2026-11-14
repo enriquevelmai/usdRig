@@ -226,6 +226,7 @@ add_library(rigExec SHARED
     libs/rigExec/frozenWorker.cpp
     libs/rigExec/backgroundScheduler.cpp
     libs/rigExec/outputAffectedIndex.cpp
+    libs/rigExec/outputSubscription.cpp
     libs/rigExec/taskListCache.cpp
     libs/rigExec/frameCacheSparsity.cpp
 )
@@ -1278,6 +1279,13 @@ add_executable(testRigExecOutputExtraction tests/testRigExecOutputExtraction.cpp
 target_link_libraries(testRigExecOutputExtraction PRIVATE rigExec)
 add_test(NAME testRigExecOutputExtraction COMMAND testRigExecOutputExtraction)
 
+# The subscription lifecycle over the pool and the coverage cache. The jobs run
+# the frozen requested-run entry against a real catalog, so it compiles a
+# stage like any other scene test.
+add_executable(testRigExecOutputSubscription tests/testRigExecOutputSubscription.cpp)
+target_link_libraries(testRigExecOutputSubscription PRIVATE rigExec)
+add_test(NAME testRigExecOutputSubscription COMMAND testRigExecOutputSubscription)
+
 add_executable(testRigExecInputReplayValues tests/testRigExecInputReplayValues.cpp)
 target_link_libraries(testRigExecInputReplayValues PRIVATE rigExec)
 add_test(NAME testRigExecInputReplayValues COMMAND testRigExecInputReplayValues)
@@ -2260,7 +2268,7 @@ function(rigexec_add_serial_test name)
     endif()
 endfunction()
 foreach(_suite testRigExecBackgroundScheduler testRigExecConstraints
-               testRigExecFrameCacheSparsity
+               testRigExecFrameCacheSparsity testRigExecOutputSubscription
                testRigExecInteractive testRigExecPoseInterpolator)
     rigexec_add_serial_test(${_suite})
 endforeach()
@@ -2920,7 +2928,7 @@ foreach(_rigexec_scene_exe IN ITEMS
     testRigExecFrameCacheCones_Verify testRigExecFrameCacheSparsity
     testRigExecFrozenContext testRigExecGeometryOpsBakedParity
     testRigExecGeometryProgram testRigExecGraphBindings testRigExecOutputCatalog
-    testRigExecOutputExtraction
+    testRigExecOutputExtraction testRigExecOutputSubscription
     testRigExecGroupForwarding testRigExecInputActions testRigExecInputReplayHosting
     testRigExecInteractive testRigExecInteropNotices testRigExecLattice testRigExecLeaves
     testRigExecOneLoopAcceptance testRigExecOpTrace
