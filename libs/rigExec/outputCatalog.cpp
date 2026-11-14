@@ -335,16 +335,6 @@ AddPointOutputs(const RigExecBakedProgramImpl &program,
 
 } // namespace
 
-std::string
-RigExecOutputSemanticKey(const std::string &target,
-                         const std::string &publicComputation,
-                         const std::string &phase)
-{
-    return std::to_string(target.size()) + ":" + target +
-           std::to_string(publicComputation.size()) + ":" + publicComputation +
-           std::to_string(phase.size()) + ":" + phase;
-}
-
 RigExecOutputStatus
 RigExecOutputCatalog::Resolve(const RigExecOutputHandle &handle,
                               const RigExecOutputBinding **binding,

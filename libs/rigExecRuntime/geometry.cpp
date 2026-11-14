@@ -5991,6 +5991,91 @@ RrGeoPointsAfter(const RrGeometryScratch::Chain &chain, size_t r,
     *count = version ? version->size() : 0;
 }
 
+} // namespace
+
+// One point version as the last run left it, for an output request. Outside
+// the anonymous namespace: store.h declares it for the export half.
+bool
+RrGeoExtractPoints(const RrProgram *program, const RrExport &output,
+                   RigExecOutputPayload *payload, std::string *reason)
+{
+    const auto fail = [&](const std::string &message) {
+        if (reason)
+            *reason = message;
+        return false;
+    };
+    const auto *scratch =
+        static_cast<const RrGeometryScratch *>(program->geo.get());
+    if (!scratch)
+        return fail("points output " + output.handle.semanticKey +
+                    " has no geometry state");
+    if (output.object >= scratch->chains.size())
+        return fail("points output " + output.handle.semanticKey +
+                    " names a chain the program does not hold");
+    const auto &chain = scratch->chains[output.object];
+    const bool haveBase = output.object < program->store.chainHaveBase.size() &&
+                          program->store.chainHaveBase[output.object] != 0;
+    const uint32_t domain =
+        output.producerValue < program->store.opAdapter.values.size()
+            ? program->store.opAdapter.values[size_t(output.producerValue)]
+                  .domain
+            : uint32_t(-1);
+    const RrVec3f *points = nullptr;
+    size_t count = 0;
+    if (domain == uint32_t(RigExecWireSlotDomain::ChainBase)) {
+        // A chain that read no base has no base to hand back: a skip in an
+        // earlier run never left a value an extraction can mistake for this
+        // request's answer.
+        if (!haveBase)
+            return fail("chain " + output.handle.semanticKey + " has no base");
+        points = chain.lastBase.data();
+        count = chain.lastBase.size();
+    } else if (domain == uint32_t(RigExecWireSlotDomain::ChainPoints)) {
+        if (!haveBase || !chain.haveResult)
+            return fail("chain " + output.handle.semanticKey +
+                        " has no final points");
+        points = chain.result.data();
+        count = chain.result.size();
+    } else if (domain == uint32_t(RigExecWireSlotDomain::RevisionDone)) {
+        if (!haveBase)
+            return fail("chain " + output.handle.semanticKey +
+                        " has no base for revision " +
+                        std::to_string(output.version));
+        // A version cut into groups is gathered from the groups its writers
+        // published -- the chunks the run computed -- and never recomputed.
+        const std::vector<RrVec3f> *version =
+            RrGeoPointsVersion(chain, output.version);
+        points = version ? version->data() : nullptr;
+        count = version ? version->size() : 0;
+        // The gather must have filled the whole chain: a group that never ran
+        // leaves a short buffer, which would read as points that moved.
+        if (count != chain.lastBase.size())
+            return fail("chain " + output.handle.semanticKey + " version " +
+                        std::to_string(output.version) + " holds " +
+                        std::to_string(count) + " points for a base of " +
+                        std::to_string(chain.lastBase.size()));
+    } else {
+        return fail("points output " + output.handle.semanticKey +
+                    " names a slot that holds no point version");
+    }
+    if (!points)
+        return fail("chain " + output.handle.semanticKey + " holds no points");
+    if (count > std::numeric_limits<size_t>::max() / 3)
+        return fail("points output " + output.handle.semanticKey +
+                    " has a point count that overflows its payload");
+    // xyz triplets in the file's point order, widened to the layout's double
+    // cells; the runtime stores a chain's points as float.
+    std::vector<double> cells(count * 3);
+    for (size_t i = 0; i < count; ++i)
+        for (int k = 0; k < 3; ++k)
+            cells[i * 3 + size_t(k)] = double(points[i]._data[k]);
+    return RigExecPackPayload(RigExecPayloadKind::Point3, uint64_t(count),
+                              cells.empty() ? nullptr : cells.data(), payload,
+                              reason);
+}
+
+namespace {
+
 std::string
 RrGeoPhaseName(const RrProgram *program, const RigExecWireReadPhase &phase)
 {

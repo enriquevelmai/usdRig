@@ -730,6 +730,16 @@ RigExecRuntimeReader::Open(const uint8_t *bytes, size_t size,
         return fail(error ? *error
                           : std::string("common graph initialization failed"));
     }
+    // The exports the file names, bound to these tables: an entry that
+    // addresses storage this program does not hold, or spells a semantic key
+    // its tables do not imply, is a refusal here rather than an output no
+    // request can answer.
+    if (!RrBindExportCatalog(&program, error)) {
+        return fail(error ? *error : std::string("export catalog failed"));
+    }
+    if (!RrBuildExportIndex(&program, error)) {
+        return fail(error ? *error : std::string("output demand index failed"));
+    }
     // Unavailable compiled data retains the existing missing-kernel behavior.
     // Module declarations generate this catalog; the engine names no mover.
     size_t moverCount = 0;

@@ -20,72 +20,79 @@ _SortByPath(std::vector<T> *out)
 }
 
 // A membership change's new rows, built before any output changes.
-template<class T>
-struct _StagedRows {
-    bool changed=false;
+template <class T> struct _StagedRows {
+    bool changed = false;
     std::vector<T> rows;
     std::vector<size_t> positions;
 };
 
 // \p describe fills what a row keeps for its key, beyond its path.
-template<class Order,class T,class Enumerate,class Describe>
-void _StageRows(Order *order,const std::vector<T> &rows,const RrProgram &program,
-                Enumerate enumerate,Describe describe,_StagedRows<T> *staged)
+template <class Order, class T, class Enumerate, class Describe>
+void
+_StageRows(Order *order, const std::vector<T> &rows, const RrProgram &program,
+           Enumerate enumerate, Describe describe, _StagedRows<T> *staged)
 {
     order->nextKeys.clear();
-    enumerate([&](uint32_t id,const auto &) {order->nextKeys.push_back(id);});
-    staged->changed=order->keys!=order->nextKeys || rows.size()!=order->nextKeys.size();
-    if(!staged->changed)return;
-    const size_t count=order->nextKeys.size();
+    enumerate(
+        [&](uint32_t id, const auto &) { order->nextKeys.push_back(id); });
+    staged->changed =
+        order->keys != order->nextKeys || rows.size() != order->nextKeys.size();
+    if (!staged->changed)
+        return;
+    const size_t count = order->nextKeys.size();
     staged->rows.resize(count);
     std::vector<size_t> sorted(count);
-    for(size_t i=0;i<count;++i) {
-        sorted[i]=i;
-        staged->rows[i].path=program.TextOrEmpty(order->nextKeys[i]);
+    for (size_t i = 0; i < count; ++i) {
+        sorted[i] = i;
+        staged->rows[i].path = program.TextOrEmpty(order->nextKeys[i]);
     }
-    std::sort(sorted.begin(),sorted.end(),[&](size_t a,size_t b) {
-        return staged->rows[a].path<staged->rows[b].path;
+    std::sort(sorted.begin(), sorted.end(), [&](size_t a, size_t b) {
+        return staged->rows[a].path < staged->rows[b].path;
     });
     _SortByPath(&staged->rows);
     staged->positions.resize(count);
-    for(size_t i=0;i<count;++i)staged->positions[sorted[i]]=i;
-    size_t at=0;
-    enumerate([&](uint32_t,const auto &value) {
-        describe(staged->rows[staged->positions[at++]],value);
+    for (size_t i = 0; i < count; ++i)
+        staged->positions[sorted[i]] = i;
+    size_t at = 0;
+    enumerate([&](uint32_t, const auto &value) {
+        describe(staged->rows[staged->positions[at++]], value);
     });
 }
 
-template<class Order,class T,class Enumerate,class Assign,class Recycle>
-void _CommitRows(Order *order,std::vector<T> *rows,_StagedRows<T> *staged,
-                 Enumerate enumerate,Assign assign,Recycle recycle)
+template <class Order, class T, class Enumerate, class Assign, class Recycle>
+void
+_CommitRows(Order *order, std::vector<T> *rows, _StagedRows<T> *staged,
+            Enumerate enumerate, Assign assign, Recycle recycle)
 {
-    if(staged->changed) {
-        for(T &row:*rows)recycle(row);
+    if (staged->changed) {
+        for (T &row : *rows)
+            recycle(row);
         rows->swap(staged->rows);
         order->keys.swap(order->nextKeys);
         order->positions.swap(staged->positions);
     }
-    size_t at=0;
-    enumerate([&](uint32_t,const auto &value) {
-        assign((*rows)[order->positions[at++]],value);
+    size_t at = 0;
+    enumerate([&](uint32_t, const auto &value) {
+        assign((*rows)[order->positions[at++]], value);
     });
 }
 
 // The pool only spares an allocation: one that cannot grow drops the buffer.
-template<class T>
-void _Recycle(RigExecSharedArray<T> *array) noexcept
+template <class T>
+void
+_Recycle(RigExecSharedArray<T> *array) noexcept
 {
     try {
         RrRetainedRecycle(array->Release());
-    } catch(...) {
+    } catch (...) {
     }
 }
 
-}  // namespace
+} // namespace
 
 bool
 RigExecRuntimeStageArrayInputs::CanSample(const RigExecRuntimeReader &reader,
-                                         size_t slot)
+                                          size_t slot)
 {
     const auto &slots = reader._program->inputState.stageArraySlots;
     return std::binary_search(slots.begin(), slots.end(), slot);
@@ -97,22 +104,25 @@ RigExecRuntimeStageArrayInputs::Enumerate(const RigExecRuntimeReader &reader)
     std::vector<RigExecStageArrayInputInfo> result;
     const auto &file = *reader._program->inputState.file;
     for (size_t slot : RrStageArraySlots(reader._program.get())) {
-        result.push_back({slot, reader._program->TextOrEmpty(file.inputs[slot].name()),
-                          RrInputTag(uint8_t(file.inputs[slot].type()))});
+        result.push_back(
+            {slot, reader._program->TextOrEmpty(file.inputs[slot].name()),
+             RrInputTag(uint8_t(file.inputs[slot].type()))});
     }
     return result;
 }
 
 bool
 RigExecRuntimeStageArrayInputs::SetSample(RigExecRuntimeReader &reader,
-    size_t slot, const RigExecRuntimeArray &value, std::string *error)
+                                          size_t slot,
+                                          const RigExecRuntimeArray &value,
+                                          std::string *error)
 {
     return RrStageArraySet(reader._program.get(), slot, value, error);
 }
 
 bool
 RigExecRuntimeStageArrayInputs::ClearSample(RigExecRuntimeReader &reader,
-    size_t slot, std::string *error)
+                                            size_t slot, std::string *error)
 {
     return RrStageArrayClear(reader._program.get(), slot, error);
 }
@@ -121,15 +131,16 @@ bool
 RigExecRuntimeStageArrayInputs::CanSampleProviderValue(
     const RigExecRuntimeReader &reader, size_t slot)
 {
-    const auto &sources=reader._program->inputState.slotProviderSource;
-    return slot<sources.size() && sources[slot];
+    const auto &sources = reader._program->inputState.slotProviderSource;
+    return slot < sources.size() && sources[slot];
 }
 
 bool
-RigExecRuntimeStageArrayInputs::SetSampleBlocked(
-    RigExecRuntimeReader &reader,size_t slot,bool blocked,std::string *error)
+RigExecRuntimeStageArrayInputs::SetSampleBlocked(RigExecRuntimeReader &reader,
+                                                 size_t slot, bool blocked,
+                                                 std::string *error)
 {
-    return RrStageInputBlockedSet(reader._program.get(),slot,blocked,error);
+    return RrStageInputBlockedSet(reader._program.get(), slot, blocked, error);
 }
 
 std::vector<RigExecStageArrayInputInfo>
@@ -137,32 +148,39 @@ RigExecRuntimeStageArrayInputs::EnumerateProviderValues(
     const RigExecRuntimeReader &reader)
 {
     std::vector<RigExecStageArrayInputInfo> result;
-    const auto &state=reader._program->inputState;
-    for (size_t slot=0;slot<state.slotProviderSource.size();++slot) {
-        if (!state.slotProviderSource[slot]) continue;
-        const auto &input=state.file->inputs[slot];
-        const auto tag=RrInputTag(uint8_t(input.type()));
+    const auto &state = reader._program->inputState;
+    for (size_t slot = 0; slot < state.slotProviderSource.size(); ++slot) {
+        if (!state.slotProviderSource[slot])
+            continue;
+        const auto &input = state.file->inputs[slot];
+        const auto tag = RrInputTag(uint8_t(input.type()));
         const bool sourceBacked = (state.slotProviderSource[slot] & 2) != 0;
-        if ((!sourceBacked && !(input.flags() & uint8_t(RigExecWireInputSlotFlags::Animated))) ||
-            tag==RrInputTag::Token || RrInputTagIsArray(tag)) continue;
-        result.push_back({slot,reader._program->TextOrEmpty(input.name()),tag,
-                          (input.flags() & uint8_t(RigExecWireInputSlotFlags::Animated)) != 0});
+        if ((!sourceBacked &&
+             !(input.flags() & uint8_t(RigExecWireInputSlotFlags::Animated))) ||
+            tag == RrInputTag::Token || RrInputTagIsArray(tag))
+            continue;
+        result.push_back({slot, reader._program->TextOrEmpty(input.name()), tag,
+                          (input.flags() &
+                           uint8_t(RigExecWireInputSlotFlags::Animated)) != 0});
     }
     return result;
 }
 
 bool
-RigExecRuntimeStageArrayInputs::SetScalarSample(
-    RigExecRuntimeReader &reader,size_t slot,const RrInputValue &value,std::string *error)
+RigExecRuntimeStageArrayInputs::SetScalarSample(RigExecRuntimeReader &reader,
+                                                size_t slot,
+                                                const RrInputValue &value,
+                                                std::string *error)
 {
-    return RrStageScalarSet(reader._program.get(),slot,value,error);
+    return RrStageScalarSet(reader._program.get(), slot, value, error);
 }
 
 bool
-RigExecRuntimeStageArrayInputs::ClearScalarSample(
-    RigExecRuntimeReader &reader,size_t slot,std::string *error)
+RigExecRuntimeStageArrayInputs::ClearScalarSample(RigExecRuntimeReader &reader,
+                                                  size_t slot,
+                                                  std::string *error)
 {
-    return RrStageScalarClear(reader._program.get(),slot,error);
+    return RrStageScalarClear(reader._program.get(), slot, error);
 }
 
 bool
@@ -174,27 +192,32 @@ RigExecRuntimeStageArrayInputs::CanSampleToken(
 }
 
 std::vector<RigExecStageArrayInputInfo>
-RigExecRuntimeStageArrayInputs::EnumerateTokens(const RigExecRuntimeReader &reader)
+RigExecRuntimeStageArrayInputs::EnumerateTokens(
+    const RigExecRuntimeReader &reader)
 {
     std::vector<RigExecStageArrayInputInfo> result;
     const auto &state = reader._program->inputState;
     for (size_t slot : state.stageTokenSlots)
-        result.push_back({slot, reader._program->TextOrEmpty(state.file->inputs[slot].name()),
-                          RrInputTag::Token});
+        result.push_back(
+            {slot,
+             reader._program->TextOrEmpty(state.file->inputs[slot].name()),
+             RrInputTag::Token});
     return result;
 }
 
 bool
-RigExecRuntimeStageArrayInputs::SetTokenSample(
-    RigExecRuntimeReader &reader, size_t slot, const std::string &text,
-    std::string *error)
+RigExecRuntimeStageArrayInputs::SetTokenSample(RigExecRuntimeReader &reader,
+                                               size_t slot,
+                                               const std::string &text,
+                                               std::string *error)
 {
     return RrStageTokenSet(reader._program.get(), slot, text, true, error);
 }
 
 bool
-RigExecRuntimeStageArrayInputs::ClearTokenSample(
-    RigExecRuntimeReader &reader, size_t slot, std::string *error)
+RigExecRuntimeStageArrayInputs::ClearTokenSample(RigExecRuntimeReader &reader,
+                                                 size_t slot,
+                                                 std::string *error)
 {
     return RrStageTokenSet(reader._program.get(), slot, {}, false, error);
 }
@@ -268,8 +291,7 @@ RigExecRuntimeReader::SetInput(const std::string &name, double value,
 
 bool
 RigExecRuntimeReader::SetInputToken(const std::string &name,
-                                    const std::string &text,
-                                    std::string *error)
+                                    const std::string &text, std::string *error)
 {
     size_t index = 0;
     if (!FindInput(name, &index)) {
@@ -289,8 +311,7 @@ RigExecRuntimeReader::SetInputAt(size_t index, const RrInputValue &value,
 }
 
 bool
-RigExecRuntimeReader::SetSampledInputAt(size_t index,
-                                        const RrInputValue &value,
+RigExecRuntimeReader::SetSampledInputAt(size_t index, const RrInputValue &value,
                                         std::string *error)
 {
     return RrInputsSet(_program.get(), index, value, error,
@@ -555,7 +576,8 @@ RigExecRuntimeReader::GetJointPoseMatrices() const
     const auto rests = GetJointRestMatrices();
     std::vector<RigExecRuntimeJointMatrix> out;
     for (const auto &delta : _jointMatrices) {
-        const auto rest = std::lower_bound(rests.begin(), rests.end(), delta.path,
+        const auto rest = std::lower_bound(
+            rests.begin(), rests.end(), delta.path,
             [](const RigExecRuntimeJointMatrix &a, const std::string &path) {
                 return a.path < path;
             });
@@ -617,7 +639,8 @@ RigExecRuntimeReader::GetIkFkMatches() const
     const RrStore &store = _program->store;
     for (size_t i = 0; i < constraints.size() && i < store.matchValid.size();
          ++i) {
-        if (!constraints[i].ikFkMatch || !store.matchValid[i]) continue;
+        if (!constraints[i].ikFkMatch || !store.matchValid[i])
+            continue;
         const auto &values = store.matchValues[i];
         out.push_back({_program->TextOrEmpty(constraints[i].path),
                        std::vector<double>(values.begin(), values.begin() + 11),
@@ -708,15 +731,16 @@ RigExecRuntimeReader::PushHistory()
 {
     RrProgram &program = *_program;
     RrStore &store = program.store;
-    for (size_t w = 0; w < program.windowedOps.size() &&
-                       w < store.windowRings.size() &&
-                       w < store.windowCaptures.size();
+    for (size_t w = 0;
+         w < program.windowedOps.size() && w < store.windowRings.size() &&
+         w < store.windowCaptures.size();
          ++w) {
         RigExecWindowRing &ring = store.windowRings[w];
         ring.push_back(store.windowCaptures[w]);
         const size_t keep = program.windowedOps[w].frames;
         if (ring.size() > keep)
-            ring.erase(ring.begin(), ring.begin() + std::ptrdiff_t(ring.size() - keep));
+            ring.erase(ring.begin(),
+                       ring.begin() + std::ptrdiff_t(ring.size() - keep));
         store.windowRingChanged[w] = 1;
     }
 }
@@ -726,7 +750,8 @@ RigExecRuntimeReader::ClearHistory()
 {
     RrStore &store = _program->store;
     for (size_t w = 0; w < store.windowRings.size(); ++w) {
-        if (!store.windowRings[w].empty()) store.windowRingChanged[w] = 1;
+        if (!store.windowRings[w].empty())
+            store.windowRingChanged[w] = 1;
         store.windowRings[w].clear();
     }
 }
@@ -735,19 +760,23 @@ bool
 RigExecRuntimeReader::ExecuteHistory(std::string *error)
 {
     RrProgram &program = *_program;
-    if (program.windowedOps.empty()) return true;
+    if (program.windowedOps.empty())
+        return true;
     if (!_history) {
         if (!_historyBytes) {
-            if (error) *error = "the reader kept no bytes for its history";
+            if (error)
+                *error = "the reader kept no bytes for its history";
             return false;
         }
         _history = Open(_historyBytes->data(), _historyBytes->size(), error);
-        if (!_history) return false;
+        if (!_history)
+            return false;
         _history->_historyBytes.reset();
     }
     RrProgram &tick = *_history->_program;
     // The kernels installed here; their prepared states are immutable.
-    for (size_t k = 0; k < program.externals.size() && k < tick.externals.size(); ++k) {
+    for (size_t k = 0;
+         k < program.externals.size() && k < tick.externals.size(); ++k) {
         tick.externals[k].kernel = program.externals[k].kernel;
         tick.externals[k].state = program.externals[k].state;
         tick.externals[k].version = program.externals[k].version;
@@ -756,7 +785,8 @@ RigExecRuntimeReader::ExecuteHistory(std::string *error)
     tick.store.windowRings = program.store.windowRings;
     std::fill(tick.store.windowRingChanged.begin(),
               tick.store.windowRingChanged.end(), char(1));
-    if (!_history->_RunHistoryTick(error)) return false;
+    if (!_history->_RunHistoryTick(error))
+        return false;
     program.store.windowRings = tick.store.windowRings;
     std::fill(program.store.windowRingChanged.begin(),
               program.store.windowRingChanged.end(), char(1));
@@ -779,9 +809,81 @@ RigExecRuntimeReader::_RunHistoryTick(std::string *error)
                      RrRunSteps(&program, false, error);
     store.historyTick = false;
     RrShareLatticeBinds(&program);
-    if (!ran) return false;
+    if (!ran)
+        return false;
     PushHistory();
     return true;
+}
+
+size_t
+RigExecRuntimeReader::GetOutputCount() const
+{
+    return _program->exports.size();
+}
+
+bool
+RigExecRuntimeReader::GetOutputAt(size_t index,
+                                  RigExecRuntimeOutput *output) const
+{
+    if (!output || index >= _program->exports.size())
+        return false;
+    const RrExport &entry = _program->exports[index];
+    output->handle = entry.handle;
+    output->status = entry.extractable ? RigExecOutputStatus::Pending
+                                       : RigExecOutputStatus::Unsupported;
+    output->reason = entry.reason;
+    return true;
+}
+
+bool
+RigExecRuntimeReader::FindOutput(const std::string &semanticKey,
+                                 size_t *index) const
+{
+    for (size_t i = 0; i < _program->exports.size(); ++i)
+        if (_program->exports[i].handle.semanticKey == semanticKey) {
+            if (index)
+                *index = i;
+            return true;
+        }
+    return false;
+}
+
+std::string
+RigExecRuntimeReader::GetOutputRigIdentity() const
+{
+    return _program->rigIdentity;
+}
+
+uint64_t
+RigExecRuntimeReader::GetOutputCompileEpoch() const
+{
+    return _program->compileEpoch;
+}
+
+RigExecOutputStatus
+RigExecRuntimeReader::ResolveOutput(const RigExecOutputHandle &handle,
+                                    std::string *reason) const
+{
+    return RrResolveOutput(_program.get(), handle, reason);
+}
+
+bool
+RigExecRuntimeReader::ExecuteRequested(
+    const std::vector<RigExecOutputHandle> &requested,
+    const RigExecOutputTime &at, const RigExecOutputGeneration &captured,
+    std::vector<RigExecOutputPacket> *packets,
+    RigExecRuntimeRequestedCounts *counts, std::string *error)
+{
+    size_t requestedOperations = 0, executedOperations = 0, clustersRun = 0;
+    const bool ran = RrRequestOutputs(_program.get(), requested, at, captured,
+                                      packets, &requestedOperations,
+                                      &executedOperations, &clustersRun, error);
+    if (counts) {
+        counts->requestedOperations = requestedOperations;
+        counts->executedOperations = executedOperations;
+        counts->clustersRun = clustersRun;
+    }
+    return ran;
 }
 
 bool
@@ -796,7 +898,8 @@ RigExecRuntimeReader::Execute(std::string *error)
 
     std::vector<std::string> poseDiagnostics;
     RrProloguePose(&program);
-    if (!RrPrologueGeometry(&program, &poseDiagnostics, error)) return false;
+    if (!RrPrologueGeometry(&program, &poseDiagnostics, error))
+        return false;
     const bool ran = RrRunSteps(&program, false, error);
     // Joined: the binds this run built share now, not at the next run.
     RrShareLatticeBinds(&program);
@@ -804,28 +907,43 @@ RigExecRuntimeReader::Execute(std::string *error)
         return false;
     }
 
-    if(!program.requiredStageFramesAdmission.admitted) {
+    if (!program.requiredStageFramesAdmission.admitted) {
         std::vector<size_t> propertySteps;
-        for(size_t i=0;i<program.steps->size();++i)
-            if((*program.steps)[i].kind==RigExecWireStepKind::PropertyRevision)propertySteps.push_back(i);
-        std::sort(propertySteps.begin(),propertySteps.end(),[&](size_t a,size_t b) {
-            const auto &left=(*program.steps)[a]; const auto &right=(*program.steps)[b];
-            return std::make_pair(left.object,left.part)<std::make_pair(right.object,right.part);
-        });
-        for(size_t i:propertySteps) {
-            poseDiagnostics.insert(poseDiagnostics.end(),store.headLines[i].begin(),store.headLines[i].end());
+        for (size_t i = 0; i < program.steps->size(); ++i)
+            if ((*program.steps)[i].kind ==
+                RigExecWireStepKind::PropertyRevision)
+                propertySteps.push_back(i);
+        std::sort(propertySteps.begin(), propertySteps.end(),
+                  [&](size_t a, size_t b) {
+                      const auto &left = (*program.steps)[a];
+                      const auto &right = (*program.steps)[b];
+                      return std::make_pair(left.object, left.part) <
+                             std::make_pair(right.object, right.part);
+                  });
+        for (size_t i : propertySteps) {
+            poseDiagnostics.insert(poseDiagnostics.end(),
+                                   store.headLines[i].begin(),
+                                   store.headLines[i].end());
         }
-        const size_t target=size_t(program.requiredStageFramesAdmission.firstBadTarget);
-        const size_t slot=size_t(program.slotMeta->xformSlots[target]);
-        const std::string refusal="could not resolve constraint target "+
-            program.TextOrEmpty(program.slotMeta->paths[slot])+" relative to the asset root";
+        const size_t target =
+            size_t(program.requiredStageFramesAdmission.firstBadTarget);
+        const size_t slot = size_t(program.slotMeta->xformSlots[target]);
+        const std::string refusal =
+            "could not resolve constraint target " +
+            program.TextOrEmpty(program.slotMeta->paths[slot]) +
+            " relative to the asset root";
         poseDiagnostics.push_back(refusal);
-        _jointMatrices.clear(); _points.clear(); _matrixPrimvars.clear();
-        _weightFrames.clear(); _weightFields.clear(); _providerXforms.clear();
-        _diagnostics=std::move(poseDiagnostics);
-        _counters=RigExecRuntimeCounters();
-        _counters.executedOpCount=store.opExecution.executed;
-        if(error)*error=refusal;
+        _jointMatrices.clear();
+        _points.clear();
+        _matrixPrimvars.clear();
+        _weightFrames.clear();
+        _weightFields.clear();
+        _providerXforms.clear();
+        _diagnostics = std::move(poseDiagnostics);
+        _counters = RigExecRuntimeCounters();
+        _counters.executedOpCount = store.opExecution.executed;
+        if (error)
+            *error = refusal;
         return false;
     }
 
@@ -847,15 +965,17 @@ RigExecRuntimeReader::Execute(std::string *error)
     for (const auto &loop : program.opGraph.cycles) {
         std::string message = "operation cycle: ";
         for (size_t i = 0; i < loop.size(); ++i) {
-            if (i) message += " -> ";
+            if (i)
+                message += " -> ";
             message += loop[i];
         }
-        if (std::find(poseDiagnostics.begin(), poseDiagnostics.end(), message) == poseDiagnostics.end())
+        if (std::find(poseDiagnostics.begin(), poseDiagnostics.end(),
+                      message) == poseDiagnostics.end())
             poseDiagnostics.push_back(std::move(message));
     }
 
     RigExecRuntimeCounters counters;
-    counters.executedOpCount=store.opExecution.executed;
+    counters.executedOpCount = store.opExecution.executed;
 
     // A plugin mover this runtime has no kernel for is a no-op, said on
     // every frame it is one, beside the lines of the step it sat in.
@@ -868,7 +988,8 @@ RigExecRuntimeReader::Execute(std::string *error)
             program.geometry->chains[slot.first].revisions[slot.second];
         poseDiagnostics.push_back(
             "warning: " + program.TextOrEmpty(wire.moverPath) + " is a " +
-            state.type + ", which this runtime has no kernel for; its "
+            state.type +
+            ", which this runtime has no kernel for; its "
             "points pass through");
     }
 
@@ -888,24 +1009,30 @@ RigExecRuntimeReader::Execute(std::string *error)
     // a failure anywhere above keeps the previous frame. Every output stages
     // its rows before any is committed, so a throw while staging publishes
     // none of this frame.
-    const auto entries=[](const auto &map) {
-        return [&map](auto visit) {for(const auto &entry:map)visit(entry.first,entry.second);};
+    const auto entries = [](const auto &map) {
+        return [&map](auto visit) {
+            for (const auto &entry : map)
+                visit(entry.first, entry.second);
+        };
     };
-    const auto joints=entries(store.jointMatricesFinal);
-    const auto moved=entries(store.movedProperties);
-    const auto matrices=entries(store.movedMatrices);
-    const auto frames=[&](auto visit) {
-        const size_t count=std::min({program.slotMeta?program.slotMeta->paths.size():size_t(0),
-            store.volumePlaced.size(),store.volumePlacement.size()});
-        for(size_t slot=0;slot<count;++slot)if(store.volumePlaced[slot])
-            visit(program.slotMeta->paths[slot],store.volumePlacement[slot]);
+    const auto joints = entries(store.jointMatricesFinal);
+    const auto moved = entries(store.movedProperties);
+    const auto matrices = entries(store.movedMatrices);
+    const auto frames = [&](auto visit) {
+        const size_t count = std::min(
+            {program.slotMeta ? program.slotMeta->paths.size() : size_t(0),
+             store.volumePlaced.size(), store.volumePlacement.size()});
+        for (size_t slot = 0; slot < count; ++slot)
+            if (store.volumePlaced[slot])
+                visit(program.slotMeta->paths[slot],
+                      store.volumePlacement[slot]);
     };
-    const auto fields=entries(store.weightFields);
-    const auto providers=[&](auto visit) {
-        for(const auto &entry:store.providerXforms) {
-            const auto base=store.providerBaseXforms.find(entry.first);
-            if(base!=store.providerBaseXforms.end())
-                visit(entry.first,std::make_pair(entry.second,base->second));
+    const auto fields = entries(store.weightFields);
+    const auto providers = [&](auto visit) {
+        for (const auto &entry : store.providerXforms) {
+            const auto base = store.providerBaseXforms.find(entry.first);
+            if (base != store.providerBaseXforms.end())
+                visit(entry.first, std::make_pair(entry.second, base->second));
         }
     };
     _StagedRows<RigExecRuntimeJointMatrix> jointRows;
@@ -914,35 +1041,56 @@ RigExecRuntimeReader::Execute(std::string *error)
     _StagedRows<RigExecRuntimeWeightFrame> frameRows;
     _StagedRows<RigExecRuntimeWeightField> fieldRows;
     _StagedRows<RigExecRuntimeProviderXform> providerRows;
-    const auto pathOnly=[](auto &,const auto &) {};
-    _StageRows(&_jointOrder,_jointMatrices,program,joints,pathOnly,&jointRows);
-    _StageRows(&_pointOrder,_points,program,moved,pathOnly,&pointRows);
-    _StageRows(&_matrixOrder,_matrixPrimvars,program,matrices,pathOnly,&matrixRows);
-    _StageRows(&_weightFrameOrder,_weightFrames,program,frames,pathOnly,&frameRows);
+    const auto pathOnly = [](auto &, const auto &) {};
+    _StageRows(&_jointOrder, _jointMatrices, program, joints, pathOnly,
+               &jointRows);
+    _StageRows(&_pointOrder, _points, program, moved, pathOnly, &pointRows);
+    _StageRows(&_matrixOrder, _matrixPrimvars, program, matrices, pathOnly,
+               &matrixRows);
+    _StageRows(&_weightFrameOrder, _weightFrames, program, frames, pathOnly,
+               &frameRows);
     // A field's target comes from its file record, so it moves only with
     // membership.
-    _StageRows(&_weightOrder,_weightFields,program,fields,
-        [&](auto &row,const auto &value) {
-            if(!program.GetText(value.target,&row.target))row.target.clear();
-        },&fieldRows);
-    _StageRows(&_providerOrder,_providerXforms,program,providers,pathOnly,&providerRows);
-    const auto matrix=[](auto &row,const auto &value) {row.matrix=value;};
-    const auto keep=[](auto &) {};
-    _CommitRows(&_jointOrder,&_jointMatrices,&jointRows,joints,matrix,keep);
-    _CommitRows(&_pointOrder,&_points,&pointRows,moved,
-        [](auto &row,const auto &value) {
+    _StageRows(
+        &_weightOrder, _weightFields, program, fields,
+        [&](auto &row, const auto &value) {
+            if (!program.GetText(value.target, &row.target))
+                row.target.clear();
+        },
+        &fieldRows);
+    _StageRows(&_providerOrder, _providerXforms, program, providers, pathOnly,
+               &providerRows);
+    const auto matrix = [](auto &row, const auto &value) {
+        row.matrix = value;
+    };
+    const auto keep = [](auto &) {};
+    _CommitRows(&_jointOrder, &_jointMatrices, &jointRows, joints, matrix,
+                keep);
+    _CommitRows(
+        &_pointOrder, &_points, &pointRows, moved,
+        [](auto &row, const auto &value) {
             _Recycle(&row.points);
-            row.points=RigExecSharedArray<RrVec3f>(value.Share());
-        },[](auto &row) {_Recycle(&row.points);});
-    _CommitRows(&_matrixOrder,&_matrixPrimvars,&matrixRows,matrices,matrix,keep);
-    _CommitRows(&_weightFrameOrder,&_weightFrames,&frameRows,frames,matrix,keep);
-    _CommitRows(&_weightOrder,&_weightFields,&fieldRows,fields,
-        [](auto &row,const auto &value) {
+            row.points = RigExecSharedArray<RrVec3f>(value.Share());
+        },
+        [](auto &row) { _Recycle(&row.points); });
+    _CommitRows(&_matrixOrder, &_matrixPrimvars, &matrixRows, matrices, matrix,
+                keep);
+    _CommitRows(&_weightFrameOrder, &_weightFrames, &frameRows, frames, matrix,
+                keep);
+    _CommitRows(
+        &_weightOrder, &_weightFields, &fieldRows, fields,
+        [](auto &row, const auto &value) {
             _Recycle(&row.weights);
-            row.weights=RigExecSharedArray<float>(value.weights.Share());
-        },[](auto &row) {_Recycle(&row.weights);});
-    _CommitRows(&_providerOrder,&_providerXforms,&providerRows,providers,
-        [](auto &row,const auto &value) {row.matrix=value.first;row.base=value.second;},keep);
+            row.weights = RigExecSharedArray<float>(value.weights.Share());
+        },
+        [](auto &row) { _Recycle(&row.weights); });
+    _CommitRows(
+        &_providerOrder, &_providerXforms, &providerRows, providers,
+        [](auto &row, const auto &value) {
+            row.matrix = value.first;
+            row.base = value.second;
+        },
+        keep);
     store.movedProperties.clear();
     store.weightFields.clear();
     _diagnostics = std::move(poseDiagnostics);
@@ -950,4 +1098,4 @@ RigExecRuntimeReader::Execute(std::string *error)
     return true;
 }
 
-}  // namespace rigExec
+} // namespace rigExec

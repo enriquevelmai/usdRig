@@ -19,6 +19,7 @@
 #include "rigExecRuntime/inputs.h"
 #include "rigExecRuntime/values.h"
 #include "rigExecGraph/opValues.h"
+#include "rigExecGraph/outputDemand.h"
 #include "rigExecGraph/providerRecords.h"
 #include "rigExecGraph/windowHistory.h"
 
@@ -37,13 +38,13 @@ namespace rigExec {
 // Runtime vectors and matrices are bare scalar arrays, so their key bytes
 // are their object bytes and contiguous runs of them key with one append.
 static_assert(sizeof(RrVec2f) == 2 * sizeof(float) &&
-              sizeof(RrVec3f) == 3 * sizeof(float) &&
-              sizeof(RrVec3d) == 3 * sizeof(double) &&
-              sizeof(RrMat4d) == 16 * sizeof(double) &&
-              std::is_trivially_copyable<RrVec2f>::value &&
-              std::is_trivially_copyable<RrVec3f>::value &&
-              std::is_trivially_copyable<RrVec3d>::value &&
-              std::is_trivially_copyable<RrMat4d>::value,
+                  sizeof(RrVec3f) == 3 * sizeof(float) &&
+                  sizeof(RrVec3d) == 3 * sizeof(double) &&
+                  sizeof(RrMat4d) == 16 * sizeof(double) &&
+                  std::is_trivially_copyable<RrVec2f>::value &&
+                  std::is_trivially_copyable<RrVec3f>::value &&
+                  std::is_trivially_copyable<RrVec3d>::value &&
+                  std::is_trivially_copyable<RrMat4d>::value,
               "key runs need padding-free, trivially copyable elements");
 template <> struct RigExecOpKeyBulkElement<RrVec2f> : std::true_type {};
 template <> struct RigExecOpKeyBulkElement<RrVec3f> : std::true_type {};
@@ -86,11 +87,16 @@ enum RrSolverField : int {
     RrSolverTwistTurns = 11,
     RrSolverRibbonSampleCount = 12,
     RrSolverIkSpace = 13,
-    RrSolverPin=14,RrSolverUpperScale=15,RrSolverLowerScale=16,RrSolverSoftDistance=17,RrSolverLimbTwist=18,
+    RrSolverPin = 14,
+    RrSolverUpperScale = 15,
+    RrSolverLowerScale = 16,
+    RrSolverSoftDistance = 17,
+    RrSolverLimbTwist = 18,
     RrSolverFieldCount = 19,
 };
-static_assert(size_t(RrSolverFieldCount) == RigExecWireSolverFixedFieldCount,
-              "solver fixed fields: format.h, serialize.cpp, computedCapture.cpp");
+static_assert(
+    size_t(RrSolverFieldCount) == RigExecWireSolverFixedFieldCount,
+    "solver fixed fields: format.h, serialize.cpp, computedCapture.cpp");
 
 enum RrConstraintField : int {
     RrConstraintEnabled = 0,
@@ -114,7 +120,7 @@ enum RrConstraintField : int {
     RrConstraintWorldUpVector = 18,
     RrConstraintPoleVector = 19,
     RrConstraintTwistDegrees = 20,
-    RrConstraintStretch=21,
+    RrConstraintStretch = 21,
     // An IK/FK match's scalars: switch, stretch, softDistance, upperScale,
     // lowerScale, pin, twist. Absent on every other constraint.
     RrConstraintMatchFirst = 22,
@@ -166,25 +172,47 @@ struct RrLadderLive {
 // keep their old payload intact across later executions and workspace clones.
 template <class T> class RrRetainedArray {
     std::shared_ptr<std::vector<T>> _data;
+
 public:
-    const std::vector<T> &Read() const {
+    const std::vector<T> &Read() const
+    {
         return _data ? *_data : Empty();
     }
     static const std::vector<T> &Empty();
-    bool empty() const { return Read().empty(); }
-    size_t size() const { return Read().size(); }
-    const T *data() const { return Read().data(); }
-    void clear() { _data.reset(); }
-    std::vector<T> &Write() {
-        if (!_data) _data=std::make_shared<std::vector<T>>();
-        else if (!_data.unique()) _data=std::make_shared<std::vector<T>>(*_data);
+    bool empty() const
+    {
+        return Read().empty();
+    }
+    size_t size() const
+    {
+        return Read().size();
+    }
+    const T *data() const
+    {
+        return Read().data();
+    }
+    void clear()
+    {
+        _data.reset();
+    }
+    std::vector<T> &Write()
+    {
+        if (!_data)
+            _data = std::make_shared<std::vector<T>>();
+        else if (!_data.unique())
+            _data = std::make_shared<std::vector<T>>(*_data);
         return *_data;
     }
-    void swap(std::vector<T> &spare) {
-        if (_data && _data.unique()) { _data->swap(spare); return; }
+    void swap(std::vector<T> &spare)
+    {
+        if (_data && _data.unique()) {
+            _data->swap(spare);
+            return;
+        }
         auto next = std::make_shared<std::vector<T>>();
         next->swap(spare);
-        if (_data && _data.unique()) spare.swap(*_data);
+        if (_data && _data.unique())
+            spare.swap(*_data);
         _data = std::move(next);
     }
     // Another retainer of the current buffer, not a copy of its elements.
@@ -194,12 +222,20 @@ public:
 };
 // Namespace-owned empty storage avoids worker-local static initialization.
 inline const std::vector<RrVec3f> RrEmptyRetainedPoints;
-template <> inline const std::vector<RrVec3f> &
-RrRetainedArray<RrVec3f>::Empty() { return RrEmptyRetainedPoints; }
+template <>
+inline const std::vector<RrVec3f> &
+RrRetainedArray<RrVec3f>::Empty()
+{
+    return RrEmptyRetainedPoints;
+}
 
 inline const std::vector<float> RrEmptyRetainedWeights;
-template <> inline const std::vector<float> &
-RrRetainedArray<float>::Empty() { return RrEmptyRetainedWeights; }
+template <>
+inline const std::vector<float> &
+RrRetainedArray<float>::Empty()
+{
+    return RrEmptyRetainedWeights;
+}
 
 inline const std::shared_ptr<const std::vector<RrVec3f>> RrEmptySharedPoints =
     std::make_shared<const std::vector<RrVec3f>>();
@@ -211,14 +247,21 @@ std::shared_ptr<const std::vector<T>> RrRetainedEmptyShared();
 
 template <>
 inline std::shared_ptr<const std::vector<RrVec3f>>
-RrRetainedEmptyShared<RrVec3f>() { return RrEmptySharedPoints; }
+RrRetainedEmptyShared<RrVec3f>()
+{
+    return RrEmptySharedPoints;
+}
 
 template <>
 inline std::shared_ptr<const std::vector<float>>
-RrRetainedEmptyShared<float>() { return RrEmptySharedWeights; }
+RrRetainedEmptyShared<float>()
+{
+    return RrEmptySharedWeights;
+}
 
 template <class T>
-inline std::shared_ptr<const std::vector<T>> RrRetainedArray<T>::Share() const
+inline std::shared_ptr<const std::vector<T>>
+RrRetainedArray<T>::Share() const
 {
     return _data ? std::shared_ptr<const std::vector<T>>(_data)
                  : RrRetainedEmptyShared<T>();
@@ -229,7 +272,8 @@ inline std::shared_ptr<const std::vector<T>> RrRetainedArray<T>::Share() const
 // threads do not share a pool. A share that is still held is not recycled,
 // so its bytes stay immutable.
 template <class T>
-inline std::vector<std::vector<T>> &RrRetainedPool()
+inline std::vector<std::vector<T>> &
+RrRetainedPool()
 {
     thread_local std::vector<std::vector<T>> pool;
     return pool;
@@ -238,9 +282,11 @@ inline std::vector<std::vector<T>> &RrRetainedPool()
 // Gives \p spare \p count elements. A pooled buffer of that size is swapped
 // in; otherwise resize allocates.
 template <class T>
-inline void RrRetainedPrepare(std::vector<T> *spare, size_t count)
+inline void
+RrRetainedPrepare(std::vector<T> *spare, size_t count)
 {
-    if (spare->size() == count) return;
+    if (spare->size() == count)
+        return;
     if (spare->capacity() >= count) {
         spare->resize(count);
         return;
@@ -260,11 +306,14 @@ inline void RrRetainedPrepare(std::vector<T> *spare, size_t count)
 // Moves \p share's storage into the pool when \p share is its only owner.
 // The vector was allocated non-const; the const pointer is the public view.
 template <class T>
-inline void RrRetainedRecycle(std::shared_ptr<const std::vector<T>> share)
+inline void
+RrRetainedRecycle(std::shared_ptr<const std::vector<T>> share)
 {
-    if (!share || share.use_count() != 1 || share->capacity() == 0) return;
+    if (!share || share.use_count() != 1 || share->capacity() == 0)
+        return;
     auto &pool = RrRetainedPool<T>();
-    if (pool.size() >= 32) return;
+    if (pool.size() >= 32)
+        return;
     pool.emplace_back();
     pool.back().swap(*const_cast<std::vector<T> *>(share.get()));
 }
@@ -336,7 +385,7 @@ struct RrProviderConversionScratch {
 };
 
 struct RrProviderRefreshScratch {
-    std::vector<RrPointFrame> baseInputs,finInputs,baseOutputs,finOutputs;
+    std::vector<RrPointFrame> baseInputs, finInputs, baseOutputs, finOutputs;
     std::vector<uint8_t> blocked;
 };
 
@@ -502,6 +551,20 @@ struct RrStore {
     // publishes key by it, so a solve over a new history publishes a change
     // even when the frame's inputs hold still.
     std::vector<uint64_t> windowRingSerial;
+    // A requested run (docs/specs/output-subscriptions.md): the closure mask,
+    // the operations it names, and the operations it left out and so owes the
+    // next run. It never overlaps a history tick.
+    bool requestedRun = false;
+    std::vector<char> requestedMask;
+    std::vector<uint32_t> requestedOps, requestedDebt, requestedSkipEffects;
+    // Per operation, whether any run of this store has executed its body. An
+    // operation that never ran has published nothing here, so no key compare
+    // may read its storage as clean.
+    std::vector<char> opProduced;
+    // Non-zero when the last run was masked (a requested run or a history
+    // tick): the operations it masked out were never asked about, so their
+    // clean state no longer says what this store holds.
+    char lastRunRestricted = 0;
     bool historyTick = false;
     bool everRan = false;
     // An Animated input was set, or the caller said time moved
@@ -556,8 +619,7 @@ struct RrStatic {
     {
         return file->pose->constraintArrays[k].weights;
     }
-    const std::vector<RigExecWireVec3d> &ArrayTranslationOffsets(
-        size_t k) const
+    const std::vector<RigExecWireVec3d> &ArrayTranslationOffsets(size_t k) const
     {
         return file->pose->constraintArrays[k].translationOffsets;
     }
@@ -565,7 +627,10 @@ struct RrStatic {
     {
         return file->pose->constraintArrays[k].rotationOffsets;
     }
-    bool ArrayOk(size_t k) const { return file->pose->constraintArrays[k].ok; }
+    bool ArrayOk(size_t k) const
+    {
+        return file->pose->constraintArrays[k].ok;
+    }
     const std::vector<double> &ArrayPoleWeights(size_t k) const
     {
         return file->pose->constraintArrays[k].poleWeights;
@@ -646,12 +711,33 @@ struct RrGeoSettings {
     bool useSimd = true;
 };
 
+// One export_catalog entry bound to this program's tables at Open. `storage`
+// is the file's own enum, and `object` and `version` are read as it names
+// them: a property chain and its value version, a provider slot, a
+// pose.frame_records index, or a geometry chain and its point version. The
+// handle carries the reader's own rig-identity text and the compile epoch Open
+// minted for it: a .rigexec never serializes the live identity its exporter
+// held, so a handle from another reader or another compile never resolves
+// here.
+struct RrExport {
+    RigExecOutputHandle handle;
+    fb::ExportStorage storage = fb::ExportStorage::PropertyValue;
+    // kRigExecNoOutputValue for an address the compiled graph retains no
+    // canonical producer for.
+    RigExecValueId producerValue = kRigExecNoOutputValue;
+    uint32_t object = 0;
+    uint32_t version = 0;
+    // False for an entry the file marks unusable, which names its reason.
+    bool extractable = true;
+    std::string reason;
+};
+
 // The opened program plus its working state. The table pointers borrow
 // from `file`; the store is sized at Open.
 struct RrProgram {
     // Explicit captured source state; no runtime Stage lookup or inferred frame validity.
     fb::RigExecWireRequiredStageFramesAdmission requiredStageFramesAdmission;
-    bool requiredStageFramesFullOwed=false;
+    bool requiredStageFramesFullOwed = false;
     RigExecCompiledGraph opGraph;
     /// The windowed operations, settled from the common graph at compile
     /// (RigExecSettleWindowLayout), and the canonical-op mask of a history
@@ -747,6 +833,21 @@ struct RrProgram {
     /// serially whatever the dispatcher.
     bool parallelSafe = true;
 
+    /// The file's export catalog bound to these tables (RrBindExportCatalog),
+    /// in the file's semantic-key order. The identity the handles carry is
+    /// this reader's own: the rig path text as the file spells it, and the
+    /// compile epoch Open minted, which no other reader's handle repeats.
+    std::vector<RrExport> exports;
+    std::string rigIdentity;
+    uint64_t compileEpoch = 0;
+    /// The demand index over `exports` for this program's canonical graph,
+    /// with the requirement edges compiled from it. Built once, after the op
+    /// graph exists (RrBuildExportIndex), because a closure needs the graph's
+    /// predecessors, skip effects and windows.
+    RigExecOutputDemandIndex exportIndex;
+    RigExecDemandEdges exportEdges;
+    bool exportIndexReady = false;
+
     /// One plugin revision's playback state, in external_movers order. No
     /// prepared state means no kernel here: the revision passes through.
     struct ExternalRevision {
@@ -781,7 +882,8 @@ struct RrProgram {
     // no switch pays nothing at all. Empty when the binary carries none.
     std::vector<int32_t> spaceSwitchBySlot;
     // Exact native declaration-derived seed steps, independent of clustering.
-    std::vector<std::vector<int32_t>> avarReaderSteps, chainBaseSteps, revisionSteps;
+    std::vector<std::vector<int32_t>> avarReaderSteps, chainBaseSteps,
+        revisionSteps;
     std::vector<int32_t> revisionStaticStep;
     std::vector<std::array<int32_t, RrSolverFieldCount>> solverRead;
     // Per solver, a RigExecSkeleton2d's channel reads (thirteen per bone,
@@ -868,18 +970,24 @@ struct RrProgram {
 
     RrInputValue ReadLadder(size_t slot, int field) const
     {
-        const auto &ladder=poses->ladders[slot];
-        const int channel=field<=2?field:field==RrLadderParentSpace?3:
-            field==RrLadderParentDefaultSpace?4:field==RrLadderAvarDefaultSpace?5:
-            field==RrLadderPosedDefaultSpace?6:-1;
-        if(channel>=0 && size_t(channel)<ladder.spaceValues.size()) {
-            const int id=ladder.spaceValues[size_t(channel)];
-            if(id>=0 && size_t(id)<store.providerValues.size()) {
-                const auto &state=store.providerValues[size_t(id)];
-                const auto *matrix=std::get_if<std::array<double,16>>(&state.value);
-                if(state.initialized && !state.blocked && matrix) {
-                    RrInputValue value; value.tag=RrInputTag::Matrix4d;
-                    std::memcpy(value.matrix._mtx,matrix->data(),sizeof(double)*16);
+        const auto &ladder = poses->ladders[slot];
+        const int channel = field <= 2                            ? field
+                            : field == RrLadderParentSpace        ? 3
+                            : field == RrLadderParentDefaultSpace ? 4
+                            : field == RrLadderAvarDefaultSpace   ? 5
+                            : field == RrLadderPosedDefaultSpace  ? 6
+                                                                  : -1;
+        if (channel >= 0 && size_t(channel) < ladder.spaceValues.size()) {
+            const int id = ladder.spaceValues[size_t(channel)];
+            if (id >= 0 && size_t(id) < store.providerValues.size()) {
+                const auto &state = store.providerValues[size_t(id)];
+                const auto *matrix =
+                    std::get_if<std::array<double, 16>>(&state.value);
+                if (state.initialized && !state.blocked && matrix) {
+                    RrInputValue value;
+                    value.tag = RrInputTag::Matrix4d;
+                    std::memcpy(value.matrix._mtx, matrix->data(),
+                                sizeof(double) * 16);
                     return value;
                 }
             }
@@ -964,7 +1072,8 @@ bool RrRunPropertyPart(RrProgram *program, size_t chain, size_t part,
                        std::vector<std::string> *diagnostics);
 void RrPropertyBegin(RrProgram *program);
 void RrPropertyPublish(RrProgram *program);
-void RrPropertyPublishFinished(RrProgram *program, const std::vector<char> &finished);
+void RrPropertyPublishFinished(RrProgram *program,
+                               const std::vector<char> &finished);
 bool RrRunRestHead(RrProgram *program, size_t group, bool ladder);
 bool RrRunTopologyHead(RrProgram *program, size_t revision);
 bool RrRunPropertyChains(RrProgram *program,
@@ -985,9 +1094,11 @@ void RrShareLatticeBinds(RrProgram *program);
 // Step bodies by family.
 bool RrRunPoseStep(RrProgram *program, size_t step, std::string *error);
 bool RrRunGeometryStep(RrProgram *program, size_t step, std::string *error);
-bool RrWeightFieldEffectiveInputMemo(const RrProgram *, uint32_t, std::string *, std::vector<uint32_t> *);
+bool RrWeightFieldEffectiveInputMemo(const RrProgram *, uint32_t, std::string *,
+                                     std::vector<uint32_t> *);
 bool RrRunWeightStep(RrProgram *program, size_t step, std::string *error);
-bool RrRevisionWeightFieldInput(const RrProgram *, size_t, const RrVec3f **, size_t *);
+bool RrRevisionWeightFieldInput(const RrProgram *, size_t, const RrVec3f **,
+                                size_t *);
 bool RrRunRevisionWeightField(RrProgram *program, size_t fieldIndex);
 // Evaluate one compiled per-consumer field without stage or publication-map
 // lookup. The graph producer supplies the actual entering point count.
@@ -1012,6 +1123,53 @@ bool RrResolveWeightOracle(const RrProgram *program, size_t object,
 // set since the last run reach; RrStore::animatedTouched stands for a
 // change of time.
 bool RrRunSteps(RrProgram *program, bool force, std::string *error);
+/// The file's export catalog bound to this program's tables and the rig
+/// identity its handles carry. Open calls it once the tables close; an entry
+/// whose semantic key, phase or producer value does not address the storage it
+/// names is a refusal, not an unanswered output.
+bool RrBindExportCatalog(RrProgram *program, std::string *error);
+/// The demand index over the bound catalog, built from the compiled operation
+/// graph and its requirement edges. Runs at the first requested execution.
+bool RrBuildExportIndex(RrProgram *program, std::string *error);
+/// The payload one export answers from the storage the last run left, and
+/// what it holds. The framework reads property-chain and provider storage;
+/// a chain's point versions through RrGeoExtractPoints.
+bool RrExtractExport(const RrProgram *program, const RrExport &output,
+                     RigExecOutputPayload *payload, std::string *reason);
+/// The geometry half of that read: one chain's point version as the last run
+/// left it, gathered from the groups its writers published when the chain is
+/// cut into groups. False with why the chain cannot answer.
+bool RrGeoExtractPoints(const RrProgram *program, const RrExport &output,
+                        RigExecOutputPayload *payload, std::string *reason);
+/// A requested run holds the graph to the closure of the outputs a host
+/// asked for. RrBeginRequestedRun installs the mask; RrEndRequestedRun lifts
+/// it, and what the closure left out stays owed to the next run. Both run on
+/// the owner thread with no operation running.
+bool RrBeginRequestedRun(RrProgram *program,
+                         const RigExecDemandClosure &requested,
+                         std::string *error);
+void RrEndRequestedRun(RrProgram *program);
+/// The last requested run's operation and cluster counts: what the closure
+/// named, how many of them ran, and how many clusters it closed.
+void RrRequestedRunCounts(const RrProgram *program, size_t *requested,
+                          size_t *executed, size_t *clusters);
+/// What \p handle means to this program: Pending for an output it can answer,
+/// Unsupported for an address it does not export or cannot produce, Invalidated
+/// for another rig instance or a stale compile epoch.
+RigExecOutputStatus RrResolveOutput(const RrProgram *program,
+                                    const RigExecOutputHandle &handle,
+                                    std::string *reason);
+/// The whole requested execution: resolve every handle, run the union of their
+/// closures over the inputs as set, and answer each handle from the storage
+/// that run left. The run publishes nothing. The three counts name what the
+/// closure asked for, how much of it ran, and the clusters it closed.
+bool RrRequestOutputs(RrProgram *program,
+                      const std::vector<RigExecOutputHandle> &requested,
+                      const RigExecOutputTime &at,
+                      const RigExecOutputGeneration &captured,
+                      std::vector<RigExecOutputPacket> *packets,
+                      size_t *requestedOperations, size_t *executedOperations,
+                      size_t *clustersRun, std::string *error);
 /// Builds RrProgram::epilogue from the steps and their output as they
 /// stand, keeping `verify` and `mismatches`.
 void RrIndexEpilogue(RrProgram *program);
@@ -1069,6 +1227,6 @@ enum class RrRotationFilter : uint8_t { All = 0, Twist = 1, Swing = 2 };
 RrMat4d RrFilterSpaceRotation(const RrMat4d &m, const RrVec3d &axis,
                               RrRotationFilter filter);
 
-}  // namespace rigExec
+} // namespace rigExec
 
-#endif  // RIGEXEC_RUNTIME_STORE_H
+#endif // RIGEXEC_RUNTIME_STORE_H

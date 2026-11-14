@@ -5,8 +5,8 @@
 //
 // This is the only place these types are declared: scene lowering, cache
 // publication, bake, runtime, imaging and host adapters include this header and
-// may not declare their own time, handle, status, packet, payload layout,
-// payload lease or closure type.
+// may not declare their own time, handle, status, packet, semantic key,
+// payload layout, payload lease or closure type.
 //
 // USD-free by contract, like the rest of rigExecGraph: no stage, path or
 // schema type appears here. Compiled rig identity travels as plain text plus a
@@ -33,6 +33,11 @@ namespace rigExec {
 
 // A canonical operation index that names no operation.
 constexpr uint32_t kRigExecNoOp = 0xffffffffu;
+
+// A graph value id that names no value: an output address the compiled graph
+// retains no canonical producer for.
+constexpr RigExecValueId kRigExecNoOutputValue =
+    std::numeric_limits<RigExecValueId>::max();
 
 // Namespace-scope so an absent demand list needs no guard at call time.
 const std::vector<uint32_t> kRigExecNoOutputs;
@@ -205,6 +210,21 @@ struct RigExecOutputHandleHash {
         return handle.Hash();
     }
 };
+
+// The durable semantic key of a target/public-computation/phase address.
+// Dense storage and value ids never enter it, and each field is
+// length-prefixed, so no field text can imitate the next field's length.
+// Discovery, a .rigexec's export catalog, and any consumer rebuilding an
+// address from compiled tables share this one spelling.
+inline std::string
+RigExecOutputSemanticKey(const std::string &target,
+                         const std::string &publicComputation,
+                         const std::string &phase)
+{
+    return std::to_string(target.size()) + ":" + target +
+           std::to_string(publicComputation.size()) + ":" + publicComputation +
+           std::to_string(phase.size()) + ":" + phase;
+}
 
 // Explicit: a host asked for this output. Speculative: the owner warmed it on
 // its own and a host may take it.

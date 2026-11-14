@@ -24,6 +24,7 @@
 
 #include "rigExecBinary/external.h"
 #include "rigExecBinary/moverDefinition.h"
+#include "rigExecGraph/outputDemand.h"
 #include "rigExecRuntime/runtimeMath.h"
 #include "rigExecRuntime/values.h"
 
@@ -212,6 +213,24 @@ struct RigExecRuntimeCounters {
     uint64_t executedOpCount = 0;
 };
 
+// One output the file names, as discovery reports it. A Pending output is one
+// this reader can answer; Unsupported names the address but no payload this
+// reader can produce -- a GPU-only point chain among them -- with the file's
+// reason for refusing it.
+struct RigExecRuntimeOutput {
+    RigExecOutputHandle handle;
+    RigExecOutputStatus status = RigExecOutputStatus::Unsupported;
+    std::string reason;
+};
+
+// What one requested execution ran: the operations its closure named, how many
+// of them ran, and how many clusters the scheduler closed.
+struct RigExecRuntimeRequestedCounts {
+    size_t requestedOperations = 0;
+    size_t executedOperations = 0;
+    size_t clustersRun = 0;
+};
+
 // Plays a .rigexec file: a static graph whose inputs are the attributes the
 // rig reads. Open decodes the file, and the inputs start at their
 // bake-time defaults; each input set takes effect as an authored value at
@@ -367,6 +386,49 @@ public:
     /// program whose Open found state that is not per op (serial then).
     void SetTaskDispatch(std::function<void(std::function<void()>)> dispatch,
                          std::function<void()> wait);
+
+    // The outputs the file names by its export catalog (format 32 and newer),
+    // in the file's semantic-key order. A program older than that, or one
+    // assembled in memory, names no outputs: discovery answers nothing and a
+    // request is refused, because an older bake holds no address for an
+    // intermediate output and playback never guesses one.
+    size_t GetOutputCount() const;
+    // Output \p index as discovery reports it; false past the count.
+    bool GetOutputAt(size_t index, RigExecRuntimeOutput *output) const;
+    // The index of the output whose semantic address is \p semanticKey; false
+    // when the file exports none. A host that learned an address from another
+    // program looks it up here to get this reader's own handle.
+    bool FindOutput(const std::string &semanticKey, size_t *index) const;
+    // The rig-identity text and the compile epoch this reader's handles carry.
+    // Open mints the epoch: a .rigexec never carries the live identity its
+    // exporter held, so a handle from another evaluator, or from another reader
+    // of the same file, never resolves here.
+    std::string GetOutputRigIdentity() const;
+    uint64_t GetOutputCompileEpoch() const;
+    // What \p handle means to this reader: Pending for an output it can answer,
+    // Unsupported for an address it does not export or cannot produce,
+    // Invalidated for another rig instance or a stale compile epoch.
+    RigExecOutputStatus ResolveOutput(const RigExecOutputHandle &handle,
+                                      std::string *reason = nullptr) const;
+
+    // Evaluate exactly the closure of the outputs \p requested names, publish
+    // nothing, and answer each handle from the storage that run left (the same
+    // closure and availability rules the USD evaluators use, over this
+    // program's graph). The inputs must already be set for the frame asked
+    // about; the runtime does not track time. \p captured is the generation the
+    // requester holds: a handle naming a revision it no longer stands at, or a
+    // capture naming another program, is answered Invalidated with why it
+    // cannot be satisfied, never with a different answer. Returns false when
+    // the request itself is invalid (no output named, or the run did not
+    // complete); \p packets still holds one packet per handle, in request
+    // order. A handle this file does not name at all is answered Unsupported
+    // and never enters the closure.
+    bool ExecuteRequested(const std::vector<RigExecOutputHandle> &requested,
+                          const RigExecOutputTime &at,
+                          const RigExecOutputGeneration &captured,
+                          std::vector<RigExecOutputPacket> *packets,
+                          RigExecRuntimeRequestedCounts *counts = nullptr,
+                          std::string *error = nullptr);
 
     // Plugin movers: a file may hold movers an external library registered.
     // Playback runs each through the kernel the host installs for its type

@@ -501,6 +501,7 @@ add_library(rigExecRuntime STATIC
     libs/rigExecRuntime/open.cpp
     libs/rigExecRuntime/exec.cpp
     libs/rigExecRuntime/closure.cpp
+    libs/rigExecRuntime/exports.cpp
     libs/rigExecRuntime/publish.cpp
     libs/rigExecRuntime/kernels.cpp
     libs/rigExecRuntime/pose.cpp

@@ -8,16 +8,12 @@
 #include "rigExecGraph/outputDemand.h"
 
 #include <cstdint>
-#include <limits>
 #include <string>
 #include <vector>
 
 namespace rigExec {
 
 class RigExecBakedProgram;
-
-constexpr RigExecValueId kRigExecNoOutputValue =
-    std::numeric_limits<RigExecValueId>::max();
 
 /// The USD-free spelling of a RigExecValueAddress plus its exact payload type.
 struct RigExecOutputDescriptor {
@@ -27,12 +23,6 @@ struct RigExecOutputDescriptor {
     std::string type;
     std::string semanticKey;
 };
-
-/// Builds the durable semantic key for a target/public-computation/phase
-/// address. Dense program slots never enter this key.
-std::string RigExecOutputSemanticKey(const std::string &target,
-                                     const std::string &publicComputation,
-                                     const std::string &phase);
 
 enum class RigExecOutputKind {
     Scalar,

@@ -84,6 +84,31 @@ _RrIndexSkipEffects(RrProgram *p)
             skipEffects.push_back(c);
 }
 
+// Whether this run is restricted to a closure of the graph.
+bool
+_RrRunsRequested(const RrProgram &p)
+{
+    return p.store.requestedRun &&
+           p.store.requestedMask.size() == p.opGraph.ops.size();
+}
+
+// Whether an operation stands outside this run's restriction.
+bool
+_RrOutsideRequested(const RrProgram &p, uint32_t op)
+{
+    return _RrRunsRequested(p) && p.store.requestedMask[op] == 0;
+}
+
+// The seed and candidate lists stay ascending, so the executor sees the same
+// op order a cone run would.
+void
+_RrInsertAscending(std::vector<uint32_t> *list, uint32_t op)
+{
+    const auto at = std::lower_bound(list->begin(), list->end(), op);
+    if (at == list->end() || *at != op)
+        list->insert(at, op);
+}
+
 // The leaves RrOpValue keys from input slots alone, by the slots it reads
 // for them: a provider leaf its input slot, a constraint's arrays their raw
 // slots. A slot past the inputs keys as undeclared, a constant.
@@ -1384,6 +1409,7 @@ RrCompileOpGraph(RrProgram *p, std::string *error)
     // Wire steps are immutable after Open: one classification serves every run.
     auto &state = p->store.opAdapter;
     state.constantSource.assign(p->opGraph.ops.size(), 0);
+    p->store.opProduced.assign(p->opGraph.ops.size(), char(0));
     state.sourceVisits.clear();
     for (uint32_t c = 0; c < p->opGraph.ops.size(); ++c) {
         const auto &step = (*p->steps)[p->opGraph.ops[c].originalIndex];
@@ -1418,6 +1444,10 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
     // leaves what it owes the ops outside its mask for the next full run.
     const bool history =
         s.historyTick && p->historyMask.size() == p->opGraph.ops.size();
+    // A requested run (docs/specs/output-subscriptions.md): the same masked
+    // graph, restricted to the closure of the outputs a host asked for. It
+    // publishes nothing and owes what its closure left out to the next run.
+    const bool requested = _RrRunsRequested(*p);
     state.changedLeaves.clear();
     state.seeds.clear();
     state.candidateOps.clear();
@@ -1560,9 +1590,9 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
                 for (uint32_t k = p->slotSourceBegin[slot];
                      k < p->slotSourceBegin[slot + 1]; ++k)
                     sourceDirty[p->slotSourceOps[k]] = 1;
-    // A history tick keeps the slots written for the next full run, whose
-    // ops outside the mask have not read them yet.
-    if (!history) {
+    // A history tick and a requested run keep the slots written for the next
+    // run, whose ops outside the mask have not read them yet.
+    if (!history && !requested) {
         for (const uint32_t slot : inputs.written)
             inputs.writtenFlag[slot] = 0;
         inputs.written.clear();
@@ -1576,9 +1606,14 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
     s.sourceKeysBuilt = 0;
     const auto source = [&](uint32_t c) {
         // A history tick leaves an op outside its mask untouched, memo
-        // included, so the next full run still sees what moved for it.
+        // included, so the next full run still sees what moved for it. A
+        // requested run does the same for the ops its closure omits: their
+        // keys stay behind the generation they last ran in, which is what
+        // makes them change on the run that asks for them.
         if (s.historyTick && p->historyMask.size() == p->opGraph.ops.size() &&
             !p->historyMask[c])
+            return;
+        if (_RrOutsideRequested(*p, c))
             return;
         const auto i = p->opGraph.ops[c].originalIndex;
         const auto &step = (*p->steps)[i];
@@ -1675,8 +1710,74 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
             state.seeds.insert(at, c);
     }
     std::fill(s.windowRingChanged.begin(), s.windowRingChanged.end(), char(0));
+    // A requested run trusts no value this store never produced. Inside the
+    // closure an op whose writes were never published is seeded whatever its
+    // inputs say, so a request that stops early leaves no slot a later request
+    // would read as an answer. What the closure omits is carried to the next
+    // run: seeded while its values are still missing, offered as a candidate
+    // once they stand, so a key that has never been compared is never read as
+    // clean.
+    const auto writesSomethingAbsent = [&p, &state](uint32_t c) {
+        for (RigExecValueId id : p->opGraph.ops[c].descriptor.writes)
+            if (size_t(id) < state.values.size() &&
+                !state.values[size_t(id)].initialized)
+                return true;
+        return false;
+    };
+    // An operation whose body never ran here published nothing, so no equal
+    // key may stand in for its storage: it runs whatever its inputs say.
+    const auto neverRan = [&s](uint32_t c) {
+        return c >= s.opProduced.size() || s.opProduced[size_t(c)] == 0;
+    };
+    if (requested) {
+        if (s.lastRunRestricted) {
+            // The last run asked nothing about the operations this one masks
+            // in, so their clean state stands for a generation this store
+            // never produced. Recompute the closure instead of reading what
+            // that partial run left behind it.
+            const size_t existing = state.seeds.size();
+            for (uint32_t c : s.requestedOps)
+                if (c < p->opGraph.ops.size())
+                    state.seeds.push_back(c);
+            std::inplace_merge(state.seeds.begin(),
+                               state.seeds.begin() + std::ptrdiff_t(existing),
+                               state.seeds.end());
+            state.seeds.erase(
+                std::unique(state.seeds.begin(), state.seeds.end()),
+                state.seeds.end());
+        } else {
+            for (uint32_t c : s.requestedOps)
+                if (c < p->opGraph.ops.size() &&
+                    (neverRan(c) || writesSomethingAbsent(c)))
+                    _RrInsertAscending(&state.seeds, c);
+        }
+    }
+    for (uint32_t c : s.requestedDebt) {
+        if (c >= p->opGraph.ops.size())
+            continue;
+        if (neverRan(c) || writesSomethingAbsent(c))
+            _RrInsertAscending(&state.seeds, c);
+        else
+            _RrInsertAscending(&state.candidateOps, c);
+    }
+    s.requestedDebt.clear();
     RigExecOpCallbacks callbacks;
-    if (s.historyTick && p->historyMask.size() == p->opGraph.ops.size())
+    // A cone skip is the bookkeeping an operation that was asked about and
+    // found clean leaves behind: it clears the dirty flags. An operation the
+    // closure omits was never asked, so it stays out of the effect list and
+    // keeps its debt.
+    if (requested) {
+        s.requestedSkipEffects.clear();
+        for (uint32_t op : state.skipEffects)
+            if (size_t(op) < s.requestedMask.size() && s.requestedMask[op])
+                s.requestedSkipEffects.push_back(op);
+        callbacks.skipEffects = &s.requestedSkipEffects;
+    }
+    // A history tick runs only what the windowed ops depend on; a requested
+    // run only what the requested outputs need.
+    if (requested)
+        callbacks.active = &s.requestedMask;
+    else if (s.historyTick && p->historyMask.size() == p->opGraph.ops.size())
         callbacks.active = &p->historyMask;
     callbacks.changed = [&](RigExecValueId id) {
         return state.values[size_t(id)].changed != 0;
@@ -1836,6 +1937,14 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
         trace.erase(std::remove(trace.begin(), trace.end(), int32_t(-1)),
                     trace.end());
     }
+    // An operation whose body ran has published its writes to this store; a
+    // later restricted run may read them as clean, one that never ran may not.
+    if (s.opProduced.size() != p->opGraph.ops.size())
+        s.opProduced.assign(p->opGraph.ops.size(), char(0));
+    for (const uint32_t c : s.opWorkspace.pending)
+        if (c < s.opProduced.size() && c < s.opExecution.ran.size() &&
+            s.opExecution.ran[c])
+            s.opProduced[c] = 1;
     // A cluster's ran ops are consecutive in that order, so counting changes
     // of cluster counts the distinct clusters. The version checks follow it
     // too, so a serial run reports the first mismatch it reported while
@@ -1862,6 +1971,18 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
     }
     RigExecOpGatherChanges(&state, p->opGraph, s.opExecution.ran);
     RrFoldHeldSteps(p);
+    // What a restricted run left out is owed by the next one, whether this run
+    // finished or not.
+    if (requested) {
+        s.requestedDebt.clear();
+        for (uint32_t c = 0; c < p->opGraph.ops.size(); ++c)
+            if (!s.requestedMask[c])
+                s.requestedDebt.push_back(c);
+    }
+    // A restricted run asks nothing about the operations outside its mask, so
+    // their clean state no longer says what this store holds. The next
+    // restricted run recomputes its own closure; a whole run resets this.
+    s.lastRunRestricted = history || requested;
     if (!ok) {
         if (error) {
             if (failedOp >= 0)
@@ -1900,9 +2021,12 @@ RrExecuteOpGraph(RrProgram *p, bool force, std::string *error)
         return false;
     }
     s.lastClosedClusters = closedClusters;
-    if (history) {
+    if (history || requested) {
         // A history program runs nothing but ticks (RigExecRuntimeReader::
-        // _history): each one is its run, so the next compares with it.
+        // _history): each one is its run, so the next compares with it. A
+        // requested run publishes nothing either: the caller reads its
+        // outputs from the storage this run left, and an owed full pass keeps
+        // its flag.
         RrPropertyPublish(p);
         state.everRan = true;
         s.everRan = true;
@@ -1930,6 +2054,74 @@ bool
 RrRunSteps(RrProgram *p, bool force, std::string *error)
 {
     return RrExecuteOpGraph(p, force, error);
+}
+
+bool
+RrBeginRequestedRun(RrProgram *p, const RigExecDemandClosure &requested,
+                    std::string *error)
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    auto &s = p->store;
+    const size_t opCount = p->opGraph.ops.size();
+    if (!s.opAdapter.compiled || opCount == 0)
+        return fail("this program has no canonical operation graph");
+    if (s.historyTick)
+        return fail("a history tick cannot also be a requested run");
+    if (requested.ops.empty())
+        return fail("requested run names no operation");
+    uint32_t previous = 0;
+    bool leading = true;
+    for (uint32_t op : requested.ops) {
+        if (op >= opCount)
+            return fail("requested run names an operation outside the graph");
+        if (!leading && op <= previous)
+            return fail("requested run names operations out of order, or the "
+                        "same one twice");
+        previous = op;
+        leading = false;
+    }
+    std::string reason;
+    if (!RigExecClosureIsClosed(p->opGraph, requested, &reason))
+        return fail("requested closure: " + reason);
+    std::vector<char> mask(opCount, 0);
+    for (uint32_t op : requested.ops)
+        mask[size_t(op)] = 1;
+    s.requestedMask = std::move(mask);
+    s.requestedOps = requested.ops;
+    s.requestedRun = true;
+    return true;
+}
+
+void
+RrEndRequestedRun(RrProgram *p)
+{
+    auto &s = p->store;
+    s.requestedRun = false;
+    s.requestedMask.clear();
+    s.requestedOps.clear();
+    s.requestedSkipEffects.clear();
+}
+
+void
+RrRequestedRunCounts(const RrProgram *p, size_t *requested, size_t *executed,
+                     size_t *clusters)
+{
+    const auto &s = p->store;
+    size_t ran = 0;
+    for (uint32_t op : s.requestedOps)
+        if (op < p->opGraph.ops.size() && op < s.opExecution.ran.size() &&
+            s.opExecution.ran[op])
+            ++ran;
+    if (requested)
+        *requested = s.requestedOps.size();
+    if (executed)
+        *executed = ran;
+    if (clusters)
+        *clusters = s.lastClosedClusters;
 }
 
 } // namespace rigExec

@@ -229,6 +229,34 @@ Scene lowering maps an authored value to one of those spellings in
 `RigExecResolveOutputDescriptor` (`libs/rigExecScene/outputDescriptors.h`),
 which reads stage identity and type metadata only and authors nothing.
 
+## Reading it from a `.rigexec`
+
+A baked program writes the catalog it discovered into the file's
+`export_catalog` (format version 32): entries in ascending semantic-key order,
+each naming a semantic address, its payload layout, its storage, the object and
+version of the file's own table that retains it, and its capability with a
+reason when it is unusable. `RigExecRuntimeReader::Open` validates that table —
+order, enum agreement, object and version bounds, and that the producer value's
+domain matches the storage the entry names — and binds each entry to the
+retained storage of this reader. An entry whose storage the reader cannot
+produce stays `Unsupported` with the reason the file recorded.
+
+| Declaration | Says |
+| --- | --- |
+| `GetOutputCount` / `GetOutputAt` | The file's own list, as it wrote it. A file older than the catalog names nothing. |
+| `FindOutput(semanticKey, index)` | This reader's index of an address a host learned elsewhere, so it can mint the handle this reader answers. |
+| `GetOutputRigIdentity` / `GetOutputCompileEpoch` | The identity and epoch this reader's handles carry. A `.rigexec` never carries the live identity its exporter held, so Open mints the epoch: a handle from another evaluator, or another reader of the same file, resolves `Invalidated`. |
+| `ResolveOutput(handle, reason)` | What an address means to this reader before anything runs. |
+| `ExecuteRequested(requested, at, captured, packets, counts, error)` | Run exactly the union of the named closures on this reader's store, publish nothing, and answer each handle from the storage that run left. |
+
+- **A restricted run recomputes its own closure.** The run before it may have
+  been restricted too, and the operations it masked out were never asked about,
+  so their clean state says nothing about what this store holds. A whole run
+  resets that. See "What a run leaves out is owed, not trusted" above.
+- **An older bake is not guessed at.** A file older than the catalog exposes the
+  getters it always had, names no outputs, and refuses a request with a reason
+  rather than resolving an address it never recorded.
+
 ## Background admission
 
 A subscription service runs the work behind a request on the existing
