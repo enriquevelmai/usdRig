@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -582,6 +583,16 @@ RigExecImagingRegistry::_PrependPendingRewarm(
         RigExecFrameCacheCompiledRigSignature(session->bridge->GetEvaluator());
     const std::vector<RigExecWarmFrameState> states = _warmIndex->States(
         session->rigPath, session->pendingRewarm, generation, compiledRig);
+    // A demanded frame already holds an exact output request on the pool
+    // (registryFrameDemand.cpp); the rewarm lane keeps it as a fallback but
+    // never queues a second job that computes the same answer.
+    std::set<double> explicitInFlight;
+    for (const RigExecExplicitJobKey &key :
+         _scheduler->InFlightExplicitKeys(session->rigPath)) {
+        if (!key.time.IsDefault()) {
+            explicitInFlight.insert(key.time.TimeCode());
+        }
+    }
     std::vector<std::pair<double, double>> scored;
     std::vector<double> keep;
     for (size_t i = 0; i < session->pendingRewarm.size(); ++i) {
@@ -592,7 +603,8 @@ RigExecImagingRegistry::_PrependPendingRewarm(
             continue;
         }
         keep.push_back(time);
-        if (state == RigExecWarmFrameState::Warming) {
+        if (state == RigExecWarmFrameState::Warming ||
+            explicitInFlight.count(time)) {
             continue;
         }
         scored.emplace_back(std::abs(time - center), time);

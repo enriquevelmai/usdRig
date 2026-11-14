@@ -420,8 +420,49 @@ RigExecImagingBridge::PublishResult
 RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
 {
     RigExecImagingBridge::PublishResult result;
-    if (!_reader) {
+    std::shared_ptr<RigExecImagingSnapshot> snapshot;
+    std::string why;
+    if (!_RunAndBuildGeneration(time, /*publishing = */ true, &snapshot,
+                                &result, &why)) {
         return result;
+    }
+    result.dirtied = _store->Publish(std::move(snapshot));
+    result.ok = true;
+    return result;
+}
+
+bool
+RigExecBakedPlayback::ProduceAtTimeWithoutPublishing(
+    UsdTimeCode time, RigExecImagingSnapshotConstPtr *snapshot,
+    std::string *error)
+{
+    if (snapshot) {
+        snapshot->reset();
+    }
+    RigExecImagingBridge::PublishResult ignored;
+    std::string why;
+    std::shared_ptr<RigExecImagingSnapshot> built;
+    if (!_RunAndBuildGeneration(time, /*publishing = */ false, &built, &ignored,
+                                &why)) {
+        if (error && !why.empty()) {
+            *error = why;
+        }
+        return false;
+    }
+    if (snapshot) {
+        *snapshot = std::move(built);
+    }
+    return true;
+}
+
+bool
+RigExecBakedPlayback::_RunAndBuildGeneration(
+    UsdTimeCode time, bool publishing,
+    std::shared_ptr<RigExecImagingSnapshot> *snapshot,
+    RigExecImagingBridge::PublishResult *result, std::string *errorOut)
+{
+    if (!_reader) {
+        return false;
     }
     std::string why;
     // Upstream values go in after Apply, never through
@@ -455,24 +496,28 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
         ran = _reader->Execute(&why);
     }
     if (!ran) {
-        // The bridge's rule: a rig that cannot evaluate stops driving the
-        // scene, and the next good generation re-announces its compiled rig.
-        result.dirtied = _store->Publish(nullptr);
-        _publishedCompiledRigSignature = 0;
+        if (publishing) {
+            // The bridge's rule: a rig that cannot evaluate stops driving the
+            // scene, and the next good generation re-announces its compiled
+            // rig. A detached production touches no store and retires no
+            // publication state.
+            result->dirtied = _store->Publish(nullptr);
+            _publishedCompiledRigSignature = 0;
+        }
         _historyHave = false;
-        return result;
+        return false;
     }
     _historyTime = time;
     _historyHave = true;
 
-    auto snapshot = std::make_shared<RigExecImagingSnapshot>();
-    snapshot->generation = ++_generation;
+    auto built = std::make_shared<RigExecImagingSnapshot>();
+    built->generation = ++_generation;
     // The requested time: the merge only accepts a generation that
     // describes the stage/time it asked for.
-    snapshot->stage = UsdStageWeakPtr(_stage);
-    snapshot->sampleTimeIsDefault = time.IsDefault();
-    snapshot->sampleTime = time.IsDefault() ? 0.0 : time.GetValue();
-    snapshot->assetRoot = _assetRoot;
+    built->stage = UsdStageWeakPtr(_stage);
+    built->sampleTimeIsDefault = time.IsDefault();
+    built->sampleTime = time.IsDefault() ? 0.0 : time.GetValue();
+    built->assetRoot = _assetRoot;
 
     const TfToken &pointsName = _playbackTokens->points;
     const TfToken &normalsName = _playbackTokens->normals;
@@ -489,7 +534,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
         RigExecPublishedPrim *published = nullptr;
         if (property == pointsName || isNormals ||
             (property == extentName && moved.points.size() == 2)) {
-            published = &snapshot->prims[primPath];
+            published = &built->prims[primPath];
             published->assetRoot = _assetRoot;
         } else {
             continue;
@@ -528,7 +573,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
         if (!output.ok || !output.isProperty || output.primvar.IsEmpty()) {
             continue;
         }
-        RigExecPublishedPrim &published = snapshot->prims[output.primPath];
+        RigExecPublishedPrim &published = built->prims[output.primPath];
         published.assetRoot = _assetRoot;
         published.shaderFloats[output.primvar] = scalar.value;
     }
@@ -562,7 +607,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
         GfMatrix4d matrix(1.0);
         if (!RigExecPointsToMatrix(identityFrame.points, points, &matrix))
             continue;
-        auto &published = snapshot->prims[provider.path];
+        auto &published = built->prims[provider.path];
         published.assetRoot = _assetRoot;
         published.hasControlFrame = true;
         published.controlFrame = matrix;
@@ -579,7 +624,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
             continue;
         }
         const SdfPath &providerPath = output.path;
-        RigExecPublishedPrim &published = snapshot->prims[providerPath];
+        RigExecPublishedPrim &published = built->prims[providerPath];
         published.assetRoot = _assetRoot;
         published.xform = GfMatrix4d(
             provider.matrix[0][0], provider.matrix[0][1], provider.matrix[0][2],
@@ -596,7 +641,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
             provider.base[3][0], provider.base[3][1], provider.base[3][2],
             provider.base[3][3]);
         published.hasXform = true;
-        snapshot->hasDrivenXforms = true;
+        built->hasDrivenXforms = true;
         providerRoots.push_back(providerPath);
     }
     // Authored reset boundaries beneath driven roots, captured while the
@@ -628,7 +673,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
         _xformResetRoots = std::move(providerRoots);
         _xformResetsValid = true;
     }
-    snapshot->xformResetPaths = _xformResetPaths;
+    built->xformResetPaths = _xformResetPaths;
 
     // The influence overlay, from the fields the runtime published --
     // what the movers consumed, not a re-derivation, like the bridge.
@@ -650,7 +695,7 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
             if (geomPath.IsEmpty() || geomPath.IsAbsoluteRootPath()) {
                 continue;
             }
-            RigExecPublishedPrim &published = snapshot->prims[geomPath];
+            RigExecPublishedPrim &published = built->prims[geomPath];
             published.assetRoot = _assetRoot;
             published.hasWeightOverlay = true;
             const auto source = field.weights.Share();
@@ -665,21 +710,20 @@ RigExecBakedPlayback::EvaluateAndPublishResult(UsdTimeCode time)
     }
 
     // One compiled rig ever: the digest is stable per file, so only the first
-    // publication carries it.
-    if (_compiledRigSignature != _publishedCompiledRigSignature) {
+    // publication carries it. A detached production announces nothing: the
+    // stamp stands until an actual publication carries it.
+    if (publishing && _compiledRigSignature != _publishedCompiledRigSignature) {
         auto compiledRig = std::make_shared<
             RigExecBindingResolvingSceneIndex::CompiledRigBinding>();
         compiledRig->id = _compiledRigSignature;
-        for (const auto &[primPath, published] : snapshot->prims) {
+        for (const auto &[primPath, published] : built->prims) {
             compiledRig->publishedPrims.insert(primPath);
         }
-        result.compiledRig = std::move(compiledRig);
+        result->compiledRig = std::move(compiledRig);
         _publishedCompiledRigSignature = _compiledRigSignature;
     }
-
-    result.dirtied = _store->Publish(std::move(snapshot));
-    result.ok = true;
-    return result;
+    *snapshot = std::move(built);
+    return true;
 }
 
 } // namespace rigExec

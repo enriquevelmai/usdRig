@@ -71,9 +71,8 @@ enum class RrInputTag : uint8_t;
 /// the first EvaluateAndPublishResult.
 class RigExecBakedPlayback {
 public:
-    RigExecBakedPlayback(
-        const UsdStageRefPtr &stage, const SdfPath &rigPath,
-        std::shared_ptr<RigExecSnapshotStore> store);
+    RigExecBakedPlayback(const UsdStageRefPtr &stage, const SdfPath &rigPath,
+                         std::shared_ptr<RigExecSnapshotStore> store);
     // Out of line: the reader's destructor lives in the runtime library.
     ~RigExecBakedPlayback();
 
@@ -85,7 +84,10 @@ public:
     bool Open(const std::string &resolvedPath, std::string *error);
 
     /// The opened file, empty until Open succeeds.
-    const std::string &GetAssetPath() const { return _assetPath; }
+    const std::string &GetAssetPath() const
+    {
+        return _assetPath;
+    }
 
     /// Plays the binary over the stage's input values at \p time and
     /// publishes the complete generation, without notifying any scene
@@ -93,8 +95,18 @@ public:
     /// binary refuses clears the store (the bridge's rule: an unevaluated
     /// result is recoverable, a plausible wrong one is not) and returns
     /// ok == false.
-    RigExecImagingBridge::PublishResult EvaluateAndPublishResult(
-        UsdTimeCode time);
+    RigExecImagingBridge::PublishResult
+    EvaluateAndPublishResult(UsdTimeCode time);
+
+    /// Plays the binary over the stage's input values at \p time and returns
+    /// the complete generation WITHOUT publishing: the store the display reads
+    /// is never touched, so an off-frame production (frameTable.h) needs no
+    /// evaluate-and-restore. False, with the reason, when the binary refuses
+    /// the run; a refused detached run clears nothing.
+    bool
+    ProduceAtTimeWithoutPublishing(UsdTimeCode time,
+                                   RigExecImagingSnapshotConstPtr *snapshot,
+                                   std::string *error = nullptr);
 
     /// The stage changed: the next evaluation at a new time reads every
     /// bound input again, the static ones included, and re-decides which
@@ -104,7 +116,10 @@ public:
 
     /// Stable per file (FNV-1a over the bytes): the published prim set of
     /// a binary never changes, so one compiled rig is published ever.
-    uint64_t GetCompiledRigSignature() const { return _compiledRigSignature; }
+    uint64_t GetCompiledRigSignature() const
+    {
+        return _compiledRigSignature;
+    }
 
     /// The reserved generated scope this rig owns (for pruning). Playback
     /// publishes nothing under it; the scope keeps the pruning behavior
@@ -113,11 +128,15 @@ public:
 
     /// Selects the weight object painted as the influence overlay; empty
     /// turns it off. Takes effect on the next publication.
-    void SetWeightOverlay(const SdfPath &weightPrimPath) {
+    void SetWeightOverlay(const SdfPath &weightPrimPath)
+    {
         _weightOverlay = weightPrimPath;
     }
 
-    const SdfPath &GetWeightOverlay() const { return _weightOverlay; }
+    const SdfPath &GetWeightOverlay() const
+    {
+        return _weightOverlay;
+    }
 
     /// Upstream values for this rig: authored-level, each replacing the
     /// stage value of its attribute at every time. The list replaces the
@@ -131,7 +150,8 @@ public:
     void SetUpstreamInputs(std::vector<RigExecUpstreamValue> values);
 
     /// The list SetUpstreamInputs last received.
-    const std::vector<RigExecUpstreamValue> &GetUpstreamInputs() const {
+    const std::vector<RigExecUpstreamValue> &GetUpstreamInputs() const
+    {
         return _upstreamRequested;
     }
 
@@ -139,12 +159,14 @@ public:
     std::vector<SdfPath> GetUpstreamInputPaths() const;
 
     /// One line per key the last admission ignored, in the order given.
-    const std::vector<std::string> &GetUpstreamDropLines() const {
+    const std::vector<std::string> &GetUpstreamDropLines() const
+    {
         return _upstreamDropLines;
     }
 
     /// The reader, for tests that compare its outputs; null before Open.
-    const RigExecRuntimeReader *GetReaderForTesting() const {
+    const RigExecRuntimeReader *GetReaderForTesting() const
+    {
         return _reader.get();
     }
 
@@ -157,6 +179,18 @@ private:
         UsdAttribute attribute;
         VtValue value;
     };
+
+    // The shared core of both entries: prepare history, inputs and upstream
+    // values at \p time, run the reader, and build the complete generation
+    // into \p *snapshot. \p publishing selects the store-visible side
+    // effects only (the cleared store on failure, the compiled-rig
+    // re-announcement); the store itself is the caller's. \p result carries
+    // the publish-mode dirtied/compiled-rig notices.
+    bool
+    _RunAndBuildGeneration(UsdTimeCode time, bool publishing,
+                           std::shared_ptr<RigExecImagingSnapshot> *snapshot,
+                           RigExecImagingBridge::PublishResult *result,
+                           std::string *why);
 
     void _AdmitUpstream(UsdTimeCode time);
     bool _ApplyUpstream(UsdTimeCode time, std::string *error);
@@ -242,6 +276,6 @@ private:
 /// unresolvable), in which case the rig evaluates live.
 bool RigExecPlaybackAssetFor(const UsdPrim &rig, std::string *resolvedPath);
 
-}  // namespace rigExec
+} // namespace rigExec
 
-#endif  // RIGEXEC_IMAGING_PLAYBACK_H
+#endif // RIGEXEC_IMAGING_PLAYBACK_H

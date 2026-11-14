@@ -84,6 +84,7 @@
 namespace rigExec {
 
 class RigExecImagingDirectory;
+class RigExecOutputCatalog;
 struct RigExecWarmWorkspacePool;
 
 /// The span an upstream pull reconstructs (RigExecImagingRegistry::
@@ -282,16 +283,19 @@ public:
     /// Turns the frames Hydra readers asked for at a time offset into
     /// frame-table entries, at most \p maxFrames per call, nearest the
     /// playhead first. NEVER evaluates a live rig: a frame the frame cache
-    /// holds becomes an entry; any other one is queued for the background
-    /// workers (the rewarm lane the idle sweep visits first) and stays
-    /// pending. A .rigexec playback plays its binary at the frame. Waits
-    /// while an interactive preview stands. Sends PrimsDirtied for the
-    /// rig's outputs when entries were added or a stale table was dropped.
+    /// holds becomes an entry; any other one is admitted as an exact output
+    /// request on the existing pool (docs/specs/output-subscriptions.md),
+    /// which runs ahead of every speculative warm job and stays admitted
+    /// when warming is off, and stays pending until that job publishes the
+    /// complete pose. A .rigexec playback produces the frame as a detached
+    /// generation, without publishing over the display. Waits while an
+    /// interactive preview stands. Sends PrimsDirtied for the rig's outputs
+    /// when entries were added or a stale table was dropped.
     /// With \p allowFallback (OnIdle passes it; playback never does), a
-    /// frame still pending after kFrameDemandFallbackAge calls -- a rig
-    /// that cannot warm in the background, or a frame outside the warm
-    /// window -- is evaluated on this thread, at most one per call, so
-    /// every asked-for frame is eventually answered.
+    /// frame still pending after kFrameDemandFallbackAge calls with no
+    /// background job in flight -- a rig no exact request can answer, or a
+    /// frame the request caps declined -- is evaluated on this thread, at
+    /// most one per call, so every asked-for frame is eventually answered.
     /// Returns the entries added. Owner thread; OnIdle calls it first.
     size_t ServiceFrameDemand(size_t maxFrames = 8, bool allowFallback = false);
     static constexpr int kFrameDemandFallbackAge = 40;
@@ -1225,6 +1229,32 @@ private:
                             std::shared_ptr<RigExecImagingSnapshot> *frame,
                             bool evaluate = false);
     void _BroadcastFramesChanged();
+
+    /// Explicit demand admission (docs/specs/output-subscriptions.md):
+    /// frames Hydra readers demanded are exact output requests on the
+    /// existing pool, not speculative warming: they run ahead of every warm
+    /// job and stay admitted when speculative warming is off. The job still
+    /// publishes the complete pose, so frame-table publication still
+    /// requires complete compatible rig coverage. Owner thread; the request
+    /// identity never uses a rounded time.
+    struct _DemandCatalogEntry {
+        uint64_t epoch = 0;
+        std::shared_ptr<const RigExecOutputCatalog> catalog;
+    };
+    /// The catalog of each rig's current compile epoch, rebuilt when the
+    /// epoch moves. An empty catalog means the epoch cannot answer an exact
+    /// request: the rewarm lane stays that frame's route. _mutex held.
+    std::map<SdfPath, _DemandCatalogEntry> _demandCatalogs;
+    /// Admits the demanded frames as explicit output requests on the
+    /// scheduler, sampling each job's work on the calling (owner) thread
+    /// like the warm triggers do. Runs OUTSIDE _mutex: BuildWarmWork takes
+    /// it per factory call, and the scheduler owns admission and fences.
+    /// Returns how many jobs were admitted or coalesced.
+    size_t _AdmitDemandWork(const std::vector<double> &times);
+    /// True while a background job (warm or explicit) for \p time runs for
+    /// any session: the frame's answer is coming, so neither the rewarm lane
+    /// nor the calling-thread fallback should duplicate it. _mutex held.
+    bool _DemandWorkInFlightLocked(double time) const;
 
     /// Millisecond slice for one standing-burst rebuild; see
     /// SetWarmBurstPrepSliceMs. UI thread, _mutex held.

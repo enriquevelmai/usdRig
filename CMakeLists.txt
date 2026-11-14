@@ -1918,7 +1918,8 @@ add_test(NAME testRigExecImagingPlayback COMMAND testRigExecImagingPlayback
     "${CMAKE_CURRENT_SOURCE_DIR}/examples")
 # Frames on demand: rig outputs sampled at a time offset through Hydra.
 add_executable(testRigExecFrameDemand tests/testRigExecFrameDemand.cpp)
-target_link_libraries(testRigExecFrameDemand PRIVATE rigExecImaging rigExecBake rigExec)
+target_link_libraries(testRigExecFrameDemand PRIVATE rigExecImaging rigExecBake
+    rigExec rigExecRuntime)
 target_compile_definitions(testRigExecFrameDemand PRIVATE
     ${_rigexec_schema_resource_define} ${_rigexec_imaging_resource_define}
     RIGEXEC_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")

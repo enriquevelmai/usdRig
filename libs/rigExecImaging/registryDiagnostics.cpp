@@ -52,6 +52,22 @@ _AddSchedulerStats(RigExecBackgroundSchedulerStats *into,
     into->declinedD7Exempt += from.declinedD7Exempt;
     into->droppedAtShutdown += from.droppedAtShutdown;
     into->factoryInvocations += from.factoryInvocations;
+    into->explicitAccepted += from.explicitAccepted;
+    into->explicitCoalesced += from.explicitCoalesced;
+    into->explicitDeclined += from.explicitDeclined;
+    into->explicitDeclinedBytes += from.explicitDeclinedBytes;
+    into->explicitCompleted += from.explicitCompleted;
+    into->explicitPublished += from.explicitPublished;
+    into->explicitDeclinedInvalid += from.explicitDeclinedInvalid;
+    into->explicitDeclinedGeneration += from.explicitDeclinedGeneration;
+    into->explicitDroppedStale += from.explicitDroppedStale;
+    into->explicitCanceled += from.explicitCanceled;
+    into->explicitDroppedAtShutdown += from.explicitDroppedAtShutdown;
+    if (gauges) {
+        into->explicitQueuedDepth += from.explicitQueuedDepth;
+        into->explicitRunning += from.explicitRunning;
+        into->explicitReservedBytes += from.explicitReservedBytes;
+    }
 }
 
 size_t

@@ -4,10 +4,18 @@
 // how a host reads a frame the display does not hold (docs/specs/
 // frames-on-demand.md). It never evaluates a live rig except through the
 // documented opt-in fallback, never samples topology per frame, and adds no
-// time record to any .rigexec.
+// time record to any .rigexec. A frame the cache does not hold becomes an
+// exact output request on the existing pool (docs/specs/
+// output-subscriptions.md): what a reader asked for is not speculative
+// warming, so it runs ahead of the warm sweep and stays admitted when
+// speculative warming is off. The job still publishes a complete pose, and
+// the table entry is still built from complete compatible rig coverage.
 #include "registry.h"
 
 #include "frameTable.h"
+
+#include "rigExec/backgroundScheduler.h"
+#include "rigExec/outputCatalog.h"
 
 #include "pxr/base/work/utils.h"
 #include "pxr/usd/usd/stage.h"
@@ -24,6 +32,17 @@
 #include <vector>
 
 namespace rigExec {
+
+namespace {
+
+// Coarse per-job reservation for one demanded full-frame request: the
+// sampled vector plus the pose its completion publishes. The pool bounds
+// queued bytes by it before allocating; the per-payload charge belongs to
+// the subscription lifecycle (outputSubscription.h), not to this pose
+// route.
+constexpr size_t kRigExecDemandJobReservationBytes = size_t(4) * 1024 * 1024;
+
+} // namespace
 
 uint64_t
 RigExecImagingRegistry::_FrameTableStampLocked() const
@@ -73,16 +92,12 @@ RigExecImagingRegistry::_CachedFrameLocked(
         bool ok = false;
         if (session.playback) {
             // A .rigexec playback has no frame cache: it plays its binary
-            // at the time into its own store (the chains read the combined
-            // store, never this one) and the displayed one is put back.
-            const RigExecImagingSnapshotConstPtr shown = session.store->Get();
-            const RigExecImagingBridge::PublishResult played =
-                session.playback->EvaluateAndPublishResult(at);
-            part = session.store->Get();
-            session.store->Replace(
-                shown ? std::make_shared<RigExecImagingSnapshot>(*shown)
-                      : nullptr);
-            ok = played.ok && part && part->Describes(_stage, at);
+            // at the time into a detached generation (the chains read the
+            // combined store, never this one). The production never
+            // publishes, so the displayed generation is never touched and
+            // never restored.
+            ok = session.playback->ProduceAtTimeWithoutPublishing(at, &part);
+            ok = ok && part && part->Describes(_stage, at);
         } else if (session.bridge) {
             std::string diagnostic;
             bool evaluated = false;
@@ -145,6 +160,10 @@ RigExecImagingRegistry::ServiceFrameDemand(size_t maxFrames, bool allowFallback)
 {
     size_t added = 0;
     bool reset = false;
+    // Frames this call found missing from every cache: admitted as exact
+    // output requests below, outside the lock.
+    std::vector<double> admit;
+    bool previewing = false;
     {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_sessions.empty() || !_stage) {
@@ -156,7 +175,7 @@ RigExecImagingRegistry::ServiceFrameDemand(size_t maxFrames, bool allowFallback)
         reset = _frameTable->ResetIfStale(_FrameTableStampLocked());
         // A live preview's displayed pose is not the authored one; frames
         // asked for meanwhile wait for it to end.
-        bool previewing = _previewActive;
+        previewing = _previewActive;
         for (const RigSession &session : _sessions) {
             previewing = previewing ||
                          (session.bridge &&
@@ -189,9 +208,11 @@ RigExecImagingRegistry::ServiceFrameDemand(size_t maxFrames, bool allowFallback)
             if (!previewing && added < maxFrames) {
                 bool ready = _CachedFrameLocked(time, &frame);
                 if (!ready && allowFallback && !fallbackUsed &&
-                    age >= kFrameDemandFallbackAge) {
-                    // Still not warmed: one evaluation here, so the frame
-                    // is answered even when no worker ever will.
+                    age >= kFrameDemandFallbackAge &&
+                    !_DemandWorkInFlightLocked(time)) {
+                    // Still not warmed and no background job for it is
+                    // in flight: one evaluation here, so the frame is
+                    // answered even when no worker ever will.
                     fallbackUsed = true;
                     ready = _CachedFrameLocked(time, &frame,
                                                /* evaluate = */ true);
@@ -201,6 +222,7 @@ RigExecImagingRegistry::ServiceFrameDemand(size_t maxFrames, bool allowFallback)
                     ++added;
                     continue;
                 }
+                admit.push_back(time);
             }
             if (_pendingFrameDemand.size() < RigExecFrameTable::kMaxDemand) {
                 _pendingFrameDemand.push_back(time);
@@ -209,10 +231,220 @@ RigExecImagingRegistry::ServiceFrameDemand(size_t maxFrames, bool allowFallback)
         }
         _pendingFrameAge.swap(ages);
     }
+    // Unlocked: the exact-request admission samples its jobs on this
+    // thread (BuildWarmWork takes _mutex per factory call), and the
+    // scheduler owns admission, coalescing and the fences.
+    if (!previewing && !admit.empty()) {
+        _AdmitDemandWork(admit);
+    }
     if (added || reset) {
         _BroadcastFramesChanged();
     }
     return added;
+}
+
+bool
+RigExecImagingRegistry::_DemandWorkInFlightLocked(double time) const
+{
+    if (!_scheduler) {
+        return false;
+    }
+    for (const RigSession &session : _sessions) {
+        if (session.playback) {
+            continue;
+        }
+        for (const UsdTimeCode &at :
+             _scheduler->InFlightTimes(session.rigPath)) {
+            if (at.IsNumeric() && at.GetValue() == time) {
+                return true;
+            }
+        }
+        for (const RigExecExplicitJobKey &key :
+             _scheduler->InFlightExplicitKeys(session.rigPath)) {
+            if (!key.time.IsDefault() && key.time.TimeCode() == time) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+size_t
+RigExecImagingRegistry::_AdmitDemandWork(const std::vector<double> &times)
+{
+    if (times.empty()) {
+        return 0;
+    }
+    // What each non-playback rig still owes, resolved under short locks;
+    // the sampling below runs outside _mutex, exactly as the commit and
+    // idle triggers sample outside theirs.
+    struct Candidate {
+        SdfPath rig;
+        std::vector<double> times;
+        RigExecFrameGeneration generation = 0;
+        // The identity every request of this rig shares: program epoch,
+        // input revision, output handles, edit generation, reservation.
+        RigExecExplicitRequest base;
+    };
+    std::vector<Candidate> candidates;
+    std::shared_ptr<RigExecBackgroundScheduler> scheduler;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_scheduler || !_stage) {
+            return 0;
+        }
+        scheduler = _scheduler;
+        for (RigSession &session : _sessions) {
+            if (session.playback || !session.bridge) {
+                continue;
+            }
+            // A pose the query lookup refuses to serve answers nothing:
+            // with the cache off the demand path's only route stays the
+            // aged calling-thread fill.
+            if (session.bridge->GetFrameCacheMode() ==
+                RigExecFrameCacheMode::Off) {
+                continue;
+            }
+            const RigExecRigEvaluator &evaluator =
+                session.bridge->GetEvaluator();
+            const uint64_t epoch = evaluator.GetCompiledRigSignature();
+            _DemandCatalogEntry &entry = _demandCatalogs[session.rigPath];
+            if (entry.epoch != epoch) {
+                entry.epoch = epoch;
+                entry.catalog.reset();
+                auto catalog = std::make_shared<RigExecOutputCatalog>();
+                std::string error;
+                const RigExecBakedProgram *program =
+                    evaluator.GetBakedProgram();
+                if (program && RigExecDiscoverOutputs(
+                                   *program, session.rigPath.GetString(), epoch,
+                                   catalog.get(), &error)) {
+                    entry.catalog = std::move(catalog);
+                }
+            }
+            if (!entry.catalog) {
+                continue; // this epoch cannot answer an exact request
+            }
+            std::vector<RigExecOutputHandle> outputs;
+            for (const RigExecOutputBinding &binding :
+                 entry.catalog->GetBindings()) {
+                if (binding.status == RigExecOutputStatus::Pending) {
+                    outputs.push_back(binding.handle);
+                }
+            }
+            if (outputs.empty()) {
+                continue;
+            }
+            const RigExecFrameGeneration generation =
+                _scheduler->CurrentGeneration(session.rigPath);
+            Candidate candidate;
+            candidate.rig = session.rigPath;
+            candidate.generation = generation;
+            candidate.base.rig = session.rigPath;
+            // The exact identity: the compiled epoch as the program
+            // identity, the stage serial as the input revision. The time
+            // is per request and never rounded.
+            candidate.base.generation.programIdentity = epoch;
+            candidate.base.generation.inputRevision =
+                evaluator.GetStageEditSerial();
+            candidate.base.generation.previewRevision = 0;
+            candidate.base.generation.historyRevision = 0;
+            candidate.base.outputs = std::move(outputs);
+            candidate.base.editGeneration = generation;
+            candidate.base.reservationBytes = kRigExecDemandJobReservationBytes;
+            const std::vector<RigExecWarmFrameState> states =
+                _warmIndex
+                    ? _warmIndex->States(
+                          session.rigPath, times, generation,
+                          RigExecFrameCacheCompiledRigSignature(evaluator))
+                    : std::vector<RigExecWarmFrameState>();
+            std::set<double> explicitInFlight;
+            for (const RigExecExplicitJobKey &key :
+                 _scheduler->InFlightExplicitKeys(session.rigPath)) {
+                if (!key.time.IsDefault()) {
+                    explicitInFlight.insert(key.time.TimeCode());
+                }
+            }
+            const std::vector<UsdTimeCode> warmInFlight =
+                _scheduler->InFlightTimes(session.rigPath);
+            for (size_t i = 0; i < times.size(); ++i) {
+                const double time = times[i];
+                if (!std::isfinite(time)) {
+                    continue;
+                }
+                // Cached frames need no job; a Warming state or an
+                // in-flight job of either class means the answer is
+                // already coming -- never admit a duplicate of it.
+                if (i < states.size() &&
+                    states[i] != RigExecWarmFrameState::Uncached) {
+                    continue;
+                }
+                if (explicitInFlight.count(time)) {
+                    continue;
+                }
+                bool warmRunning = false;
+                for (const UsdTimeCode &at : warmInFlight) {
+                    if (at.IsNumeric() && at.GetValue() == time) {
+                        warmRunning = true;
+                        break;
+                    }
+                }
+                if (warmRunning) {
+                    continue;
+                }
+                candidate.times.push_back(time);
+                if (candidate.times.size() >= _warmSamplingMaxInvocations) {
+                    break;
+                }
+            }
+            if (!candidate.times.empty()) {
+                candidates.push_back(std::move(candidate));
+            }
+        }
+    }
+    if (!scheduler) {
+        return 0;
+    }
+    size_t admitted = 0;
+    for (const Candidate &candidate : candidates) {
+        for (const double time : candidate.times) {
+            // The same owner-thread factory the warm triggers use: sample
+            // the frame's input vector, take the freshness proof, and
+            // build the frozen job that publishes the complete pose
+            // behind the fences.
+            RigExecWarmFactoryResult built =
+                BuildWarmWork(candidate.rig, UsdTimeCode(time),
+                              candidate.generation, RigExecFrozenStepRunner());
+            if (!built.work) {
+                continue; // reasoned skip: the rewarm lane stays its route
+            }
+            RigExecExplicitRequest request = candidate.base;
+            if (!RigExecOutputTime::TryTimeCode(time, &request.time)) {
+                continue;
+            }
+            const RigExecWarmWork warm = std::move(built.work);
+            // The warm job body is the work; it re-checks the fence with
+            // the stamped token before publishing. Numeric times carry
+            // the same per-time token for both classes.
+            RigExecExplicitWork work =
+                [warm](const RigExecExplicitRequest &stamped) {
+                    RigExecWarmRequest legacy;
+                    legacy.rig = stamped.rig;
+                    legacy.time = stamped.time.IsDefault()
+                                      ? UsdTimeCode::Default()
+                                      : UsdTimeCode(stamped.time.TimeCode());
+                    legacy.generation = stamped.editGeneration;
+                    legacy.fenceToken = stamped.fenceToken;
+                    return warm(legacy);
+                };
+            if (scheduler->AdmitExplicitOutput(request, std::move(work))) {
+                ++admitted;
+            }
+            // A decline (job or byte cap) leaves the frame pending: the
+            // rewarm lane and the aged fill stay its route.
+        }
+    }
+    return admitted;
 }
 
 bool

@@ -23,17 +23,28 @@ that a rig produced it.
 - **Answered later.** On the owner (UI) thread,
   `RigExecImagingRegistry::ServiceFrameDemand` turns demand into entries:
   - A frame the frame cache holds becomes an entry.
-  - Any other frame joins the rewarm lane, which the idle sweep enqueues
-    first, so the background workers warm it.
-  - A `.rigexec` playback plays its binary at the frame instead.
+  - Any other frame is admitted as an **exact output request** on the
+    existing background pool (docs/specs/output-subscriptions.md): keyed
+    by rig, exact time and compiled epoch -- never a rounded key -- it
+    runs ahead of every speculative warm job and stays admitted when
+    warming is off. Its job publishes the complete pose, so an entry
+    still requires complete compatible rig coverage. The rewarm lane
+    stays the fallback when no exact request can be built or a request
+    cap declines, and it never queues a second job for a frame whose
+    request is already in flight.
+  - A `.rigexec` playback produces the frame as a **detached
+    generation**: the binary plays at the frame without publishing, so
+    the displayed generation is never published over and never restored.
   - When entries are added, the results scene index sends PrimsDirtied for
     the rig's value leaves (primvars, extent) and its driven subtrees'
     transforms. Readers that got "not yet" read again.
 - **Nothing waits forever.** On the idle path (`OnIdle`, never during
-  playback), a frame still pending after `kFrameDemandFallbackAge` (40)
+  playback, and never while a background job for that frame is in
+  flight), a frame still pending after `kFrameDemandFallbackAge` (40)
   services is evaluated on the owner thread, at most one per call (about 2 s
-  at the plugin's tick). That frame is either outside the warm window or
-  belongs to a rig that cannot warm in the background.
+  at the plugin's tick). That frame belongs to a rig an exact request
+  cannot answer: its frame cache is off, it has no baked program, or the
+  request caps declined.
 - **Previews hold.** While an interactive preview stands, demand waits.
   Entries made before the drag keep answering, so ghosts do not follow a
   drag.
@@ -70,10 +81,10 @@ that a rig produced it.
 
 ## Limits
 
-- A rig that cannot warm in the background answers other frames only
+- A rig an exact output request cannot answer reaches other frames only
   through the idle fallback above, one frame per idle tick:
   - a rig with no baked program;
-  - `RIGEXEC_FRAME_CACHE=off`, or background warming off.
+  - `RIGEXEC_FRAME_CACHE=off` (no servable pose).
 - GPU-deformed points (`RIGEXEC_GPU_DEFORM=shader`) have no CPU points at any
   frame, so their offset reads stay empty.
 - The table keeps 128 frames (farthest from the playhead dropped first) and
