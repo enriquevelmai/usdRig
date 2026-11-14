@@ -1,23 +1,30 @@
-// Requested execution: run the compiled graph over the closure of the outputs
-// a host asked for, and report what each value that closure writes did
-// (docs/specs/output-subscriptions.md). Typed payload extraction is a separate
-// step; what this suite holds to account is the run itself -- that a request
-// executes nothing outside its closure, that a union shares an ancestor once,
-// that a value never materialized is computed even when its inputs are clean,
-// that an operation a request left out keeps its debt, and that a sequence of
-// partial runs lands on the same answer as one whole run.
+// Requested execution and extraction: run the compiled graph over the
+// closure of the outputs a host asked for, report what each value that
+// closure writes did, and answer those outputs as immutable typed payloads
+// read from the storage the run left (docs/specs/output-subscriptions.md).
+// What this suite holds to account: a request executes nothing outside its
+// closure, a union shares an ancestor once, a value never materialized is
+// computed even when its inputs are clean, an operation a request left out
+// keeps its debt, a sequence of partial runs lands on the same answer as one
+// whole run, and an extraction equals full evaluation -- with an explicit
+// status for every output it cannot answer, the intermediate a coarsened
+// cluster stopped at retained for the run that continues past it, and the
+// bytes it handed out unchanged by every later run.
 #include "rigExec/outputCatalog.h"
 #include "rigExec/bakedProgramImpl.h"
 #include "rigExec/rigEvaluator.h"
 #include "rigExecGraph/outputDemand.h"
 #include "rigExecOpTrace.h"
 
+#include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/tf/setenv.h"
 
 #include "pxr/usd/sdf/layer.h"
 #include "pxr/usd/usd/stage.h"
+#include "pxr/usd/usdGeom/tokens.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -168,15 +175,15 @@ struct Rig {
 };
 
 Rig
-BuildRig()
+BuildRigFrom(const char *stageText, const char *rigPath)
 {
     Rig rig;
     const SdfLayerRefPtr layer = SdfLayer::CreateAnonymous(".usda");
-    CHECK(layer->ImportFromString(kStageText));
+    CHECK(layer->ImportFromString(stageText));
     rig.stage = UsdStage::Open(layer);
     CHECK(rig.stage);
-    rig.evaluator = std::make_unique<RigExecRigEvaluator>(
-        rig.stage, SdfPath("/Asset/Container/Character"));
+    rig.evaluator =
+        std::make_unique<RigExecRigEvaluator>(rig.stage, SdfPath(rigPath));
     std::vector<std::string> errors;
     CHECK(rig.evaluator->Compile(&errors));
     for (const std::string &error : errors)
@@ -195,6 +202,12 @@ BuildRig()
     if (!error.empty())
         std::printf("    catalog: %s\n", error.c_str());
     return rig;
+}
+
+Rig
+BuildRig()
+{
+    return BuildRigFrom(kStageText, "/Asset/Container/Character");
 }
 
 /// The index slots whose binding reads from \p target.
@@ -714,6 +727,752 @@ TestRequestedRunAnswersAtItsFrame()
     CHECK(Moved(atThree, kBody) == Moved(wholeAtThree, kBody));
 }
 
+// ---------------------------------------------------------------------------
+// Extraction: answering the outputs a requested run materialized.
+
+// A rig with the domains the payload layouts cover: a joint a constraint
+// revises and a matrix mover reads at that constraint's phase (so a provider
+// matrix and a frame record both exist), a property chain, a chain whose
+// target has no authored value (a producer that runs and declines), and two
+// meshes.
+const char *const kLeg = "/PhaseAsset/Container/Geometry/Leg.points";
+const char *const kStale = "/PhaseAsset/Container/Geometry/Stale.points";
+const char *const kPhaseRig = "/PhaseAsset/Container/Character";
+const char *const kEmptyAmount =
+    "/PhaseAsset/Container/Character/EmptyHome.amount";
+const char *const kPhaseJoint = "/PhaseAsset/Container/Character/Joints/X";
+
+const char *const kPhaseStageText = R"USDA(#usda 1.0
+
+def Xform "PhaseAsset"
+{
+    def Scope "Container"
+    {
+        def RigExecRoot "Character"
+        {
+            def Scope "Controls"
+            {
+                def RigExecControl "Lead"
+                {
+                    double avars:tx = 1
+                    double avars:tx.timeSamples = {
+                        2: 1,
+                        8: 3,
+                    }
+                    matrix4d rest:space = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+                }
+            }
+
+            def Scope "Joints"
+            {
+                def RigExecJoint "X"
+                {
+                    matrix4d rest:space = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0.5, 0, 1) )
+                }
+            }
+
+            def Scope "PropertyHome"
+            {
+                float amount = 3
+
+                def RigExecFloatMathMover "AmountDoubler" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    uniform token rigExec:operation = "multiply"
+                    float inputs:value = 2
+                    rel rigExec:moves = </PhaseAsset/Container/Character/PropertyHome.amount>
+                }
+            }
+
+            def Scope "EmptyHome"
+            {
+                float amount
+
+                def RigExecFloatMathMover "EmptyDoubler" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    uniform token rigExec:operation = "multiply"
+                    float inputs:value = 2
+                    rel rigExec:moves = </PhaseAsset/Container/Character/EmptyHome.amount>
+                }
+            }
+
+            # The last child runs first: Constrain revises X before Readers.
+            def Scope "Movers"
+            {
+                def Scope "Readers"
+                {
+                    def RigExecMatrixMover "LegReader" (
+                        prepend apiSchemas = ["RigExecMoverAPI"]
+                    )
+                    {
+                        float inputs:defaultWeight = 1
+                        rel rigExec:moves = </PhaseAsset/Container/Geometry/Leg.points>
+                        rel rigExec:transform = </PhaseAsset/Container/Character/Joints/X> (
+                            rigExecReadPhase = "/PhaseAsset/Container/Character/Movers/Constrain/Hold"
+                        )
+                    }
+
+                    def RigExecMatrixMover "StaleReader" (
+                        prepend apiSchemas = ["RigExecMoverAPI"]
+                    )
+                    {
+                        float inputs:defaultWeight = 1
+                        rel rigExec:moves = </PhaseAsset/Container/Geometry/Stale.points>
+                        rel rigExec:transform = </PhaseAsset/Container/Character/Joints/X>
+                    }
+                }
+
+                def Scope "Constrain"
+                {
+                    def RigExecPositionConstraint "Hold" (
+                        prepend apiSchemas = ["RigExecMoverAPI"]
+                    )
+                    {
+                        rel rigExec:moves = </PhaseAsset/Container/Character/Joints/X>
+                        rel rigExec:sources = </PhaseAsset/Container/Character/Controls/Lead>
+                    }
+                }
+            }
+        }
+
+        def Scope "Geometry"
+        {
+            def Points "Leg"
+            {
+                point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+            }
+
+            # A base with no value at the default frame: a chain that runs at
+            # a sampled frame and stands aside at the default one.
+            def Points "Stale"
+            {
+                point3f[] points.timeSamples = {
+                    3: [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)],
+                }
+            }
+        }
+    }
+}
+)USDA";
+
+/// Every catalog slot a dispatch can answer: an exported output with a
+/// producer, not one the rig reports unsupported from the start.
+std::vector<size_t>
+AnswerableSlots(const Rig &rig)
+{
+    std::vector<size_t> slots;
+    for (const RigExecOutputBinding &binding : rig.catalog.GetBindings()) {
+        if (binding.status != RigExecOutputStatus::Pending)
+            continue;
+        size_t slot = 0;
+        if (rig.catalog.GetDemandIndex().Find(binding.handle, &slot))
+            slots.push_back(slot);
+    }
+    return slots;
+}
+
+std::vector<RigExecOutputHandle>
+HandlesForSlots(const Rig &rig, const std::vector<size_t> &slots)
+{
+    std::vector<RigExecOutputHandle> handles;
+    handles.reserve(slots.size());
+    for (size_t slot : slots)
+        handles.push_back(rig.catalog.GetDemandIndex().Handle(slot));
+    return handles;
+}
+
+/// The generation a request here belongs to: this catalog's compile epoch as
+/// the program identity, with no input, preview or history revision moved.
+RigExecOutputGeneration
+Captured(const Rig &rig)
+{
+    RigExecOutputGeneration captured;
+    captured.programIdentity = rig.catalog.GetCompileEpoch();
+    return captured;
+}
+
+/// Runs the closure of \p requestSlots, then answers \p extractSlots from
+/// what that run left.
+bool
+Answer(Rig &rig, UsdTimeCode time, const std::vector<size_t> &requestSlots,
+       const std::vector<size_t> &extractSlots,
+       std::vector<RigExecOutputPacket> *packets,
+       RigExecRequestedRunReport *report, std::string *error)
+{
+    if (!Request(rig, time, ClosureFor(rig, requestSlots), report, error))
+        return false;
+    return rig.program->ExtractRequestedOutputs(
+        rig.catalog, *report, time, Captured(rig),
+        HandlesForSlots(rig, extractSlots), packets, error);
+}
+
+const RigExecOutputPacket *
+PacketFor(const Rig &rig, const std::vector<RigExecOutputPacket> &packets,
+          const std::string &target, const std::string &phase)
+{
+    for (const RigExecOutputBinding &binding : rig.catalog.GetBindings()) {
+        if (binding.descriptor.target != target ||
+            binding.descriptor.phase != phase)
+            continue;
+        for (const RigExecOutputPacket &packet : packets) {
+            if (packet.handle.semanticKey == binding.descriptor.semanticKey)
+                return &packet;
+        }
+    }
+    return nullptr;
+}
+
+/// The phase-named point versions of \p target: one per mover of its chain.
+std::vector<std::string>
+PointPhases(const Rig &rig, const std::string &target)
+{
+    std::vector<std::string> phases;
+    for (const RigExecOutputBinding &binding : rig.catalog.GetBindings()) {
+        if (binding.descriptor.target == target &&
+            binding.kind == RigExecOutputKind::Points &&
+            binding.descriptor.phase != "base" &&
+            binding.descriptor.phase != "final")
+            phases.push_back(binding.descriptor.phase);
+    }
+    return phases;
+}
+
+bool
+ReadScalar(const RigExecOutputPacket &packet, double *out)
+{
+    RigExecPayloadView view;
+    std::string error;
+    return view.Open(packet.handle, packet.payload, &error) &&
+           view.ReadScalar(0, out);
+}
+
+bool
+ReadMatrix(const RigExecOutputPacket &packet, std::array<double, 16> *out)
+{
+    RigExecPayloadView view;
+    std::string error;
+    return view.Open(packet.handle, packet.payload, &error) &&
+           view.ReadMatrix4x4Row(0, out->data());
+}
+
+bool
+ReadPoints(const RigExecOutputPacket &packet, std::vector<double> *out)
+{
+    RigExecPayloadView view;
+    std::string error;
+    if (!view.Open(packet.handle, packet.payload, &error))
+        return false;
+    out->assign(size_t(view.ElementCount()) * 3, 0.0);
+    for (size_t i = 0; i < view.ElementCount(); ++i) {
+        if (!view.ReadPoint3(i, out->data() + i * 3))
+            return false;
+    }
+    return true;
+}
+
+/// The compiled producer id behind one exported output.
+uint64_t
+ProducerValueFor(const Rig &rig, const std::string &target,
+                 const std::string &phase)
+{
+    for (const RigExecOutputBinding &binding : rig.catalog.GetBindings()) {
+        if (binding.descriptor.target == target &&
+            binding.descriptor.phase == phase)
+            return binding.producerValue;
+    }
+    return 0;
+}
+
+/// Every payload the packet holds, as its raw bytes: what a retained lease
+/// must keep byte for byte across a later run.
+std::vector<uint8_t>
+BytesOf(const RigExecOutputPacket &packet)
+{
+    return packet.payload.bytes ? *packet.payload.bytes
+                                : std::vector<uint8_t>{};
+}
+
+std::vector<double>
+Doubles(const VtVec3fArray &points)
+{
+    std::vector<double> out;
+    out.reserve(points.size() * 3);
+    for (const GfVec3f &point : points) {
+        out.push_back(double(point[0]));
+        out.push_back(double(point[1]));
+        out.push_back(double(point[2]));
+    }
+    return out;
+}
+
+std::vector<double>
+AuthoredPoints(const UsdStageRefPtr &stage, const std::string &attributePath)
+{
+    const UsdPrim prim =
+        stage->GetPrimAtPath(SdfPath(attributePath).GetPrimPath());
+    VtValue value;
+    if (prim)
+        prim.GetAttribute(UsdGeomTokens->points)
+            .Get(&value, UsdTimeCode::Default());
+    if (!value.IsHolding<VtVec3fArray>())
+        return {};
+    return Doubles(value.Get<VtVec3fArray>());
+}
+
+bool
+SameMatrix(const std::array<double, 16> &payload, const GfMatrix4d &matrix)
+{
+    for (size_t row = 0; row < 4; ++row)
+        for (size_t column = 0; column < 4; ++column)
+            if (payload[row * 4 + column] != matrix[row][column])
+                return false;
+    return true;
+}
+
+// Every payload an extraction hands out is the value the same rig publishes
+// when it is run whole: scalar, points base, phase and final, joint matrix.
+void
+TestExtractionEqualsFullEvaluation()
+{
+    Rig rig = BuildRig();
+    Rig fresh = BuildRig();
+    if (!rig.program || !fresh.program)
+        return;
+    const std::vector<size_t> slots = AnswerableSlots(rig);
+    CHECK(!slots.empty());
+
+    std::vector<RigExecOutputPacket> packets;
+    RigExecRequestedRunReport report;
+    std::string error;
+    CHECK(Request(rig, UsdTimeCode::Default(), ClosureFor(rig, slots), &report,
+                  &error));
+    const size_t executed = rig.program->GetStepGraph().opExecution.executed;
+    const std::vector<RigExecOutputHandle> handles =
+        HandlesForSlots(rig, slots);
+    CHECK(rig.program->ExtractRequestedOutputs(
+        rig.catalog, report, UsdTimeCode::Default(), Captured(rig), handles,
+        &packets, &error));
+    CHECK(error.empty());
+    CHECK(packets.size() == slots.size());
+    // Extraction runs no body: the program's own count of executed
+    // operations is exactly what the run left behind.
+    CHECK(rig.program->GetStepGraph().opExecution.executed == executed);
+
+    RigExecRigPose pose;
+    CHECK(fresh.program->Run(UsdTimeCode::Default(), &pose));
+    CHECK(pose.valid);
+
+    size_t ready = 0;
+    for (const RigExecOutputPacket &packet : packets) {
+        std::string viewError;
+        RigExecPayloadView view;
+        if (!view.Open(packet.handle, packet.payload, &viewError))
+            continue;
+        ++ready;
+        CHECK(packet.status == RigExecOutputStatus::Ready);
+        CHECK(!packet.payload.IsEmpty());
+    }
+    CHECK(ready == packets.size());
+
+    // Scalar: the double the published property holds.
+    double amount = 0;
+    const RigExecOutputPacket *scalar =
+        PacketFor(rig, packets, kAmount, "final");
+    CHECK(scalar && scalar->status == RigExecOutputStatus::Ready);
+    CHECK(scalar && ReadScalar(*scalar, &amount));
+    const VtValue movedAmount = Moved(pose, kAmount);
+    CHECK(movedAmount.IsHolding<float>());
+    CHECK(amount == double(movedAmount.Get<float>()));
+
+    // Points: the authored base, and the published final array.
+    std::vector<double> authored;
+    CHECK(ReadPoints(*PacketFor(rig, packets, kBody, "base"), &authored));
+    CHECK(authored == AuthoredPoints(rig.stage, kBody));
+    std::vector<double> extracted;
+    const RigExecOutputPacket *bodyFinal =
+        PacketFor(rig, packets, kBody, "final");
+    CHECK(bodyFinal && bodyFinal->status == RigExecOutputStatus::Ready);
+    CHECK(bodyFinal && ReadPoints(*bodyFinal, &extracted));
+    const VtValue movedBody = Moved(pose, kBody);
+    CHECK(movedBody.IsHolding<VtVec3fArray>());
+    CHECK(extracted == Doubles(movedBody.Get<VtVec3fArray>()));
+
+    // An intermediate stands between the base and the final: a request that
+    // stops at it answers the same value a request that runs past it does.
+    const std::vector<std::string> phases = PointPhases(rig, kBody);
+    CHECK(!phases.empty());
+    for (const std::string &phase : phases) {
+        const size_t slot = SlotForPhase(rig, kBody, phase);
+        CHECK(slot != size_t(-1));
+        std::vector<RigExecOutputPacket> stopped;
+        RigExecRequestedRunReport stoppedReport;
+        CHECK(Answer(rig, UsdTimeCode::Default(), {slot}, {slot}, &stopped,
+                     &stoppedReport, &error));
+        std::vector<double> stoppedPoints;
+        CHECK(!stopped.empty() &&
+              stopped.front().status == RigExecOutputStatus::Ready);
+        CHECK(ReadPoints(stopped.front(), &stoppedPoints));
+        CHECK(stoppedPoints.size() == authored.size());
+        CHECK(stoppedPoints != authored);
+
+        Rig deep = BuildRig();
+        std::vector<RigExecOutputPacket> deeper;
+        RigExecRequestedRunReport deeperReport;
+        CHECK(Answer(deep, UsdTimeCode::Default(), {slot}, {slot}, &deeper,
+                     &deeperReport, &error));
+        std::vector<double> deeperPoints;
+        CHECK(ReadPoints(deeper.front(), &deeperPoints));
+        CHECK(deeperPoints == stoppedPoints);
+    }
+}
+
+// A joint's matrix, its base matrix, and the frame record a phase read
+// leaves: each payload is the matrix the pose publishes for the same run.
+void
+TestTransformExtractionMatchesThePublishedJoint()
+{
+    Rig rig = BuildRigFrom(kPhaseStageText, kPhaseRig);
+    Rig fresh = BuildRigFrom(kPhaseStageText, kPhaseRig);
+    if (!rig.program || !fresh.program)
+        return;
+    const UsdTimeCode time(2.0);
+    const std::vector<size_t> slots = AnswerableSlots(rig);
+    CHECK(!slots.empty());
+
+    std::vector<RigExecOutputPacket> packets;
+    RigExecRequestedRunReport report;
+    std::string error;
+    CHECK(Answer(rig, time, slots, slots, &packets, &report, &error));
+    CHECK(error.empty());
+
+    RigExecRigPose pose;
+    CHECK(fresh.program->Run(time, &pose));
+    CHECK(pose.valid);
+    const auto published = pose.jointMatricesFinal.find(SdfPath(kPhaseJoint));
+    CHECK(published != pose.jointMatricesFinal.end());
+
+    const RigExecOutputPacket *finalMatrix =
+        PacketFor(rig, packets, kPhaseJoint, "final");
+    CHECK(finalMatrix && finalMatrix->status == RigExecOutputStatus::Ready);
+    std::array<double, 16> cells{};
+    CHECK(ReadMatrix(*finalMatrix, &cells));
+    CHECK(SameMatrix(cells, published->second));
+    // A moved joint is not an untouched slot read back as zeros, so the
+    // comparison above is not an agreement between two empty payloads.
+    const std::array<double, 16> zeros{};
+    CHECK(cells != zeros);
+
+    // The base the phase read is the joint as it stands before the walk:
+    // nothing revised it, so it is its own rest matrix.
+    const RigExecOutputPacket *baseMatrix =
+        PacketFor(rig, packets, kPhaseJoint, "base");
+    CHECK(baseMatrix);
+    if (baseMatrix) {
+        CHECK(baseMatrix->status == RigExecOutputStatus::Ready);
+        std::array<double, 16> baseCells{};
+        CHECK(ReadMatrix(*baseMatrix, &baseCells));
+        CHECK(SameMatrix(baseCells, GfMatrix4d(1.0)));
+    }
+
+    // The frame record the phase read names: a matrix for the writer it
+    // stands on, and with one constraint revising the joint it is the
+    // matrix the joint publishes.
+    for (const RigExecOutputBinding &binding : rig.catalog.GetBindings()) {
+        if (binding.kind != RigExecOutputKind::Transform ||
+            binding.descriptor.target != kPhaseJoint ||
+            binding.descriptor.phase == "base" ||
+            binding.descriptor.phase == "final")
+            continue;
+        const RigExecOutputPacket *record = PacketFor(
+            rig, packets, binding.descriptor.target, binding.descriptor.phase);
+        CHECK(record && record->status == RigExecOutputStatus::Ready);
+        if (!record)
+            continue;
+        std::array<double, 16> recordCells{};
+        CHECK(ReadMatrix(*record, &recordCells));
+        CHECK(SameMatrix(recordCells, published->second));
+    }
+
+    // The mesh whose mover reads the joint at the constraint's phase follows
+    // the joint it read, not the joint as it stands.
+    const RigExecOutputPacket *legFinal =
+        PacketFor(rig, packets, kLeg, "final");
+    CHECK(legFinal && legFinal->status == RigExecOutputStatus::Ready);
+    std::vector<double> legBase;
+    CHECK(ReadPoints(*PacketFor(rig, packets, kLeg, "base"), &legBase));
+    CHECK(legBase == AuthoredPoints(rig.stage, kLeg));
+    std::vector<double> legMoved;
+    CHECK(ReadPoints(*legFinal, &legMoved));
+    const VtValue movedLeg = Moved(pose, kLeg);
+    CHECK(movedLeg.IsHolding<VtVec3fArray>());
+    CHECK(legMoved == Doubles(movedLeg.Get<VtVec3fArray>()));
+    CHECK(legMoved != legBase);
+
+    // The full-pose epilogue belongs to a whole request: a requested run and
+    // its extraction publish no pose, and the whole run that follows is the
+    // first thing to write the epilogue's publication table.
+    for (char publishedFlag : rig.program->GetStepGraph().jointMatrixPublished)
+        CHECK(publishedFlag == 0);
+    RigExecRigPose second;
+    CHECK(rig.program->Run(time, &second));
+    bool anyPublished = false;
+    for (char publishedFlag : rig.program->GetStepGraph().jointMatrixPublished)
+        anyPublished = anyPublished || publishedFlag != 0;
+    CHECK(anyPublished);
+    CHECK(second.jointMatricesFinal == pose.jointMatricesFinal);
+}
+
+// An output the run did not materialize, an address the rig does not export,
+// and a stale compile epoch each answer with a status and a reason, and with
+// no payload -- never with a Ready payload of zeros.
+void
+TestAnOutputItCannotAnswerHasAStatus()
+{
+    Rig rig = BuildRig();
+    if (!rig.program)
+        return;
+    const size_t bodyFinal = SlotForPhase(rig, kBody, "final");
+    const size_t otherFinal = SlotForPhase(rig, kOther, "final");
+    CHECK(bodyFinal != size_t(-1));
+    CHECK(otherFinal != size_t(-1));
+
+    // The Body chain is requested; Other is asked about. Its producer stands
+    // outside the closure, so its storage is not this request's answer.
+    std::vector<RigExecOutputPacket> packets;
+    RigExecRequestedRunReport report;
+    std::string error;
+    CHECK(Answer(rig, UsdTimeCode::Default(), {bodyFinal},
+                 {bodyFinal, otherFinal}, &packets, &report, &error));
+    CHECK(packets.size() == 2);
+    const RigExecOutputPacket *asked = PacketFor(rig, packets, kOther, "final");
+    CHECK(asked && asked->status == RigExecOutputStatus::Pending);
+    CHECK(asked && asked->payload.IsEmpty());
+    CHECK(asked && !asked->reason.empty());
+    if (asked) {
+        RigExecPayloadView view;
+        std::string viewError;
+        CHECK(!view.Open(asked->handle, asked->payload, &viewError));
+    }
+    const RigExecOutputPacket *answered =
+        PacketFor(rig, packets, kBody, "final");
+    CHECK(answered && answered->status == RigExecOutputStatus::Ready);
+
+    // An address this rig does not export, and a handle from an earlier
+    // compile epoch: resolved before any read, with no payload.
+    RigExecOutputHandle unknown = rig.catalog.GetBindings().front().handle;
+    unknown.semanticKey = "9:not-an-output";
+    RigExecOutputHandle stale = rig.catalog.GetBindings().front().handle;
+    stale.compileEpoch = rig.catalog.GetCompileEpoch() + 1;
+    packets.clear();
+    CHECK(rig.program->ExtractRequestedOutputs(
+        rig.catalog, report, UsdTimeCode::Default(), Captured(rig),
+        {unknown, stale}, &packets, &error));
+    CHECK(packets.size() == 2);
+    CHECK(packets[0].status == RigExecOutputStatus::Unsupported);
+    CHECK(packets[1].status == RigExecOutputStatus::Invalidated);
+    for (const RigExecOutputPacket &packet : packets) {
+        CHECK(packet.payload.IsEmpty());
+        CHECK(!packet.reason.empty());
+    }
+
+    // A generation from another compiled program is never labeled current.
+    RigExecOutputGeneration foreign = Captured(rig);
+    foreign.programIdentity = rig.catalog.GetCompileEpoch() + 7;
+    packets.clear();
+    CHECK(rig.program->ExtractRequestedOutputs(
+        rig.catalog, report, UsdTimeCode::Default(), foreign,
+        {rig.catalog.GetDemandIndex().Handle(bodyFinal)}, &packets, &error));
+    CHECK(packets.size() == 1);
+    CHECK(packets[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(packets[0].payload.IsEmpty());
+
+    // A revision the run no longer holds is a different answer.
+    RigExecOutputHandle ahead = rig.catalog.GetDemandIndex().Handle(bodyFinal);
+    ahead.valueRevision = uint64_t(-1);
+    packets.clear();
+    CHECK(rig.program->ExtractRequestedOutputs(
+        rig.catalog, report, UsdTimeCode::Default(), Captured(rig), {ahead},
+        &packets, &error));
+    CHECK(packets.size() == 1);
+    CHECK(packets[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(packets[0].payload.IsEmpty());
+
+    // A producer that ran and declined publishes no value: the rig itself
+    // publishes nothing for it, so a Ready zero would be an invention.
+    Rig phase = BuildRigFrom(kPhaseStageText, kPhaseRig);
+    if (!phase.program)
+        return;
+    Rig phaseFresh = BuildRigFrom(kPhaseStageText, kPhaseRig);
+    RigExecRigPose whole;
+    CHECK(phaseFresh.program->Run(UsdTimeCode(2.0), &whole));
+    CHECK(whole.movedProperties.find(SdfPath(kEmptyAmount)) ==
+          whole.movedProperties.end());
+    const size_t emptyFinal = SlotForPhase(phase, kEmptyAmount, "final");
+    CHECK(emptyFinal != size_t(-1));
+    if (emptyFinal != size_t(-1)) {
+        std::vector<RigExecOutputPacket> declined;
+        RigExecRequestedRunReport declinedReport;
+        CHECK(Answer(phase, UsdTimeCode(2.0), {emptyFinal}, {emptyFinal},
+                     &declined, &declinedReport, &error));
+        CHECK(declined.size() == 1);
+        CHECK(declined.front().status == RigExecOutputStatus::Failed);
+        CHECK(declined.front().payload.IsEmpty());
+        CHECK(!declined.front().reason.empty());
+    }
+}
+
+// A payload lease is immutable and a retained intermediate is read, not
+// recomputed: coarsen the clusters so a request stops partway down a chain,
+// take the intermediate, then run past it, publish a whole pose, and move to
+// another frame.
+void
+TestRetainedPayloadsStandAcrossRuns()
+{
+    TfSetenv("RIGEXEC_BAKED_GRAIN_US", "1000000");
+    Rig rig = BuildRig();
+    TfUnsetenv("RIGEXEC_BAKED_GRAIN_US");
+    if (!rig.program)
+        return;
+    const std::vector<std::string> phases = PointPhases(rig, kBody);
+    CHECK(!phases.empty());
+    const size_t firstPhase = SlotForPhase(rig, kBody, phases.front());
+    const size_t bodyFinal = SlotForPhase(rig, kBody, "final");
+    const size_t amountFinal = SlotForPhase(rig, kAmount, "final");
+    CHECK(firstPhase != size_t(-1));
+    CHECK(bodyFinal != size_t(-1));
+    CHECK(amountFinal != size_t(-1));
+
+    std::vector<RigExecOutputPacket> taken;
+    RigExecRequestedRunReport takenReport;
+    std::string error;
+    CHECK(Answer(rig, UsdTimeCode(3.0), {firstPhase, amountFinal},
+                 {firstPhase, amountFinal}, &taken, &takenReport, &error));
+    CHECK(taken.size() == 2);
+    for (const RigExecOutputPacket &packet : taken)
+        CHECK(packet.status == RigExecOutputStatus::Ready);
+    const std::vector<uint8_t> heldPoints = BytesOf(taken.front());
+    const std::vector<uint8_t> heldScalar = BytesOf(taken.back());
+    CHECK(!heldPoints.empty());
+    CHECK(!heldScalar.empty());
+    const uint64_t pointsRevision = taken.front().handle.valueRevision;
+
+    // A request that runs past the intermediate in the same arena reads it:
+    // the same value, the same revision, the same bytes.
+    std::vector<RigExecOutputPacket> deeper;
+    RigExecRequestedRunReport deeperReport;
+    CHECK(Answer(rig, UsdTimeCode(3.0), {bodyFinal}, {firstPhase}, &deeper,
+                 &deeperReport, &error));
+    CHECK(deeper.size() == 1);
+    CHECK(deeper.front().status == RigExecOutputStatus::Ready);
+    CHECK(deeper.front().handle.valueRevision == pointsRevision);
+    CHECK(BytesOf(deeper.front()) == heldPoints);
+    const RigExecValueMaterialization *retained =
+        FactFor(deeperReport, ProducerValueFor(rig, kBody, phases.front()));
+    CHECK(retained && retained->reused && !retained->produced);
+
+    // A whole pose published at the same frame, then a run at another one:
+    // the leases taken first still hold the bytes they were handed.
+    RigExecRigPose pose;
+    CHECK(rig.program->Run(UsdTimeCode(3.0), &pose));
+    RigExecRigPose other;
+    CHECK(rig.program->Run(UsdTimeCode(8.0), &other));
+    const VtValue movedThree = Moved(pose, kBody);
+    const VtValue movedEight = Moved(other, kBody);
+    CHECK(movedThree.IsHolding<VtVec3fArray>() &&
+          movedEight.IsHolding<VtVec3fArray>());
+    CHECK(Doubles(movedThree.Get<VtVec3fArray>()) !=
+          Doubles(movedEight.Get<VtVec3fArray>()));
+    CHECK(BytesOf(taken.front()) == heldPoints);
+    CHECK(BytesOf(taken.back()) == heldScalar);
+
+    std::vector<RigExecOutputPacket> atEight;
+    RigExecRequestedRunReport atEightReport;
+    CHECK(Answer(rig, UsdTimeCode(8.0), {bodyFinal}, {firstPhase}, &atEight,
+                 &atEightReport, &error));
+    CHECK(atEight.size() == 1);
+    CHECK(atEight.front().status == RigExecOutputStatus::Ready);
+    CHECK(BytesOf(atEight.front()) != heldPoints);
+    CHECK(BytesOf(taken.front()) == heldPoints);
+}
+
+// A chain that read a base at one frame and none at the next publishes
+// nothing at the second, and its previous points are not an answer: the
+// extraction says so, and the lease taken at the first frame still holds.
+void
+TestNoBaseAtTheFrameAnswersWithAStatus()
+{
+    Rig rig = BuildRigFrom(kPhaseStageText, kPhaseRig);
+    if (!rig.program)
+        return;
+    const size_t staleFinal = SlotForPhase(rig, kStale, "final");
+    CHECK(staleFinal != size_t(-1));
+    if (staleFinal == size_t(-1))
+        return;
+
+    const UsdTimeCode sampled(3.0);
+    RigExecRigPose wholeSampled;
+    CHECK(rig.program->Run(sampled, &wholeSampled));
+    CHECK(wholeSampled.movedProperties.find(SdfPath(kStale)) !=
+          wholeSampled.movedProperties.end());
+
+    std::vector<RigExecOutputPacket> atSampled;
+    RigExecRequestedRunReport sampledReport;
+    std::string error;
+    CHECK(Answer(rig, sampled, {staleFinal}, {staleFinal}, &atSampled,
+                 &sampledReport, &error));
+    CHECK(atSampled.size() == 1);
+    CHECK(atSampled.front().status == RigExecOutputStatus::Ready);
+    std::vector<double> points;
+    CHECK(ReadPoints(atSampled.front(), &points));
+    const VtValue movedStale = Moved(wholeSampled, kStale);
+    CHECK(movedStale.IsHolding<VtVec3fArray>());
+    CHECK(points == Doubles(movedStale.Get<VtVec3fArray>()));
+    const std::vector<uint8_t> held = BytesOf(atSampled.front());
+
+    // The default frame has no value for that mesh at all. The whole run
+    // publishes nothing for it, and the extraction refuses to answer with
+    // the points the chain still holds from the sampled frame.
+    RigExecRigPose wholeDefault;
+    CHECK(rig.program->Run(UsdTimeCode::Default(), &wholeDefault));
+    CHECK(wholeDefault.movedProperties.find(SdfPath(kStale)) ==
+          wholeDefault.movedProperties.end());
+    std::vector<RigExecOutputPacket> atDefault;
+    RigExecRequestedRunReport defaultReport;
+    CHECK(Answer(rig, UsdTimeCode::Default(), {staleFinal}, {staleFinal},
+                 &atDefault, &defaultReport, &error));
+    CHECK(atDefault.size() == 1);
+    CHECK(atDefault.front().status == RigExecOutputStatus::Failed);
+    CHECK(atDefault.front().payload.IsEmpty());
+    CHECK(!atDefault.front().reason.empty());
+    std::vector<size_t> staleSlots;
+    for (const RigExecOutputBinding &binding : rig.catalog.GetBindings()) {
+        if (binding.descriptor.target != kStale ||
+            binding.kind != RigExecOutputKind::Points)
+            continue;
+        size_t slot = 0;
+        if (rig.catalog.GetDemandIndex().Find(binding.handle, &slot))
+            staleSlots.push_back(slot);
+    }
+    CHECK(staleSlots.size() >= 2);
+    std::vector<RigExecOutputPacket> refused;
+    RigExecRequestedRunReport refusedReport;
+    CHECK(Request(rig, UsdTimeCode::Default(), ClosureFor(rig, staleSlots),
+                  &refusedReport, &error));
+    CHECK(rig.program->ExtractRequestedOutputs(
+        rig.catalog, refusedReport, UsdTimeCode::Default(), Captured(rig),
+        HandlesForSlots(rig, staleSlots), &refused, &error));
+    CHECK(refused.size() == staleSlots.size());
+    for (const RigExecOutputPacket &packet : refused) {
+        CHECK(packet.status == RigExecOutputStatus::Failed);
+        CHECK(packet.payload.IsEmpty());
+        CHECK(!packet.reason.empty());
+    }
+    CHECK(BytesOf(atSampled.front()) == held);
+}
+
 } // namespace
 
 int
@@ -726,6 +1485,11 @@ main()
     TestRefusesAnOpenClosure();
     TestClusterBoundariesHoldTheMask();
     TestRequestedRunAnswersAtItsFrame();
+    TestExtractionEqualsFullEvaluation();
+    TestTransformExtractionMatchesThePublishedJoint();
+    TestAnOutputItCannotAnswerHasAStatus();
+    TestNoBaseAtTheFrameAnswersWithAStatus();
+    TestRetainedPayloadsStandAcrossRuns();
     if (failures)
         std::printf("%d failures\n", failures);
     return failures ? 1 : 0;

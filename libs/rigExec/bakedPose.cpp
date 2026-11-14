@@ -6694,4 +6694,51 @@ RigExecBakedPublishPose(RigExecBakedProgramImpl *program, RigExecRigPose *pose)
     return true;
 }
 
+bool
+RigExecBakedExtractTransform(const RigExecBakedProgramImpl &program,
+                             RigExecBakedSlotDomain domain,
+                             const RigExecOutputBinding &binding,
+                             RigExecOutputPayload *payload,
+                             std::string *reason)
+{
+    const auto fail = [&](const std::string &message) {
+        if (reason)
+            *reason = message;
+        return false;
+    };
+    const GfMatrix4d *matrix = nullptr;
+    if (domain == RigExecBakedSlotDomain::BaseMatrix ||
+        domain == RigExecBakedSlotDomain::FinalMatrix) {
+        const std::vector<GfMatrix4d> &table =
+            domain == RigExecBakedSlotDomain::BaseMatrix ? program.baseMatrix
+                                                         : program.finalMatrix;
+        if (binding.object >= table.size())
+            return fail("transform output " + binding.descriptor.semanticKey +
+                        " names a provider slot the program does not hold");
+        matrix = &table[size_t(binding.object)];
+    } else if (domain == RigExecBakedSlotDomain::FrameMatrix) {
+        if (binding.object >= program.frameMatrix.size() ||
+            binding.object >= program.frameMatrixValid.size())
+            return fail("transform output " + binding.descriptor.semanticKey +
+                        " names a frame record the program does not hold");
+        // The FrameMatrix step writes both fields every run, so a valid byte
+        // of 0 is this run's refusal, not a leftover from an earlier one.
+        if (!program.frameMatrixValid[size_t(binding.object)])
+            return fail("frame record " + binding.descriptor.semanticKey +
+                        " declined to record a matrix");
+        matrix = &program.frameMatrix[size_t(binding.object)];
+    } else {
+        return fail("transform output " + binding.descriptor.semanticKey +
+                    " binds storage the pose half does not publish");
+    }
+    // Row-major, USD row-vector form: p' = p * M, the same order GfMatrix4d
+    // stores and the same order the payload layout declares.
+    double cells[16];
+    for (size_t row = 0; row < 4; ++row)
+        for (size_t column = 0; column < 4; ++column)
+            cells[row * 4 + column] = (*matrix)[row][column];
+    return RigExecPackPayload(RigExecPayloadKind::Matrix4x4Row, 1, cells,
+                              payload, reason);
+}
+
 } // namespace rigExec

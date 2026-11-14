@@ -15,6 +15,7 @@
 #include "bakedTrace.h"
 #include "tapSet.h"
 
+#include "rigExecGraph/outputDemand.h"
 #include "rigExecGraph/windowHistory.h"
 
 #include "rigExecMath/pointFrame.h"
@@ -113,6 +114,7 @@ struct RigExecUpstreamArrayRow {
     std::string consumer;
 };
 
+class RigExecOutputCatalog;
 class RigExecRigEvaluator;
 struct RigExecDemandClosure;
 
@@ -325,6 +327,42 @@ public:
     bool RunRequested(UsdTimeCode time, const RigExecDemandClosure &requested,
                       RigExecRequestedRunReport *report,
                       std::string *error = nullptr);
+
+    /// Reads \p outputs out of the storage the run described by \p report
+    /// left, after the join, and answers each one with a payload in the
+    /// layout its handle declares (rigExecGraph/outputDemand.h). Nothing
+    /// runs: a point payload gathers the chunks the run computed, and no rig
+    /// result is computed beside the loop.
+    ///
+    /// \p report is the run's own materialization facts, so a value the
+    /// closure did not name is answered Pending rather than read out of
+    /// storage that may hold another generation's bytes. A producer that ran
+    /// and declined -- a property chain with no authored base, a frame record
+    /// the walk refused to write, a chain that read no base at this frame --
+    /// is answered Failed: a failed or disabled producer never yields a Ready
+    /// payload of zeros. An output this catalog does not export, or one whose
+    /// rig instance or compile epoch is not this one's, carries the status
+    /// `catalog.Resolve` gave it. \p captured is the generation the caller
+    /// captured with its request; the packets carry it beside the compile
+    /// epoch that produced the value, so a stale generation is reported and
+    /// never labeled current. A requested run publishes nothing: the full
+    /// pose epilogue belongs to a whole request, and no packet writes back to
+    /// the stage or to the program.
+    ///
+    /// Returns false with a diagnostic only when the call itself cannot be
+    /// answered -- no destination, a program with no operation graph, a
+    /// catalog that is not this program's, or a time that is neither the
+    /// default frame nor a finite time code. Individual outputs answer
+    /// through their status. A payload is an immutable lease: no later run
+    /// moves the bytes a packet handed out.
+    bool
+    ExtractRequestedOutputs(const RigExecOutputCatalog &catalog,
+                            const RigExecRequestedRunReport &report,
+                            UsdTimeCode time,
+                            const RigExecOutputGeneration &captured,
+                            const std::vector<RigExecOutputHandle> &outputs,
+                            std::vector<RigExecOutputPacket> *packets,
+                            std::string *error = nullptr) const;
 
     /// Asks the next Run to execute every step rather than the closure of
     /// what moved, then forget the request. A request, not state: the

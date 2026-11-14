@@ -6291,6 +6291,72 @@ RigExecBakedChainPublication(const RigExecBakedProgramImpl::GeomChain &chain)
     return VtValue(chain.result);
 }
 
+bool
+RigExecBakedExtractPoints(const RigExecBakedProgramImpl &program,
+                          RigExecBakedSlotDomain domain,
+                          const RigExecOutputBinding &binding,
+                          std::vector<GfVec3f> *gather,
+                          std::vector<double> *cells, RigExecOutputPayload *payload,
+                          std::string *reason)
+{
+    const auto fail = [&](const std::string &message) {
+        if (reason)
+            *reason = message;
+        return false;
+    };
+    if (binding.object >= program.chains.size())
+        return fail("points output " + binding.descriptor.semanticKey +
+                    " names a chain the program does not hold");
+    const RigExecBakedProgramImpl::GeomChain &chain =
+        program.chains[size_t(binding.object)];
+    const GfVec3f *points = nullptr;
+    size_t count = 0;
+    if (domain == RigExecBakedSlotDomain::ChainBase) {
+        // The same gate the publication uses: a chain that read no base at
+        // this frame drives nothing, and its last frame's points are not an
+        // answer for this one.
+        if (!chain.haveBase)
+            return fail("chain " + binding.descriptor.target +
+                        " read no base at this frame");
+        points = chain.lastBase.cdata();
+        count = chain.lastBase.size();
+    } else if (domain == RigExecBakedSlotDomain::ChainPoints) {
+        if (!chain.haveBase || !chain.haveResult)
+            return fail("chain " + binding.descriptor.target +
+                        " published no points at this frame");
+        points = chain.result.cdata();
+        count = chain.result.size();
+    } else if (domain == RigExecBakedSlotDomain::RevisionDone) {
+        if (!chain.haveBase)
+            return fail("chain " + binding.descriptor.target +
+                        " read no base at this frame");
+        // A version cut into groups is gathered from the groups its writers
+        // published -- the chunks the run computed -- and never recomputed.
+        RigExecBakedVersionPoints(chain, size_t(binding.version), gather,
+                                  &points, &count);
+        if (count != chain.lastBase.size())
+            return fail("chain " + binding.descriptor.target + " version " +
+                        std::to_string(binding.version) + " holds " +
+                        std::to_string(count) + " points for a base of " +
+                        std::to_string(chain.lastBase.size()));
+    } else {
+        return fail("points output " + binding.descriptor.semanticKey +
+                    " binds storage the geometry half does not publish");
+    }
+    if (count > std::numeric_limits<size_t>::max() / 3)
+        return fail("points output " + binding.descriptor.semanticKey +
+                    " has a point count that overflows its payload");
+    cells->resize(count * 3);
+    for (size_t i = 0; i < count; ++i) {
+        (*cells)[i * 3] = double(points[i][0]);
+        (*cells)[i * 3 + 1] = double(points[i][1]);
+        (*cells)[i * 3 + 2] = double(points[i][2]);
+    }
+    return RigExecPackPayload(RigExecPayloadKind::Point3, uint64_t(count),
+                              cells->empty() ? nullptr : cells->data(), payload,
+                              reason);
+}
+
 RigExecSurfaceProjectorFrames
 RigExecBakedProjectorFrames(
     const RigExecBakedProgramImpl &B,

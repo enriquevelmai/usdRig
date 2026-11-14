@@ -5430,6 +5430,150 @@ RigExecBakedProgram::RunRequested(UsdTimeCode time,
 }
 
 bool
+RigExecBakedProgram::ExtractRequestedOutputs(
+    const RigExecOutputCatalog &catalog,
+    const RigExecRequestedRunReport &report, UsdTimeCode time,
+    const RigExecOutputGeneration &captured,
+    const std::vector<RigExecOutputHandle> &outputs,
+    std::vector<RigExecOutputPacket> *packets, std::string *error) const
+{
+    const auto fail = [&](const std::string &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (!packets)
+        return fail("no output packet list");
+    *packets = {};
+    const RigExecBakedProgramImpl &B = *_impl;
+    if (!B.opAdapter.compiled)
+        return fail("baked program has no canonical operation graph");
+    if (catalog.GetDemandIndex().OperationCount() != B.opGraph.ops.size())
+        return fail("output catalog is not this program's compiled graph");
+
+    // The default frame is its own identity; a numeric one must be a finite
+    // time code, which is what the demand contract carries.
+    RigExecOutputTime at;
+    if (!time.IsDefault() &&
+        !RigExecOutputTime::TryTimeCode(time.GetValue(), &at))
+        return fail("output extraction needs the default frame or a finite "
+                    "time code");
+
+    // The generation the caller captured names the compiled program by its
+    // compile epoch, as the explicit admission keys it. A request captured
+    // against another epoch is answered, never answered current.
+    const bool staleGeneration = captured.programIdentity != 0 &&
+                                 captured.programIdentity != catalog.GetCompileEpoch();
+
+    // Gather and conversion buffers are the call's, not the program's: a
+    // requested run owns none of this, and one payload's bytes are copied
+    // into their own shared owner before the next output reuses them.
+    std::vector<GfVec3f> gather;
+    std::vector<double> cells;
+    std::vector<RigExecOutputPacket> answers;
+    answers.reserve(outputs.size());
+    for (const RigExecOutputHandle &output : outputs) {
+        RigExecOutputPacket packet;
+        packet.handle = output;
+        packet.time = at;
+        packet.programIdentity = catalog.GetCompileEpoch();
+        packet.inputRevision = captured.inputRevision;
+        packet.previewRevision = captured.previewRevision;
+        packet.historyRevision = captured.historyRevision;
+
+        std::string reason;
+        const RigExecOutputBinding *binding = nullptr;
+        const RigExecOutputStatus resolved =
+            catalog.Resolve(output, &binding, &reason);
+        if (resolved != RigExecOutputStatus::Pending || !binding) {
+            packet.status = resolved;
+            packet.reason = std::move(reason);
+            answers.push_back(std::move(packet));
+            continue;
+        }
+        if (staleGeneration) {
+            packet.status = RigExecOutputStatus::Invalidated;
+            packet.reason = "the captured generation names program " +
+                            std::to_string(captured.programIdentity) +
+                            "; this catalog is epoch " +
+                            std::to_string(catalog.GetCompileEpoch());
+            answers.push_back(std::move(packet));
+            continue;
+        }
+        // The run's own facts decide what stands: a value the closure never
+        // named may hold an earlier generation's bytes, and those are not
+        // this request's answer.
+        const RigExecValueMaterialization *fact = nullptr;
+        for (const RigExecValueMaterialization &candidate : report.values) {
+            if (candidate.value == binding->producerValue) {
+                fact = &candidate;
+                break;
+            }
+            if (candidate.value > binding->producerValue)
+                break;
+        }
+        if (!fact || (!fact->produced && !fact->reused)) {
+            packet.status = RigExecOutputStatus::Pending;
+            packet.reason = "the requested run did not materialize " +
+                            binding->descriptor.semanticKey;
+            answers.push_back(std::move(packet));
+            continue;
+        }
+        // A handle that names a revision asks for that revision. The value
+        // moved past it, so this run's bytes are a different answer.
+        if (output.valueRevision != 0 && output.valueRevision != fact->revision) {
+            packet.status = RigExecOutputStatus::Invalidated;
+            packet.reason = binding->descriptor.semanticKey + " stands at " +
+                            std::to_string(fact->revision) + "; the request " +
+                            "named " + std::to_string(output.valueRevision);
+            answers.push_back(std::move(packet));
+            continue;
+        }
+        const uint32_t domain =
+            B.opAdapter.values[size_t(binding->producerValue)].domain;
+        bool packed = false;
+        switch (binding->kind) {
+        case RigExecOutputKind::Scalar:
+            packed = RigExecBakedExtractPropertyValue(
+                B, RigExecBakedSlotDomain(domain), *binding, &packet.payload,
+                &reason);
+            break;
+        case RigExecOutputKind::Transform:
+            packed = RigExecBakedExtractTransform(B,
+                                                  RigExecBakedSlotDomain(domain),
+                                                  *binding, &packet.payload,
+                                                  &reason);
+            break;
+        case RigExecOutputKind::Points:
+            packed = RigExecBakedExtractPoints(B, RigExecBakedSlotDomain(domain),
+                                               *binding, &gather, &cells,
+                                               &packet.payload, &reason);
+            break;
+        }
+        std::string mismatch;
+        if (!packed ||
+            !RigExecPayloadMatchesHandle(binding->handle, packet.payload,
+                                         &mismatch)) {
+            packet.payload = RigExecOutputPayload{};
+            packet.status = RigExecOutputStatus::Failed;
+            packet.reason = packed ? binding->descriptor.semanticKey + " " +
+                                         mismatch
+                                   : std::move(reason);
+            answers.push_back(std::move(packet));
+            continue;
+        }
+        packet.handle = binding->handle;
+        packet.handle.valueRevision = fact->revision;
+        packet.status = RigExecOutputStatus::Ready;
+        answers.push_back(std::move(packet));
+    }
+    if (error)
+        error->clear();
+    *packets = std::move(answers);
+    return true;
+}
+
+bool
 RigExecBakedProgram::SampleStageFrameSeeds(UsdTimeCode time,
                                            RigExecStageFrameSeeds *seeds,
                                            std::string *error) const

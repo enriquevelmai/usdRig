@@ -2332,4 +2332,47 @@ RigExecBakedPublishPropertyChains(RigExecBakedProgramImpl *program,
     }
 }
 
+bool
+RigExecBakedExtractPropertyValue(const RigExecBakedProgramImpl &program,
+                                 RigExecBakedSlotDomain domain,
+                                 const RigExecOutputBinding &binding,
+                                 RigExecOutputPayload *payload,
+                                 std::string *reason)
+{
+    const auto fail = [&](const std::string &message) {
+        if (reason)
+            *reason = message;
+        return false;
+    };
+    if (domain != RigExecBakedSlotDomain::PropertyResult)
+        return fail("property output " + binding.descriptor.semanticKey +
+                    " binds storage the property half does not publish");
+    if (binding.object >= program.propertyChains.size())
+        return fail("property output " + binding.descriptor.semanticKey +
+                    " names a chain the program does not hold");
+    const Chain &chain = program.propertyChains[size_t(binding.object)];
+    // Discovery exports only the float and double arms, whose payload is one
+    // double; the matrix and vec3f arms have no layout to pack.
+    if (chain.arm != Chain::Arm::Float && chain.arm != Chain::Arm::Double)
+        return fail("property chain " + binding.descriptor.target +
+                    " has no scalar payload for its type");
+    const size_t version = size_t(chain.versionBase) + size_t(binding.version);
+    if (version >= program.propertyValues.size() ||
+        version >= program.propertyVersionValid.size())
+        return fail("property output " + binding.descriptor.semanticKey +
+                    " names a version the program does not hold");
+    // The body running is not the body writing: a chain whose base read
+    // failed, or whose authored base was not finite, leaves its storage
+    // untouched and its valid byte 0.
+    if (!program.propertyVersionValid[version])
+        return fail("property chain " + binding.descriptor.target +
+                    " at phase " + binding.descriptor.phase +
+                    " produced no value");
+    const RigExecBakedPropertyValue &stored = program.propertyValues[version];
+    const double value = chain.arm == Chain::Arm::Float ? double(stored.f)
+                                                        : stored.d;
+    return RigExecPackPayload(RigExecPayloadKind::Scalar, 1, &value, payload,
+                              reason);
+}
+
 } // namespace rigExec

@@ -18,6 +18,7 @@
 #include "rigExecScene/geometrySceneTranslation.h"
 #include "bakedClusters.h"
 #include "bakedProgram.h"
+#include "outputCatalog.h"
 #include "rigExecScene/autoClavicleGraph.h"
 #include "frameExtraction.h"
 #include "moverGraph.h"
@@ -5908,6 +5909,33 @@ bool RigExecBakedPublishPose(RigExecBakedProgramImpl *program,
 /// Publishes each geometry chain and derived target in chain order.
 void RigExecBakedPublishGeometry(RigExecBakedProgramImpl *program,
                                  RigExecRigPose *pose);
+
+/// Post-join payload extraction for one output binding (docs/specs/
+/// output-subscriptions.md), one per output domain. Each reads the retained
+/// storage \p domain names and packs it in the layout the binding's handle
+/// declares; a point payload aggregates the chunks the run computed and
+/// nothing here computes a rig result. False with a reason when that storage
+/// holds no published value, which is asked separately from whether the body
+/// ran: `produced` says the body ran, not that it wrote a value.
+bool RigExecBakedExtractPropertyValue(const RigExecBakedProgramImpl &program,
+                                      RigExecBakedSlotDomain domain,
+                                      const RigExecOutputBinding &binding,
+                                      RigExecOutputPayload *payload,
+                                      std::string *reason);
+bool RigExecBakedExtractTransform(const RigExecBakedProgramImpl &program,
+                                  RigExecBakedSlotDomain domain,
+                                  const RigExecOutputBinding &binding,
+                                  RigExecOutputPayload *payload,
+                                  std::string *reason);
+/// \p gather and \p cells are the caller's scratch, reused per output: the
+/// gathered version is only readable until the copy into packed doubles.
+bool RigExecBakedExtractPoints(const RigExecBakedProgramImpl &program,
+                               RigExecBakedSlotDomain domain,
+                               const RigExecOutputBinding &binding,
+                               std::vector<GfVec3f> *gather,
+                               std::vector<double> *cells,
+                               RigExecOutputPayload *payload,
+                               std::string *reason);
 
 /// What ChainStatus publishes for \p chain: its points, or in shader mode
 /// its program (RigExecGpuDeformPublication).
