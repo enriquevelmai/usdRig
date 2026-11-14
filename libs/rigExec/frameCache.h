@@ -24,16 +24,20 @@
 #define RIGEXEC_FRAME_CACHE_H
 
 #include "rigEvaluator.h"
+#include "rigExecGraph/outputDemand.h"
 
 #include "pxr/usd/usd/timeCode.h"
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -153,13 +157,13 @@ struct RigExecFrameCacheStats {
 uint64_t RigExecUpstreamFoldHash(const VtValue &value);
 
 uint64_t RigExecControlStateDigest(const RigExecFrameInputs &inputs);
-uint64_t RigExecControlStateDigest(
-    const RigExecFrameInputs &inputs,
-    const std::vector<RigExecValueOverride> &overrides);
-uint64_t RigExecControlStateDigest(
-    const RigExecFrameInputs &inputs,
-    const std::vector<RigExecValueOverride> &overrides,
-    const std::vector<RigExecUpstreamValue> &upstream);
+uint64_t
+RigExecControlStateDigest(const RigExecFrameInputs &inputs,
+                          const std::vector<RigExecValueOverride> &overrides);
+uint64_t
+RigExecControlStateDigest(const RigExecFrameInputs &inputs,
+                          const std::vector<RigExecValueOverride> &overrides,
+                          const std::vector<RigExecUpstreamValue> &upstream);
 
 /// Level-1 digest of one sampled input: its path, its valuelessness, and
 /// its value folded exactly as the control digest folds one sample. The
@@ -190,14 +194,15 @@ std::shared_ptr<const RigExecFrameDigestOrder> RigExecRecordFrameDigestOrder(
 
 /// Whether \p order was recorded from \p values' path sequence; false for a
 /// null order.
-bool RigExecFrameDigestOrderMatches(
-    const RigExecFrameDigestOrder *order,
-    const std::vector<RigExecSampledInput> &values);
+bool
+RigExecFrameDigestOrderMatches(const RigExecFrameDigestOrder *order,
+                               const std::vector<RigExecSampledInput> &values);
 
 /// The text bytes of every path in \p order's recorded sequence (the sum of
 /// GetString().size(), duplicates included), computed once when the order
 /// was recorded. 0 for null.
-size_t RigExecFrameDigestOrderPathTextBytes(const RigExecFrameDigestOrder *order);
+size_t
+RigExecFrameDigestOrderPathTextBytes(const RigExecFrameDigestOrder *order);
 
 /// Whether \p path is one of \p order's first-win paths (binary search over
 /// the recorded sorted order). False for null.
@@ -211,7 +216,7 @@ bool RigExecFrameDigestOrderHasPath(const RigExecFrameDigestOrder *order,
 /// passes through it, so a constant patch opens a new key namespace while
 /// the compiled rig half stays standing. Within-process only, like the key hash.
 uint64_t RigExecFoldConstantDigest(uint64_t controlDigest,
-                                  uint64_t constantDigest);
+                                   uint64_t constantDigest);
 
 /// The control half of the cache key with compiled rig constant coverage: the
 /// plain control digest folded with \p constantDigest. Lookup, memoization,
@@ -225,8 +230,7 @@ uint64_t RigExecControlStateDigestWithConstants(
 uint64_t RigExecControlStateDigestWithConstants(
     const RigExecFrameInputs &inputs,
     const std::vector<RigExecValueOverride> &overrides,
-    const std::vector<RigExecUpstreamValue> &upstream,
-    uint64_t constantDigest);
+    const std::vector<RigExecUpstreamValue> &upstream, uint64_t constantDigest);
 
 /// The control-state digest of a burst-cached vector: identical to
 /// RigExecControlStateDigest for the same inputs, but level-1s served
@@ -277,13 +281,13 @@ bool RigExecControlStateDigestible(
 /// dynamic walk reads authored-level.
 ///
 /// Within-process only, like the key hash: never persisted.
-uint64_t RigExecRefusalControlDigest(
-    UsdTimeCode time, uint64_t stageEditSerial,
-    const std::vector<RigExecValueOverride> &overrides);
-uint64_t RigExecRefusalControlDigest(
-    UsdTimeCode time, uint64_t stageEditSerial,
-    const std::vector<RigExecValueOverride> &overrides,
-    const std::vector<RigExecUpstreamValue> &upstream);
+uint64_t
+RigExecRefusalControlDigest(UsdTimeCode time, uint64_t stageEditSerial,
+                            const std::vector<RigExecValueOverride> &overrides);
+uint64_t
+RigExecRefusalControlDigest(UsdTimeCode time, uint64_t stageEditSerial,
+                            const std::vector<RigExecValueOverride> &overrides,
+                            const std::vector<RigExecUpstreamValue> &upstream);
 
 /// Whether every override in \p overrides (and upstream value in
 /// \p upstream) can be digested exactly (time always folds). False bypasses
@@ -355,6 +359,355 @@ constexpr size_t kRigExecProvenanceAliasCap = 1024;
 /// the retained source snapshot beside it.
 size_t RigExecFrameCachePoseBytes(const RigExecRigPose &pose);
 
+// ------------------------------------------------------------
+// Partial output coverage
+// ------------------------------------------------------------
+// Coverage records sit beside the poses in the same partitions and share the
+// byte cap, but the pose store and its LRU pass never read or drop one. Their
+// retention is bounded at admission: a charge that would take the shared budget
+// past the cap is refused before anything is allocated.
+
+/// One requested run's identity. Time is key material here, unlike the
+/// full-pose store: a coverage record names the outputs one run answered at
+/// one frame. Any field differing -- a new epoch, a shifted frame, a moved
+/// input, preview, upstream, or history revision -- names a different record,
+/// so a stale generation misses rather than serving a plausible partial.
+struct RigExecCoverageKey {
+    std::string rigIdentity;
+    uint64_t compileEpoch = 0;
+    RigExecOutputTime time;
+    RigExecOutputGeneration generation;
+    uint64_t upstreamRevision = 0;
+
+    bool operator==(const RigExecCoverageKey &other) const
+    {
+        return rigIdentity == other.rigIdentity &&
+               compileEpoch == other.compileEpoch && time == other.time &&
+               generation == other.generation &&
+               upstreamRevision == other.upstreamRevision;
+    }
+
+    bool operator!=(const RigExecCoverageKey &other) const
+    {
+        return !(*this == other);
+    }
+
+    bool operator<(const RigExecCoverageKey &other) const
+    {
+        if (rigIdentity != other.rigIdentity) {
+            return rigIdentity < other.rigIdentity;
+        }
+        if (compileEpoch != other.compileEpoch) {
+            return compileEpoch < other.compileEpoch;
+        }
+        if (time != other.time) {
+            return time < other.time;
+        }
+        if (generation != other.generation) {
+            const auto genLess = [](const RigExecOutputGeneration &a,
+                                    const RigExecOutputGeneration &b) {
+                if (a.programIdentity != b.programIdentity) {
+                    return a.programIdentity < b.programIdentity;
+                }
+                if (a.inputRevision != b.inputRevision) {
+                    return a.inputRevision < b.inputRevision;
+                }
+                if (a.previewRevision != b.previewRevision) {
+                    return a.previewRevision < b.previewRevision;
+                }
+                return a.historyRevision < b.historyRevision;
+            };
+            return genLess(generation, other.generation);
+        }
+        return upstreamRevision < other.upstreamRevision;
+    }
+};
+
+struct RigExecCoverageKeyHash {
+    size_t operator()(const RigExecCoverageKey &key) const noexcept
+    {
+        // The FNV chain the frame-cache key uses, over every field. The time
+        // and the generation fold through their own hashes, so the default
+        // frame never collides with frame zero.
+        uint64_t hash = 1469598103934665603ull;
+        const auto fold = [&hash](uint64_t word) {
+            hash ^= word;
+            hash *= 1099511628211ull;
+        };
+        fold(uint64_t(std::hash<std::string>{}(key.rigIdentity)));
+        fold(key.compileEpoch);
+        fold(uint64_t(key.time.Hash()));
+        fold(uint64_t(key.generation.Hash()));
+        fold(key.upstreamRevision);
+        return size_t(hash);
+    }
+};
+
+/// The byte domains a coverage record accounts: the inputs a run captured, the
+/// workspace arena its payloads came from, the payload packets themselves, and
+/// the payload bytes a live lease is holding. A pin moves a payload's bytes out
+/// of Payload into Pinned, so the same bytes are never counted twice.
+enum class RigExecCoverageDomain { Capture, Workspace, Payload, Pinned };
+
+struct RigExecCoverageBytes {
+    size_t capture = 0;
+    size_t workspace = 0;
+    size_t payload = 0;
+    size_t pinned = 0;
+
+    /// Overflow-safe: false when the sum would wrap, leaving \p out untouched.
+    bool TryTotal(size_t *out) const
+    {
+        size_t total = capture;
+        for (size_t part : {workspace, payload, pinned}) {
+            if (total > (std::numeric_limits<size_t>::max)() - part) {
+                return false;
+            }
+            total += part;
+        }
+        *out = total;
+        return true;
+    }
+
+    /// Checked \p bytes onto one domain, returning false (unchanged) when the
+    /// domain would wrap.
+    bool TryAdd(RigExecCoverageDomain domain, size_t bytes)
+    {
+        size_t *slot = Slot(domain);
+        if (!slot || bytes > (std::numeric_limits<size_t>::max)() - *slot) {
+            return false;
+        }
+        *slot += bytes;
+        return true;
+    }
+
+    /// Checked \p bytes off one domain, returning false (unchanged) when the
+    /// domain holds less than the release: an unbalanced release never wraps.
+    bool TrySub(RigExecCoverageDomain domain, size_t bytes)
+    {
+        size_t *slot = Slot(domain);
+        if (!slot || bytes > *slot) {
+            return false;
+        }
+        *slot -= bytes;
+        return true;
+    }
+
+    size_t *Slot(RigExecCoverageDomain domain)
+    {
+        switch (domain) {
+        case RigExecCoverageDomain::Capture:
+            return &capture;
+        case RigExecCoverageDomain::Workspace:
+            return &workspace;
+        case RigExecCoverageDomain::Payload:
+            return &payload;
+        case RigExecCoverageDomain::Pinned:
+            return &pinned;
+        }
+        return nullptr;
+    }
+
+    size_t Slot(RigExecCoverageDomain domain) const
+    {
+        switch (domain) {
+        case RigExecCoverageDomain::Capture:
+            return capture;
+        case RigExecCoverageDomain::Workspace:
+            return workspace;
+        case RigExecCoverageDomain::Payload:
+            return payload;
+        case RigExecCoverageDomain::Pinned:
+            return pinned;
+        }
+        return 0;
+    }
+
+    bool operator==(const RigExecCoverageBytes &other) const
+    {
+        return capture == other.capture && workspace == other.workspace &&
+               payload == other.payload && pinned == other.pinned;
+    }
+};
+
+/// Whether \p lhs plus \p rhs fits without wrapping, in \p out.
+inline bool
+RigExecCheckedAdd(size_t lhs, size_t rhs, size_t *out)
+{
+    if (!out || rhs > (std::numeric_limits<size_t>::max)() - lhs) {
+        return false;
+    }
+    *out = lhs + rhs;
+    return true;
+}
+
+/// Whether \p lhs minus \p rhs stays non-negative, in \p out.
+inline bool
+RigExecCheckedSub(size_t lhs, size_t rhs, size_t *out)
+{
+    if (!out || rhs > lhs) {
+        return false;
+    }
+    *out = lhs - rhs;
+    return true;
+}
+
+class RigExecFrameCache;
+
+/// A charge on the coverage budget, taken before the caller allocates. The
+/// cache refuses a charge that would exceed the byte cap, so a run is declined
+/// rather than allocated over budget. Committing it hands the charge to a
+/// record (PublishCoverage); dropping it without committing returns it. Either
+/// path balances the account, and an uncommitted reservation releases when it
+/// dies. The reservation must die with the cache that admitted it.
+class RigExecCoverageReservation {
+public:
+    RigExecCoverageReservation() = default;
+    ~RigExecCoverageReservation();
+
+    RigExecCoverageReservation(const RigExecCoverageReservation &) = delete;
+    RigExecCoverageReservation &
+    operator=(const RigExecCoverageReservation &) = delete;
+    RigExecCoverageReservation(RigExecCoverageReservation &&other)
+        : _cache(other._cache), _bytes(other._bytes)
+    {
+        other._cache = nullptr;
+        other._bytes = RigExecCoverageBytes();
+    }
+    RigExecCoverageReservation &operator=(RigExecCoverageReservation &&other)
+    {
+        if (this != &other) {
+            Release();
+            _cache = other._cache;
+            _bytes = other._bytes;
+            other._cache = nullptr;
+            other._bytes = RigExecCoverageBytes();
+        }
+        return *this;
+    }
+
+    bool IsValid() const
+    {
+        return _cache != nullptr;
+    }
+    RigExecCoverageBytes Bytes() const
+    {
+        return _bytes;
+    }
+
+    /// Grows the charge by \p bytes in one domain. false, leaving the
+    /// reservation unchanged, when the grown request overflows or exceeds the
+    /// cap.
+    bool Extend(RigExecCoverageDomain domain, size_t bytes);
+
+    /// Returns the charge to the cache and empties the reservation. Idempotent:
+    /// a released reservation returns false.
+    bool Release();
+
+private:
+    friend class RigExecFrameCache;
+    RigExecCoverageReservation(RigExecFrameCache *cache,
+                               const RigExecCoverageBytes &bytes)
+        : _cache(cache), _bytes(bytes)
+    {
+    }
+
+    RigExecFrameCache *_cache = nullptr;
+    RigExecCoverageBytes _bytes;
+};
+
+/// A live lease on one coverage payload. While a lease stands, the cache
+/// counts its bytes in the pinned domain and never drops the record
+/// underneath it; the lease's owner returns the bytes by releasing or
+/// destroying the lease. A record replaced or cleared while a lease stands
+/// keeps that lease's bytes charged, and the lease keeps serving the packet
+/// it pinned. The lease must die with the cache that admitted it.
+class RigExecCoverageLease {
+public:
+    RigExecCoverageLease() = default;
+    ~RigExecCoverageLease();
+
+    RigExecCoverageLease(const RigExecCoverageLease &) = delete;
+    RigExecCoverageLease &operator=(const RigExecCoverageLease &) = delete;
+    RigExecCoverageLease(RigExecCoverageLease &&other)
+        : _cache(other._cache), _entry(std::move(other._entry)),
+          _key(std::move(other._key)), _handle(std::move(other._handle)),
+          _packet(std::move(other._packet)), _bytes(other._bytes)
+    {
+        other._cache = nullptr;
+        other._bytes = 0;
+    }
+    RigExecCoverageLease &operator=(RigExecCoverageLease &&other)
+    {
+        if (this != &other) {
+            Release();
+            _cache = other._cache;
+            _entry = std::move(other._entry);
+            _key = std::move(other._key);
+            _handle = std::move(other._handle);
+            _packet = std::move(other._packet);
+            _bytes = other._bytes;
+            other._cache = nullptr;
+            other._bytes = 0;
+        }
+        return *this;
+    }
+
+    bool IsValid() const
+    {
+        return _cache != nullptr && _bytes > 0;
+    }
+    size_t ByteCount() const
+    {
+        return _bytes;
+    }
+    const RigExecOutputPacket &Packet() const
+    {
+        return _packet;
+    }
+
+    /// Ends the lease and returns its bytes to the pinned domain. Idempotent:
+    /// a released lease returns false.
+    bool Release();
+
+private:
+    friend class RigExecFrameCache;
+    RigExecCoverageLease(const RigExecFrameCache *cache,
+                         const RigExecCoverageKey &key,
+                         std::shared_ptr<void> entry,
+                         const RigExecOutputHandle &handle,
+                         const RigExecOutputPacket &packet, size_t bytes)
+        : _cache(cache), _entry(std::move(entry)), _key(key), _handle(handle),
+          _packet(packet), _bytes(bytes)
+    {
+    }
+
+    // The record this lease pinned, type-erased so the lease can name it
+    // without exposing the cache's internal storage: the byte hand-back lands
+    // on this record, never on a later one published under the same key.
+    std::shared_ptr<void> _entry;
+    const RigExecFrameCache *_cache = nullptr;
+    RigExecCoverageKey _key;
+    RigExecOutputHandle _handle;
+    RigExecOutputPacket _packet;
+    size_t _bytes = 0;
+};
+
+/// One run's Ready outputs. \p packets is the explicit export coverage: the
+/// record answers exactly the handles it names, and a pose lookup never reads
+/// it. \p arenaRetained says the workspace those payloads were produced from
+/// still stands. That is a separate fact from the payloads -- a hit on a
+/// covered output serves its bytes and never implies the ancestors behind them
+/// exist, because the arena can be retired, or never captured, while the bytes
+/// it wrote stay reusable.
+struct RigExecCoverageRecord {
+    RigExecCoverageKey key;
+    std::vector<RigExecOutputPacket> packets;
+    RigExecCoverageBytes bytes;
+    bool arenaRetained = false;
+    size_t leases = 0;
+};
+
 /// The (compiledRigSignature, controlDigest) store. See the file header for the key
 /// contract and the lock rule.
 class RigExecFrameCache {
@@ -423,8 +776,7 @@ public:
     /// that serves many frames. No-op when no entry is held, when the time
     /// is already listed, or past the alias cap. Called on the serving
     /// path (a cache hit); under the shard lock, never across evaluation.
-    void NoteProvenanceAlias(const RigExecFrameCacheKey &key,
-                             UsdTimeCode time);
+    void NoteProvenanceAlias(const RigExecFrameCacheKey &key, UsdTimeCode time);
 
     /// Drops the entry under \p key, if any. Returns whether one was held.
     bool Evict(const RigExecFrameCacheKey &key);
@@ -449,7 +801,96 @@ public:
 
     RigExecFrameCacheStats Stats() const;
 
+    // ---- partial output coverage ----
+
+    /// Charges the coverage budget for \p request before the caller allocates.
+    /// false, having charged nothing, when the request overflows or would take
+    /// the budget (the full-pose store plus every standing coverage charge)
+    /// over the byte cap. On success \p reservationOut owns the charge; see
+    /// RigExecCoverageReservation for the commit-or-release contract.
+    bool TryReserveCoverage(const RigExecCoverageBytes &request,
+                            RigExecCoverageReservation *reservationOut);
+
+    /// Returns a charge to the coverage budget. false when a domain holds fewer
+    /// bytes than the release, having released nothing: an unbalanced release is
+    /// declined rather than wrapped.
+    bool ReleaseCoverage(const RigExecCoverageBytes &bytes) const;
+
+    /// Every coverage charge standing right now, per domain.
+    RigExecCoverageBytes CoverageHeld() const;
+    size_t CoverageRecordCount() const;
+
+    /// Publishes \p packets as the coverage of one run: the explicit export
+    /// coverage of \p key, charged by \p reservation (a reservation with no
+    /// bytes accounts nothing). Publishing under a held key replaces the record
+    /// and releases the bytes the old one held, except the pinned bytes a live
+    /// lease still owes: that lease keeps its charge and its packet. A record is
+    /// never a pose, and a full-pose Lookup never reads one. false when the
+    /// coverage names no output.
+    bool PublishCoverage(const RigExecCoverageKey &key,
+                         const std::vector<RigExecOutputPacket> &packets,
+                         RigExecCoverageReservation reservation,
+                         bool arenaRetained);
+
+    /// Copies the record standing at \p key, or false when none does: a key
+    /// differing in epoch, time, or any revision is a different record, so a
+    /// stale generation misses. Touches no byte account.
+    bool LookupCoverage(const RigExecCoverageKey &key,
+                        RigExecCoverageRecord *recordOut) const;
+
+    /// Answers one exported output at \p key: the packet must be Ready for
+    /// \p handle at exactly the key's time and generation, and its payload must
+    /// match the handle's declared layout. A handle the record does not cover,
+    /// a stale generation, or a payload whose bytes were released all miss.
+    bool CoverageAnswers(const RigExecCoverageKey &key,
+                         const RigExecOutputHandle &handle,
+                         RigExecOutputPacket *packetOut) const;
+
+    /// How many of \p handles the record at \p key answers. A record naming no
+    /// outputs, or none of \p handles, returns 0. \p packetOut may be null to
+    /// count without taking the packets.
+    size_t
+    CoverageAnswerCount(const RigExecCoverageKey &key,
+                        const std::vector<RigExecOutputHandle> &handles,
+                        std::vector<RigExecOutputPacket> *packetOut) const;
+
+    /// Whether the workspace behind a record's payloads still stands. A
+    /// coverage hit says nothing about this: payload reuse outlives the arena
+    /// that produced it. false when no record is held.
+    bool CoverageArenaRetained(const RigExecCoverageKey &key) const;
+
+    /// Releases the workspace charge and marks the arena retired, keeping every
+    /// payload. false when no record is held or the arena is already retired.
+    bool RetireCoverageArena(const RigExecCoverageKey &key);
+
+    /// Drops one payload from a record, releasing its payload charge. A payload
+    /// a lease is holding keeps its bytes pinned: the record's own reference
+    /// detaches (records sharing the buffer keep theirs) while the lease still
+    /// owes the bytes. A record left with no payloads, no arena and no lease is
+    /// removed. false when the record does not name \p handle.
+    bool ReleaseCoveragePayload(const RigExecCoverageKey &key,
+                                const RigExecOutputHandle &handle);
+
+    /// Takes a live lease on the payload answering \p handle at \p key: its
+    /// bytes move from the payload charge to the pinned charge, and the cache
+    /// will not drop a record with a standing lease. false when the record does
+    /// not answer that handle.
+    bool PinCoverage(const RigExecCoverageKey &key,
+                     const RigExecOutputHandle &handle,
+                     RigExecCoverageLease *leaseOut);
+
+    /// Drops the record at \p key and releases its bytes. false when no record
+    /// is held or a lease still stands on it: a live lease is never revoked.
+    bool EvictCoverage(const RigExecCoverageKey &key);
+
+    /// Drops every record with no standing lease, returning how many were held.
+    /// Pinned records stay, and their bytes stay charged until the lease
+    /// releases.
+    size_t ClearCoverageUnpinned();
+
 private:
+    friend class RigExecCoverageReservation;
+    friend class RigExecCoverageLease;
     // One stored generation behind a shared handle: Lookup copies the handle
     // under the shard lock and the pose outside it, which is what keeps
     // allocation and copying out of the critical section.
@@ -471,13 +912,37 @@ private:
         // recently-used entry early (a miss, never a wrong pose).
         mutable std::atomic<uint64_t> lastUse{0};
     };
+    struct _CoveredOutput {
+        // The answered packet, payload included. A lease copies this handle, so
+        // releasing the record's reference (CoW) leaves the lease holding the
+        // same buffer.
+        RigExecOutputPacket packet;
+        // The payload's bytes are held by a live lease: they sit in the pinned
+        // charge, not the payload charge.
+        bool leased = false;
+    };
+    struct _CoverageEntry {
+        std::vector<_CoveredOutput> outputs;
+        RigExecCoverageBytes bytes;
+        bool arenaRetained = false;
+        size_t leases = 0;
+    };
+    using _CoverageMap =
+        std::unordered_map<RigExecCoverageKey, std::shared_ptr<_CoverageEntry>,
+                           RigExecCoverageKeyHash>;
     struct _Shard {
         mutable std::mutex mutex;
         // Mutable: Lookup edits through a const handle -- refreshing the
         // LRU position and dropping corrupt entries -- the same way it
         // counts hits and misses through one.
-        mutable std::unordered_map<RigExecFrameCacheKey, std::shared_ptr<_Entry>,
-                                   RigExecFrameCacheKeyHash> map;
+        mutable std::unordered_map<RigExecFrameCacheKey,
+                                   std::shared_ptr<_Entry>,
+                                   RigExecFrameCacheKeyHash>
+            map;
+        // Partial coverage records for the same key partition, behind the
+        // same lock: a coverage record is never a pose, and the pose map
+        // above never reads one.
+        mutable _CoverageMap coverage;
     };
     static constexpr size_t _kShardCount = 16;
 
@@ -490,6 +955,17 @@ private:
         return _shards[RigExecFrameCacheKeyHash{}(key) % _kShardCount];
     }
 
+    // Coverage records live in the same partition as the poses, behind the
+    // same shard lock: one lock per run, never a store-wide one.
+    _Shard &_GetCoverageShard(const RigExecCoverageKey &key)
+    {
+        return _shards[RigExecCoverageKeyHash{}(key) % _kShardCount];
+    }
+    const _Shard &_GetCoverageShard(const RigExecCoverageKey &key) const
+    {
+        return _shards[RigExecCoverageKeyHash{}(key) % _kShardCount];
+    }
+
     // Evicts least-recently-used entries until the held bytes fit the cap,
     // locking one shard at a time: a scan pass finds the globally-oldest
     // entry, a second pass drops it if it is still that old. A racing touch
@@ -499,8 +975,32 @@ private:
     // Reports dropped entries outside every shard lock. \p evicted is
     // moved-from; an empty vector reports nothing. Const so Lookup's
     // corrupt drop (itself const) reports through the same path.
-    void _ReportEvictions(
-        std::vector<RigExecFrameCacheEviction> evicted) const;
+    void _ReportEvictions(std::vector<RigExecFrameCacheEviction> evicted) const;
+
+    // Charges or releases \p bytes across the four domains. false, having
+    // charged nothing, when a domain would wrap, or (for a charge) when the
+    // budget would exceed the byte cap. As with pose publishing, a burst of
+    // concurrent charges can overshoot the cap transiently by the burst that
+    // passes the check together.
+    bool _ChargeCoverage(const RigExecCoverageBytes &bytes) const;
+    bool _ReleaseCharge(const RigExecCoverageBytes &bytes) const;
+    // Moves \p bytes of a live payload from the payload charge to the pinned
+    // charge: the total does not change, so pinning cannot take the store over
+    // the cap by itself.
+    bool _PinPayload(size_t bytes) const;
+    // Ends a lease. Its pinned bytes return to the payload charge only where
+    // the record it pinned still holds the buffer; a record replaced or
+    // cleared under a live lease leaves only that lease's charge behind. Held
+    // for the map edit only.
+    void _EndCoverageLease(const RigExecCoverageKey &key,
+                           const std::shared_ptr<void> &entry,
+                           const RigExecOutputHandle &handle,
+                           size_t bytes) const;
+    // Drops the record at \p it from the store, releasing every charge but the
+    // pinned bytes a live lease still owes. The record stays alive while a
+    // lease holds it. Caller holds the shard lock.
+    void _DetachCoverageEntry(_Shard &shard, _CoverageMap::iterator it);
+    RigExecCoverageBytes _CoverageCharge() const;
 
     mutable std::array<_Shard, _kShardCount> _shards;
     mutable std::atomic<uint64_t> _clock{1};
@@ -511,10 +1011,15 @@ private:
     mutable std::atomic<size_t> _evictions{0};
     mutable std::atomic<size_t> _entryCount{0};
     mutable std::atomic<size_t> _bytes{0};
+    mutable std::atomic<size_t> _coverageCapture{0};
+    mutable std::atomic<size_t> _coverageWorkspace{0};
+    mutable std::atomic<size_t> _coveragePayload{0};
+    mutable std::atomic<size_t> _coveragePinned{0};
+    mutable std::atomic<size_t> _coverageRecords{0};
     mutable std::mutex _callbackMutex;
     RigExecFrameCacheEvictionCallback _evictionCallback;
 };
 
-}  // namespace rigExec
+} // namespace rigExec
 
-#endif  // RIGEXEC_FRAME_CACHE_H
+#endif // RIGEXEC_FRAME_CACHE_H

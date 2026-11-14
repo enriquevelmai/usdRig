@@ -1096,6 +1096,775 @@ TestClearDuringConcurrentPublishKeepsAccountingHonest()
     CHECK(cache.Stats().entryCount == 1);
 }
 
+// ------------------------------------------------------------
+// Coverage: partial records, generation keys, and lease accounting
+// ------------------------------------------------------------
+
+RigExecOutputHandle
+MakeHandle(const std::string &key,
+           const std::string &type = RigExecPayloadText::scalar)
+{
+    RigExecOutputHandle handle;
+    handle.rigIdentity = "rigA";
+    handle.compileEpoch = 1;
+    handle.semanticKey = key;
+    handle.type = type;
+    handle.readPhase = "final";
+    handle.valueRevision = 1;
+    return handle;
+}
+
+RigExecOutputTime
+MakeTime(double timeCode)
+{
+    RigExecOutputTime time;
+    CHECK(RigExecOutputTime::TryTimeCode(timeCode, &time));
+    return time;
+}
+
+RigExecOutputGeneration
+MakeGeneration(uint64_t program, uint64_t input, uint64_t preview,
+               uint64_t history)
+{
+    RigExecOutputGeneration generation;
+    generation.programIdentity = program;
+    generation.inputRevision = input;
+    generation.previewRevision = preview;
+    generation.historyRevision = history;
+    return generation;
+}
+
+RigExecCoverageKey
+MakeCoverageKey(uint64_t epoch, double time, const RigExecOutputGeneration &gen,
+                uint64_t upstream = 0)
+{
+    RigExecCoverageKey key;
+    key.rigIdentity = "rigA";
+    key.compileEpoch = epoch;
+    key.time = MakeTime(time);
+    key.generation = gen;
+    key.upstreamRevision = upstream;
+    return key;
+}
+
+// Elements of one layout, with distinct bytes, so a released or shared buffer
+// can be told apart from any other.
+RigExecOutputPayload
+MakePayload(RigExecPayloadKind kind, size_t elements)
+{
+    const size_t elementBytes = RigExecPayloadElementBytes(kind);
+    std::vector<uint8_t> bytes(elements * elementBytes);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = uint8_t((i * 31 + 7) & 0xff);
+    }
+    RigExecOutputPayload payload;
+    payload.bytes =
+        std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+    payload.kind = kind;
+    payload.elementCount = elements;
+    return payload;
+}
+
+RigExecOutputPacket
+MakePacket(const RigExecOutputHandle &handle, const RigExecOutputTime &time,
+           const RigExecOutputGeneration &gen, RigExecPayloadKind kind,
+           size_t elements)
+{
+    RigExecOutputPacket packet;
+    packet.handle = handle;
+    packet.time = time;
+    packet.programIdentity = gen.programIdentity;
+    packet.inputRevision = gen.inputRevision;
+    packet.previewRevision = gen.previewRevision;
+    packet.historyRevision = gen.historyRevision;
+    packet.status = RigExecOutputStatus::Ready;
+    packet.payload = MakePayload(kind, elements);
+    return packet;
+}
+
+// Charges capture/workspace/payload against cache. The returned reservation is
+// invalid when the cap refused it.
+RigExecCoverageReservation
+Reserve(RigExecFrameCache &cache, size_t capture, size_t workspace,
+        size_t payload)
+{
+    RigExecCoverageReservation reservation;
+    cache.TryReserveCoverage(
+        RigExecCoverageBytes{capture, workspace, payload, 0}, &reservation);
+    return reservation;
+}
+
+size_t
+CoverageTotal(const RigExecFrameCache &cache)
+{
+    size_t total = 0;
+    CHECK(cache.CoverageHeld().TryTotal(&total));
+    return total;
+}
+
+// Every part of the key names a different run: epoch, frame, program, input,
+// preview, history, and upstream revision each decide the record.
+void
+TestCoverageKeySeesEveryGenerationField()
+{
+    const RigExecOutputGeneration gen = MakeGeneration(1, 2, 3, 4);
+    const RigExecCoverageKey base = MakeCoverageKey(1, 5.0, gen, 7);
+    RigExecCoverageKeyHash hash;
+
+    CHECK(base == MakeCoverageKey(1, 5.0, gen, 7));
+    CHECK(hash(base) == hash(MakeCoverageKey(1, 5.0, gen, 7)));
+    CHECK(base != MakeCoverageKey(2, 5.0, gen, 7));
+    CHECK(base != MakeCoverageKey(1, 6.0, gen, 7));
+    CHECK(base != MakeCoverageKey(1, 5.0, MakeGeneration(9, 2, 3, 4), 7));
+    CHECK(base != MakeCoverageKey(1, 5.0, MakeGeneration(1, 2, 3, 5), 7));
+    CHECK(base != MakeCoverageKey(1, 5.0, gen, 8));
+
+    // The default frame is not frame 0.
+    RigExecCoverageKey defaultFrame = base;
+    defaultFrame.time = RigExecOutputTime();
+    CHECK(base != defaultFrame);
+    CHECK(hash(base) != hash(defaultFrame));
+
+    // Ordering agrees with equality, so a sorted index can hold keys.
+    CHECK(base < MakeCoverageKey(1, 5.0, MakeGeneration(2, 2, 3, 4), 7));
+    CHECK(!(MakeCoverageKey(1, 5.0, MakeGeneration(2, 2, 3, 4), 7) < base));
+}
+
+// Admission refuses an over-budget request before anything is allocated, and a
+// record with no outputs never lands.
+void
+TestCoverageAdmissionRefusesBeforeAllocating()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(100);
+
+    RigExecCoverageReservation admitted = Reserve(cache, 0, 0, 80);
+    CHECK(admitted.IsValid());
+    CHECK(cache.CoverageHeld().payload == 80);
+    CHECK(!Reserve(cache, 0, 0, 200).IsValid());
+    // The refused charge left nothing behind: the admitted 80 is still there.
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().payload == 80);
+    CHECK(cache.CoverageHeld().pinned == 0);
+
+    CHECK(admitted.Release());
+    CHECK(!admitted.IsValid());
+    CHECK(CoverageTotal(cache) == 0);
+
+    RigExecCoverageReservation refused = Reserve(cache, 0, 0, 200);
+    CHECK(!refused.IsValid());
+    CHECK(CoverageTotal(cache) == 0);
+
+    const RigExecCoverageKey key =
+        MakeCoverageKey(1, 1.0, MakeGeneration(1, 1, 0, 0));
+    CHECK(!cache.PublishCoverage(key, {}, Reserve(cache, 0, 0, 100), false));
+    CHECK(cache.CoverageRecordCount() == 0);
+    CHECK(CoverageTotal(cache) == 0);
+}
+
+// The reservation is what a run was allowed to allocate; the record is charged
+// for what exists. Surplus comes back, and a payload larger than the
+// reservation is declined rather than stored over budget.
+void
+TestPublishChargesWhatExistsAndReturnsSurplus()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 3.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+
+    RigExecCoverageReservation reservation = Reserve(cache, 100, 200, 400);
+    CHECK(reservation.IsValid());
+    CHECK(cache.CoverageHeld().capture == 100);
+    CHECK(cache.CoverageHeld().workspace == 200);
+    CHECK(cache.CoverageHeld().payload == 400);
+
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10)},
+        std::move(reservation), true));
+    CHECK(cache.CoverageHeld().capture == 100);
+    CHECK(cache.CoverageHeld().workspace == 200);
+    CHECK(cache.CoverageHeld().payload == 80);
+    CHECK(cache.CoverageRecordCount() == 1);
+
+    RigExecCoverageRecord record;
+    CHECK(cache.LookupCoverage(key, &record));
+    CHECK(record.bytes.capture == 100);
+    CHECK(record.bytes.workspace == 200);
+    CHECK(record.bytes.payload == 80);
+    CHECK(record.arenaRetained);
+    CHECK(record.leases == 0);
+
+    CHECK(!cache.PublishCoverage(
+        MakeCoverageKey(1, 4.0, gen),
+        {MakePacket(handle, MakeTime(4.0), gen,
+                    RigExecPayloadKind::Matrix4x4Row, 2)},
+        Reserve(cache, 0, 0, 100), false));
+    CHECK(cache.CoverageRecordCount() == 1);
+    CHECK(cache.CoverageHeld().capture == 100);
+    CHECK(cache.CoverageHeld().workspace == 200);
+    CHECK(cache.CoverageHeld().payload == 80);
+}
+
+// Re-publishing a key retires the old record and its bytes, so one run is never
+// counted twice.
+void
+TestCoveragePublishReplacingARecordBalancesBytes()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 2.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10)},
+        Reserve(cache, 50, 0, 80), false));
+    CHECK(cache.CoverageHeld().capture == 50);
+    CHECK(cache.CoverageHeld().payload == 80);
+
+    CHECK(cache.PublishCoverage(
+        key, {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 5)},
+        Reserve(cache, 20, 0, 40), false));
+    CHECK(cache.CoverageRecordCount() == 1);
+    CHECK(cache.CoverageHeld().capture == 20);
+    CHECK(cache.CoverageHeld().payload == 40);
+
+    CHECK(cache.EvictCoverage(key));
+    CHECK(cache.CoverageRecordCount() == 0);
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 0);
+}
+
+// A partial record never answers a complete-pose lookup, and publishing one
+// leaves the pose store's counters and complete marker untouched.
+void
+TestPartialCoverageNeverSatisfiesPoseLookup()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(10000);
+    const RigExecFrameCacheKey poseKey{1, 2};
+    CHECK(cache.Publish(poseKey, UsdTimeCode(1.0), MakePose(1.0, 2)));
+    CHECK(cache.Stats().entryCount == 1);
+
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey covKey = MakeCoverageKey(1, 1.0, gen);
+    CHECK(cache.PublishCoverage(
+        covKey,
+        {MakePacket(MakeHandle("joint.frame"), covKey.time, gen,
+                    RigExecPayloadKind::Scalar, 4)},
+        Reserve(cache, 64, 128, 32), true));
+
+    RigExecRigPose pose;
+    CHECK(cache.Lookup(poseKey, &pose));
+    CHECK(cache.Stats().entryCount == 1);
+    CHECK(cache.Stats().bytes == RigExecFrameCachePoseBytes(pose));
+    CHECK(cache.Stats().entryCount == 1);
+
+    CHECK(!cache.Lookup({1, 1}, &pose));
+    RigExecCoverageRecord record;
+    CHECK(!cache.LookupCoverage(MakeCoverageKey(1, 2.0, gen), &record));
+    CHECK(cache.LookupCoverage(covKey, &record));
+    CHECK(record.packets.size() == 1);
+}
+
+// Every part of the key decides the hit, and a packet answers only the exact
+// handle, frame, generation, and layout it was captured from.
+void
+TestStaleGenerationMissesCoverage()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 2, 3);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 4.0, gen, 9);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10)},
+        Reserve(cache, 0, 0, 80), true));
+
+    RigExecCoverageRecord record;
+    CHECK(cache.LookupCoverage(key, &record));
+    CHECK(!cache.LookupCoverage(
+        MakeCoverageKey(1, 4.0, MakeGeneration(2, 1, 2, 3), 9), &record));
+    CHECK(!cache.LookupCoverage(
+        MakeCoverageKey(1, 4.0, MakeGeneration(1, 2, 2, 3), 9), &record));
+    CHECK(!cache.LookupCoverage(
+        MakeCoverageKey(1, 4.0, MakeGeneration(1, 1, 3, 3), 9), &record));
+    CHECK(!cache.LookupCoverage(
+        MakeCoverageKey(1, 4.0, MakeGeneration(1, 1, 2, 4), 9), &record));
+    CHECK(!cache.LookupCoverage(MakeCoverageKey(1, 4.0, gen, 10), &record));
+    CHECK(!cache.LookupCoverage(MakeCoverageKey(2, 4.0, gen, 9), &record));
+    CHECK(!cache.LookupCoverage(MakeCoverageKey(1, 5.0, gen, 9), &record));
+
+    CHECK(cache.CoverageAnswers(key, handle, nullptr));
+    CHECK(!cache.CoverageAnswers(key, MakeHandle("other.frame"), nullptr));
+    CHECK(!cache.CoverageAnswers(
+        key, MakeHandle("joint.frame", RigExecPayloadText::point3), nullptr));
+    RigExecOutputHandle stale = handle;
+    stale.valueRevision = 2;
+    CHECK(!cache.CoverageAnswers(key, stale, nullptr));
+
+    RigExecOutputPacket packet;
+    CHECK(cache.CoverageAnswers(key, handle, &packet));
+    CHECK(packet.status == RigExecOutputStatus::Ready);
+    CHECK(packet.payload.ByteCount() == 80);
+
+    const std::vector<RigExecOutputHandle> asked{handle,
+                                                 MakeHandle("other.frame")};
+    std::vector<RigExecOutputPacket> answered;
+    CHECK(cache.CoverageAnswerCount(key, asked, &answered) == 1);
+    CHECK(answered.size() == 1);
+}
+
+// Payload reuse is not workspace-resume proof: retiring the arena releases the
+// workspace charge and leaves every payload answerable and unchanged.
+void
+TestArenaRetirementKeepsPayloadsAnswerable()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    const RigExecOutputPacket packet =
+        MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10);
+    CHECK(cache.PublishCoverage(key, {packet}, Reserve(cache, 32, 512, 80),
+                                true));
+    CHECK(cache.CoverageArenaRetained(key));
+    CHECK(cache.CoverageHeld().workspace == 512);
+
+    CHECK(cache.RetireCoverageArena(key));
+    CHECK(!cache.CoverageArenaRetained(key));
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().capture == 32);
+    CHECK(cache.CoverageHeld().payload == 80);
+
+    RigExecOutputPacket served;
+    CHECK(cache.CoverageAnswers(key, handle, &served));
+    CHECK(served.payload.bytes == packet.payload.bytes);
+    CHECK(served.payload.ByteCount() == packet.payload.ByteCount());
+    CHECK(cache.CoverageAnswers(key, handle, nullptr));
+
+    CHECK(!cache.RetireCoverageArena(key));
+    CHECK(cache.CoverageHeld().workspace == 0);
+}
+
+// Dropping a payload releases exactly its bytes; a record with no arena and no
+// payloads left is dropped from the store.
+void
+TestPayloadReleaseBalancesAndRetiresTheRecord()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    const RigExecOutputHandle a = MakeHandle("joint.frame");
+    const RigExecOutputHandle b =
+        MakeHandle("joint.matrix", RigExecPayloadText::matrix4x4Row);
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(a, key.time, gen, RigExecPayloadKind::Scalar, 10),
+         MakePacket(b, key.time, gen, RigExecPayloadKind::Matrix4x4Row, 1)},
+        Reserve(cache, 16, 256, 208), true));
+    CHECK(cache.CoverageHeld().payload == 80 + 128);
+
+    CHECK(cache.ReleaseCoveragePayload(key, a));
+    CHECK(cache.CoverageHeld().payload == 128);
+    CHECK(!cache.CoverageAnswers(key, a, nullptr));
+    CHECK(cache.CoverageAnswers(key, b, nullptr));
+
+    CHECK(!cache.ReleaseCoveragePayload(key, MakeHandle("missing")));
+    CHECK(cache.CoverageHeld().payload == 128);
+
+    CHECK(cache.ReleaseCoveragePayload(key, b));
+    // The payloads are gone but the arena is still held, so the record stays.
+    CHECK(cache.CoverageArenaRetained(key));
+    CHECK(cache.CoverageRecordCount() == 1);
+    CHECK(cache.CoverageHeld().capture == 16);
+    CHECK(cache.CoverageHeld().workspace == 256);
+    CHECK(cache.CoverageHeld().payload == 0);
+
+    // Retiring the last thing the record held retires the record itself.
+    CHECK(cache.RetireCoverageArena(key));
+    CHECK(cache.CoverageRecordCount() == 0);
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 0);
+}
+
+// A pin moves a payload's bytes from Payload to Pinned: the same bytes are never
+// counted twice, and a record a lease is holding cannot be evicted.
+void
+TestPinHoldsBytesAndBlocksEviction()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10)},
+        Reserve(cache, 0, 64, 80), true));
+    CHECK(cache.CoverageHeld().workspace == 64);
+    CHECK(cache.CoverageHeld().payload == 80);
+    CHECK(cache.CoverageHeld().pinned == 0);
+
+    RigExecCoverageLease lease;
+    CHECK(cache.PinCoverage(key, handle, &lease));
+    CHECK(lease.IsValid());
+    CHECK(lease.ByteCount() == 80);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 80);
+    CHECK(cache.CoverageHeld().workspace == 64);
+
+    CHECK(!cache.EvictCoverage(key));
+    CHECK(cache.ClearCoverageUnpinned() == 0);
+    CHECK(cache.CoverageAnswers(key, handle, nullptr));
+    CHECK(!cache.PinCoverage(key, handle, &lease));
+
+    RigExecCoverageRecord record;
+    CHECK(cache.LookupCoverage(key, &record));
+    CHECK(record.leases == 1);
+
+    CHECK(lease.Release());
+    CHECK(!lease.IsValid());
+    CHECK(!lease.Release());
+    CHECK(cache.CoverageHeld().pinned == 0);
+    CHECK(cache.CoverageHeld().workspace == 64);
+    CHECK(cache.EvictCoverage(key));
+    CHECK(cache.CoverageRecordCount() == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+}
+
+// A lease outlives the record that produced it: the pinned bytes stay charged
+// until the lease releases them, the record keeps no claim on them, and nothing
+// else can serve that handle.
+void
+TestLeaseOutlivesTheRecord()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10)},
+        Reserve(cache, 0, 0, 80), false));
+
+    RigExecCoverageLease lease;
+    CHECK(cache.PinCoverage(key, handle, &lease));
+    CHECK(!cache.RetireCoverageArena(key));
+    // The record drops its reference to a pinned payload; the charge is the
+    // lease's until the lease ends.
+    CHECK(cache.ReleaseCoveragePayload(key, handle));
+    CHECK(cache.CoverageHeld().pinned == 80);
+    CHECK(cache.CoverageRecordCount() == 1);
+
+    RigExecCoverageRecord record;
+    CHECK(cache.LookupCoverage(key, &record));
+    CHECK(!record.arenaRetained);
+    CHECK(!cache.CoverageAnswers(key, handle, nullptr));
+
+    CHECK(lease.IsValid());
+    CHECK(lease.ByteCount() == 80);
+    CHECK(lease.Packet().IsUsable());
+    CHECK(lease.Packet().Answers(handle, key.time, key.generation));
+
+    CHECK(lease.Release());
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(cache.CoverageRecordCount() == 0);
+}
+
+// Replacing a record under a live lease releases the old record's charges
+// except the pinned bytes the lease owns: the account balances, the lease keeps
+// its packet, and the new record is served and pinned on its own account.
+void
+TestReplacingARecordUnderALeaseBalancesBytes()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(2000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    const RigExecOutputPacket held =
+        MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10);
+    CHECK(cache.PublishCoverage(key, {held}, Reserve(cache, 16, 64, 80), true));
+
+    RigExecCoverageLease lease;
+    CHECK(cache.PinCoverage(key, handle, &lease));
+    CHECK(CoverageTotal(cache) == 160);
+
+    const RigExecOutputPacket fresh =
+        MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 5);
+    CHECK(cache.PublishCoverage(key, {fresh}, Reserve(cache, 8, 32, 40), true));
+    // The replaced record released its capture and workspace; only the lease's
+    // pinned bytes survive it.
+    CHECK(cache.CoverageHeld().capture == 8);
+    CHECK(cache.CoverageHeld().workspace == 32);
+    CHECK(cache.CoverageHeld().payload == 40);
+    CHECK(cache.CoverageHeld().pinned == 80);
+    CHECK(cache.CoverageRecordCount() == 1);
+
+    RigExecOutputPacket served;
+    CHECK(cache.CoverageAnswers(key, handle, &served));
+    CHECK(served.payload.bytes == fresh.payload.bytes);
+    CHECK(lease.IsValid());
+    CHECK(lease.Packet().payload.bytes == held.payload.bytes);
+
+    RigExecCoverageLease freshLease;
+    CHECK(cache.PinCoverage(key, handle, &freshLease));
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 120);
+    CHECK(!cache.EvictCoverage(key));
+
+    CHECK(lease.Release());
+    CHECK(cache.CoverageHeld().pinned == 40);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(!cache.EvictCoverage(key));
+    CHECK(freshLease.Release());
+    CHECK(cache.CoverageHeld().pinned == 0);
+    CHECK(CoverageTotal(cache) == 80);
+    CHECK(cache.EvictCoverage(key));
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(cache.CoverageRecordCount() == 0);
+}
+
+// Two records that captured the same buffer keep sharing it: dropping one
+// record's reference neither changes the other's bytes nor its charge.
+void
+TestSharedPayloadStaysSharedWhenARecordDropsIt()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(2000);
+    const RigExecOutputGeneration first = MakeGeneration(1, 1, 0, 0);
+    const RigExecOutputGeneration second = MakeGeneration(2, 1, 0, 0);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    const RigExecCoverageKey keyA = MakeCoverageKey(1, 1.0, first);
+    const RigExecCoverageKey keyB = MakeCoverageKey(1, 1.0, second);
+    const RigExecOutputPayload buffer =
+        MakePayload(RigExecPayloadKind::Scalar, 10);
+    CHECK(buffer.bytes.use_count() == 1);
+
+    RigExecOutputPacket packetA =
+        MakePacket(handle, keyA.time, first, RigExecPayloadKind::Scalar, 10);
+    RigExecOutputPacket packetB =
+        MakePacket(handle, keyB.time, second, RigExecPayloadKind::Scalar, 10);
+    packetA.payload = buffer;
+    packetB.payload = buffer;
+
+    CHECK(cache.PublishCoverage(keyA, {packetA}, Reserve(cache, 0, 0, 80),
+                                false));
+    CHECK(cache.PublishCoverage(keyB, {packetB}, Reserve(cache, 0, 0, 80),
+                                false));
+    CHECK(cache.CoverageHeld().payload == 160);
+
+    RigExecOutputPacket servedA;
+    RigExecOutputPacket servedB;
+    CHECK(cache.CoverageAnswers(keyA, handle, &servedA));
+    CHECK(cache.CoverageAnswers(keyB, handle, &servedB));
+    // Two records, one buffer: unrelated storage stays shared.
+    CHECK(servedA.payload.bytes == servedB.payload.bytes);
+
+    CHECK(cache.EvictCoverage(keyA));
+    CHECK(cache.CoverageHeld().payload == 80);
+    CHECK(!cache.CoverageAnswers(keyA, handle, nullptr));
+    CHECK(cache.CoverageAnswers(keyB, handle, &servedB));
+    CHECK(servedB.payload.bytes == buffer.bytes);
+    CHECK(servedB.payload.elementCount == 10);
+    for (size_t i = 0; i < servedB.payload.bytes->size(); ++i) {
+        CHECK((*servedB.payload.bytes)[i] == (*buffer.bytes)[i]);
+    }
+    CHECK(buffer.bytes.use_count() >= 2);
+
+    // 80 of the 2000 cap is held, so one byte more than the room left is
+    // refused.
+    CHECK(!Reserve(cache, 0, 0, 1921).IsValid());
+    CHECK(CoverageTotal(cache) == 80);
+}
+
+// A release is balanced or refused: an unbalanced release never wraps, and an
+// uncommitted reservation gives its charge back when it dies.
+void
+TestReleaseIsBalancedOrDeclined()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    CHECK(
+        cache.PublishCoverage(key,
+                              {MakePacket(MakeHandle("joint.frame"), key.time,
+                                          gen, RigExecPayloadKind::Scalar, 10)},
+                              Reserve(cache, 50, 0, 80), false));
+
+    RigExecCoverageBytes tooMuch;
+    tooMuch.payload = 81;
+    CHECK(!cache.ReleaseCoverage(tooMuch));
+    CHECK(cache.CoverageHeld().payload == 80);
+
+    RigExecCoverageBytes exact;
+    exact.capture = 50;
+    exact.payload = 80;
+    CHECK(cache.ReleaseCoverage(exact));
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(!cache.ReleaseCoverage(exact));
+
+    RigExecCoverageReservation reservation = Reserve(cache, 20, 30, 40);
+    CHECK(reservation.IsValid());
+    CHECK(CoverageTotal(cache) == 90);
+    CHECK(!reservation.Extend(RigExecCoverageDomain::Workspace, 1000));
+    CHECK(cache.CoverageHeld().workspace == 30);
+    CHECK(reservation.Extend(RigExecCoverageDomain::Workspace, 910));
+    CHECK(cache.CoverageHeld().workspace == 940);
+    CHECK(!reservation.Extend(RigExecCoverageDomain::Workspace, 1));
+    CHECK(cache.CoverageHeld().workspace == 940);
+    CHECK(reservation.Release());
+    CHECK(!reservation.IsValid());
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(!reservation.Release());
+
+    // A reservation left uncommitted releases itself when it dies.
+    {
+        RigExecCoverageReservation scoped = Reserve(cache, 10, 10, 10);
+        CHECK(scoped.IsValid());
+        CHECK(CoverageTotal(cache) == 30);
+    }
+    CHECK(CoverageTotal(cache) == 0);
+}
+
+// Coverage bytes count against the same cap as poses, and Clear drops every
+// record while a live lease keeps its bytes charged and its packet served.
+void
+TestCoverageSharesTheCapAndClearSweepsIt()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(1000);
+    CHECK(cache.Publish({1, 1}, UsdTimeCode(1.0), MakePose(1.0, 1)));
+    const size_t poseBytes = cache.Stats().bytes;
+    CHECK(poseBytes > 0);
+    CHECK(poseBytes < 1000);
+    // One byte past the room the poses leave is refused.
+    CHECK(!Reserve(cache, 0, 1000 - poseBytes + 1, 0).IsValid());
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(Reserve(cache, 0, 1000 - poseBytes, 0).IsValid());
+
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 1.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    CHECK(cache.PublishCoverage(
+        key, {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 1)},
+        Reserve(cache, 0, 0, 8), true));
+    CHECK(cache.Stats().bytes == poseBytes);
+    CHECK(CoverageTotal(cache) == 8);
+
+    RigExecCoverageLease lease;
+    CHECK(cache.PinCoverage(key, handle, &lease));
+
+    cache.Clear();
+    CHECK(cache.Stats().entryCount == 0);
+    CHECK(cache.CoverageRecordCount() == 0);
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 8);
+    CHECK(lease.IsValid());
+    CHECK(lease.Packet().Answers(handle, key.time, gen));
+    CHECK(lease.Release());
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(cache.CoverageRecordCount() == 0);
+
+    CHECK(cache.PublishCoverage(
+        key, {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 1)},
+        Reserve(cache, 4, 4, 8), true));
+    CHECK(cache.ClearCoverageUnpinned() == 1);
+    CHECK(CoverageTotal(cache) == 0);
+}
+
+// Publish and lookup on the same keys from several threads keep the account
+// honest: every surviving record is charged exactly once, and emptying the
+// store ends at zero.
+void
+TestConcurrentCoveragePublishKeepsAccountingHonest()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(size_t(1) << 20);
+    constexpr int kThreads = 3;
+    constexpr int kOps = 300;
+    constexpr int kKeys = 16;
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t]() {
+            for (int n = 0; n < kOps; ++n) {
+                const RigExecCoverageKey key =
+                    MakeCoverageKey(1, double((n * 3 + t) % kKeys), gen);
+                RigExecCoverageReservation reservation =
+                    Reserve(cache, 8, 16, 24);
+                if (!reservation.IsValid()) {
+                    continue;
+                }
+                CHECK(cache.PublishCoverage(
+                    key,
+                    {MakePacket(handle, key.time, gen,
+                                RigExecPayloadKind::Scalar, 2)},
+                    std::move(reservation), true));
+                RigExecCoverageRecord record;
+                CHECK(cache.LookupCoverage(key, &record));
+            }
+        });
+    }
+    for (auto &w : workers) {
+        w.join();
+    }
+
+    struct Survivor {
+        RigExecCoverageKey key;
+        size_t bytes;
+    };
+    std::vector<Survivor> survivors;
+    for (int i = 0; i < kKeys; ++i) {
+        const RigExecCoverageKey key = MakeCoverageKey(1, double(i), gen);
+        RigExecCoverageRecord record;
+        if (cache.LookupCoverage(key, &record)) {
+            size_t total = 0;
+            CHECK(record.bytes.TryTotal(&total));
+            survivors.push_back(Survivor{key, total});
+        }
+    }
+
+    size_t heldByRecords = 0;
+    for (const Survivor &survivor : survivors) {
+        CHECK(RigExecCheckedAdd(heldByRecords, survivor.bytes, &heldByRecords));
+    }
+    CHECK(heldByRecords == CoverageTotal(cache));
+
+    for (const Survivor &survivor : survivors) {
+        size_t remaining = 0;
+        CHECK(RigExecCheckedSub(heldByRecords, survivor.bytes, &remaining));
+        heldByRecords = remaining;
+        CHECK(cache.EvictCoverage(survivor.key));
+        CHECK(CoverageTotal(cache) == heldByRecords);
+    }
+    CHECK(cache.CoverageRecordCount() == 0);
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 0);
+}
+
 } // namespace
 
 int
@@ -1135,6 +1904,22 @@ main()
     TestConcurrentLookupDuringPublish();
     TestConcurrentPublishOfOneKey();
     TestClearDuringConcurrentPublishKeepsAccountingHonest();
+
+    TestCoverageKeySeesEveryGenerationField();
+    TestCoverageAdmissionRefusesBeforeAllocating();
+    TestPublishChargesWhatExistsAndReturnsSurplus();
+    TestCoveragePublishReplacingARecordBalancesBytes();
+    TestPartialCoverageNeverSatisfiesPoseLookup();
+    TestStaleGenerationMissesCoverage();
+    TestArenaRetirementKeepsPayloadsAnswerable();
+    TestPayloadReleaseBalancesAndRetiresTheRecord();
+    TestPinHoldsBytesAndBlocksEviction();
+    TestLeaseOutlivesTheRecord();
+    TestReplacingARecordUnderALeaseBalancesBytes();
+    TestSharedPayloadStaysSharedWhenARecordDropsIt();
+    TestReleaseIsBalancedOrDeclined();
+    TestCoverageSharesTheCapAndClearSweepsIt();
+    TestConcurrentCoveragePublishKeepsAccountingHonest();
 
     if (failures) {
         std::printf("%d FAILURE(S)\n", failures);

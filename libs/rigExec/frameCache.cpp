@@ -184,7 +184,8 @@ _FoldStageSeeds(uint64_t hash, const RigExecStageFrameSeeds &seeds)
         for (int row = 0; row < 4; ++row)
             for (int column = 0; column < 4; ++column)
                 hash = _FoldScalar(hash, matrix[row][column]);
-    for (char reset : seeds.interveningReset) hash = _FoldScalar(hash, reset);
+    for (char reset : seeds.interveningReset)
+        hash = _FoldScalar(hash, reset);
     return hash;
 }
 
@@ -264,8 +265,7 @@ _FoldArray(uint64_t hash, const VtArray<T> &array)
 
 // _FoldVtValue past the type name and its separator: a non-empty value's
 // storage.
-uint64_t
-_FoldVtValueAfterName(uint64_t hash, const VtValue &value);
+uint64_t _FoldVtValueAfterName(uint64_t hash, const VtValue &value);
 
 uint64_t
 _FoldVtValue(uint64_t hash, const VtValue &value)
@@ -317,30 +317,45 @@ _FoldVtValueAfterName(uint64_t hash, const VtValue &value)
     // Bitwise for everything holding floating point: TfHash deliberately
     // conflates +0.0 and -0.0, but the evaluator need not evaluate them
     // equally, so the digest folds storage instead.
-#define _RIGEXEC_FOLD_HELD(type, expr)                 \
-    if (value.IsHolding<type>()) {                     \
-        const type &held = value.UncheckedGet<type>(); \
-        (void)held;                                    \
-        return expr;                                   \
+#define _RIGEXEC_FOLD_HELD(type, expr)                                         \
+    if (value.IsHolding<type>()) {                                             \
+        const type &held = value.UncheckedGet<type>();                         \
+        (void)held;                                                            \
+        return expr;                                                           \
     }
     _RIGEXEC_FOLD_HELD(float, _FoldScalar(hash, held));
     _RIGEXEC_FOLD_HELD(double, _FoldScalar(hash, held));
     _RIGEXEC_FOLD_HELD(GfHalf, _FoldScalar(hash, held));
-    _RIGEXEC_FOLD_HELD(GfVec2f, _FoldBytes(hash, held.data(), 2 * sizeof(float)));
-    _RIGEXEC_FOLD_HELD(GfVec3f, _FoldBytes(hash, held.data(), 3 * sizeof(float)));
-    _RIGEXEC_FOLD_HELD(GfVec4f, _FoldBytes(hash, held.data(), 4 * sizeof(float)));
-    _RIGEXEC_FOLD_HELD(GfVec2d, _FoldBytes(hash, held.data(), 2 * sizeof(double)));
-    _RIGEXEC_FOLD_HELD(GfVec3d, _FoldBytes(hash, held.data(), 3 * sizeof(double)));
-    _RIGEXEC_FOLD_HELD(GfVec4d, _FoldBytes(hash, held.data(), 4 * sizeof(double)));
-    _RIGEXEC_FOLD_HELD(GfVec2h, _FoldBytes(hash, held.data(), 2 * sizeof(GfHalf)));
-    _RIGEXEC_FOLD_HELD(GfVec3h, _FoldBytes(hash, held.data(), 3 * sizeof(GfHalf)));
-    _RIGEXEC_FOLD_HELD(GfVec4h, _FoldBytes(hash, held.data(), 4 * sizeof(GfHalf)));
-    _RIGEXEC_FOLD_HELD(GfMatrix2f, _FoldBytes(hash, held.data(), 4 * sizeof(float)));
-    _RIGEXEC_FOLD_HELD(GfMatrix2d, _FoldBytes(hash, held.data(), 4 * sizeof(double)));
-    _RIGEXEC_FOLD_HELD(GfMatrix3f, _FoldBytes(hash, held.data(), 9 * sizeof(float)));
-    _RIGEXEC_FOLD_HELD(GfMatrix3d, _FoldBytes(hash, held.data(), 9 * sizeof(double)));
-    _RIGEXEC_FOLD_HELD(GfMatrix4f, _FoldBytes(hash, held.data(), 16 * sizeof(float)));
-    _RIGEXEC_FOLD_HELD(GfMatrix4d, _FoldBytes(hash, held.data(), 16 * sizeof(double)));
+    _RIGEXEC_FOLD_HELD(GfVec2f,
+                       _FoldBytes(hash, held.data(), 2 * sizeof(float)));
+    _RIGEXEC_FOLD_HELD(GfVec3f,
+                       _FoldBytes(hash, held.data(), 3 * sizeof(float)));
+    _RIGEXEC_FOLD_HELD(GfVec4f,
+                       _FoldBytes(hash, held.data(), 4 * sizeof(float)));
+    _RIGEXEC_FOLD_HELD(GfVec2d,
+                       _FoldBytes(hash, held.data(), 2 * sizeof(double)));
+    _RIGEXEC_FOLD_HELD(GfVec3d,
+                       _FoldBytes(hash, held.data(), 3 * sizeof(double)));
+    _RIGEXEC_FOLD_HELD(GfVec4d,
+                       _FoldBytes(hash, held.data(), 4 * sizeof(double)));
+    _RIGEXEC_FOLD_HELD(GfVec2h,
+                       _FoldBytes(hash, held.data(), 2 * sizeof(GfHalf)));
+    _RIGEXEC_FOLD_HELD(GfVec3h,
+                       _FoldBytes(hash, held.data(), 3 * sizeof(GfHalf)));
+    _RIGEXEC_FOLD_HELD(GfVec4h,
+                       _FoldBytes(hash, held.data(), 4 * sizeof(GfHalf)));
+    _RIGEXEC_FOLD_HELD(GfMatrix2f,
+                       _FoldBytes(hash, held.data(), 4 * sizeof(float)));
+    _RIGEXEC_FOLD_HELD(GfMatrix2d,
+                       _FoldBytes(hash, held.data(), 4 * sizeof(double)));
+    _RIGEXEC_FOLD_HELD(GfMatrix3f,
+                       _FoldBytes(hash, held.data(), 9 * sizeof(float)));
+    _RIGEXEC_FOLD_HELD(GfMatrix3d,
+                       _FoldBytes(hash, held.data(), 9 * sizeof(double)));
+    _RIGEXEC_FOLD_HELD(GfMatrix4f,
+                       _FoldBytes(hash, held.data(), 16 * sizeof(float)));
+    _RIGEXEC_FOLD_HELD(GfMatrix4d,
+                       _FoldBytes(hash, held.data(), 16 * sizeof(double)));
     _RIGEXEC_FOLD_HELD(VtArray<float>, _FoldArray(hash, held));
     _RIGEXEC_FOLD_HELD(VtArray<double>, _FoldArray(hash, held));
     _RIGEXEC_FOLD_HELD(VtArray<GfHalf>, _FoldArray(hash, held));
@@ -385,7 +400,8 @@ _FoldVtValueAfterName(uint64_t hash, const VtValue &value)
         hash = _FoldU64(hash, static_cast<uint64_t>(q.size()));
         for (const GfQuatd &e : q) {
             hash = _FoldScalar(hash, e.GetReal());
-            hash = _FoldBytes(hash, e.GetImaginary().data(), 3 * sizeof(double));
+            hash =
+                _FoldBytes(hash, e.GetImaginary().data(), 3 * sizeof(double));
         }
         return hash;
     }
@@ -394,7 +410,8 @@ _FoldVtValueAfterName(uint64_t hash, const VtValue &value)
         hash = _FoldU64(hash, static_cast<uint64_t>(q.size()));
         for (const GfQuath &e : q) {
             hash = _FoldScalar(hash, e.GetReal());
-            hash = _FoldBytes(hash, e.GetImaginary().data(), 3 * sizeof(GfHalf));
+            hash =
+                _FoldBytes(hash, e.GetImaginary().data(), 3 * sizeof(GfHalf));
         }
         return hash;
     }
@@ -422,11 +439,11 @@ _FoldLeafValue(uint64_t hash, const VtValue &value)
     if (value.IsEmpty()) {
         return _FoldU64(hash, 0);
     }
-#define _RIGEXEC_FOLD_LEAF(tag, type, expr)            \
-    if (value.IsHolding<type>()) {                     \
-        const type &held = value.UncheckedGet<type>(); \
-        hash = _FoldU64(hash, tag);                    \
-        return expr;                                   \
+#define _RIGEXEC_FOLD_LEAF(tag, type, expr)                                    \
+    if (value.IsHolding<type>()) {                                             \
+        const type &held = value.UncheckedGet<type>();                         \
+        hash = _FoldU64(hash, tag);                                            \
+        return expr;                                                           \
     }
     _RIGEXEC_FOLD_LEAF(1, VtIntArray, _FoldArray(hash, held));
     _RIGEXEC_FOLD_LEAF(2, VtFloatArray, _FoldArray(hash, held));
@@ -434,20 +451,23 @@ _FoldLeafValue(uint64_t hash, const VtValue &value)
     _RIGEXEC_FOLD_LEAF(4, float, _FoldScalar(hash, held));
     _RIGEXEC_FOLD_LEAF(5, double, _FoldScalar(hash, held));
     _RIGEXEC_FOLD_LEAF(6, bool, _FoldScalar(hash, held));
-    _RIGEXEC_FOLD_LEAF(7, GfVec3f, _FoldBytes(hash, held.data(), 3 * sizeof(float)));
-    _RIGEXEC_FOLD_LEAF(8, GfVec3d, _FoldBytes(hash, held.data(), 3 * sizeof(double)));
-    _RIGEXEC_FOLD_LEAF(9, GfVec3i, _FoldBytes(hash, held.data(), 3 * sizeof(int)));
-    _RIGEXEC_FOLD_LEAF(10, GfMatrix4d, _FoldBytes(hash, held.data(), 16 * sizeof(double)));
+    _RIGEXEC_FOLD_LEAF(7, GfVec3f,
+                       _FoldBytes(hash, held.data(), 3 * sizeof(float)));
+    _RIGEXEC_FOLD_LEAF(8, GfVec3d,
+                       _FoldBytes(hash, held.data(), 3 * sizeof(double)));
+    _RIGEXEC_FOLD_LEAF(9, GfVec3i,
+                       _FoldBytes(hash, held.data(), 3 * sizeof(int)));
+    _RIGEXEC_FOLD_LEAF(10, GfMatrix4d,
+                       _FoldBytes(hash, held.data(), 16 * sizeof(double)));
     _RIGEXEC_FOLD_LEAF(11, VtArray<GfVec2f>, _FoldArray(hash, held));
     _RIGEXEC_FOLD_LEAF(12, VtVec3fArray, _FoldArray(hash, held));
     _RIGEXEC_FOLD_LEAF(13, VtDoubleArray, _FoldArray(hash, held));
     // The token's own string, length first; an empty token reads no
     // string at all.
     _RIGEXEC_FOLD_LEAF(14, TfToken,
-                       held.IsEmpty()
-                           ? _FoldU64(hash, 0)
-                           : _FoldString(_FoldU64(hash, held.size()),
-                                         held.GetString()));
+                       held.IsEmpty() ? _FoldU64(hash, 0)
+                                      : _FoldString(_FoldU64(hash, held.size()),
+                                                    held.GetString()));
 #undef _RIGEXEC_FOLD_LEAF
     return _FoldVtValue(_FoldU64(hash, 15), value);
 }
@@ -466,8 +486,8 @@ _FoldVaryingTransport(uint64_t hash, const RigExecFrameInputs &inputs)
     }
     constexpr uint64_t kAbsent = ~uint64_t(0);
     hash = _FoldBytes(hash, "vary\x1f", 5);
-    hash = _FoldU64(hash,
-                    static_cast<uint64_t>(inputs.varyingLayoutRows.size()));
+    hash =
+        _FoldU64(hash, static_cast<uint64_t>(inputs.varyingLayoutRows.size()));
     for (const uint32_t row : inputs.varyingLayoutRows) {
         hash = _FoldU64(hash, row);
         if (row >= inputs.layoutLeaves.size()) {
@@ -500,9 +520,9 @@ _VtValueBytes(const VtValue &value)
     if (value.IsEmpty()) {
         return 0;
     }
-#define _RIGEXEC_CACHE_ARRAY(type, element)                     \
-    if (value.IsHolding<type>()) {                              \
-        return value.UncheckedGet<type>().size() * sizeof(element); \
+#define _RIGEXEC_CACHE_ARRAY(type, element)                                    \
+    if (value.IsHolding<type>()) {                                             \
+        return value.UncheckedGet<type>().size() * sizeof(element);            \
     }
     _RIGEXEC_CACHE_ARRAY(VtVec3fArray, GfVec3f)
     _RIGEXEC_CACHE_ARRAY(VtVec3dArray, GfVec3d)
@@ -514,9 +534,9 @@ _VtValueBytes(const VtValue &value)
     _RIGEXEC_CACHE_ARRAY(VtBoolArray, bool)
     _RIGEXEC_CACHE_ARRAY(VtStringArray, std::string)
 #undef _RIGEXEC_CACHE_ARRAY
-#define _RIGEXEC_CACHE_SCALAR(type)        \
-    if (value.IsHolding<type>()) {         \
-        return sizeof(type);               \
+#define _RIGEXEC_CACHE_SCALAR(type)                                            \
+    if (value.IsHolding<type>()) {                                             \
+        return sizeof(type);                                                   \
     }
     _RIGEXEC_CACHE_SCALAR(float)
     _RIGEXEC_CACHE_SCALAR(double)
@@ -536,7 +556,7 @@ _VtValueBytes(const VtValue &value)
     return sizeof(VtValue);
 }
 
-}  // namespace
+} // namespace
 
 uint64_t
 RigExecControlStateDigest(const RigExecFrameInputs &inputs)
@@ -595,7 +615,8 @@ _FoldWindowRings(uint64_t hash, const RigExecFrameInputs &inputs)
                 continue;
             }
             hash = _FoldBytes(hash, "\x01", 1);
-            hash = _FoldU64(hash, static_cast<uint64_t>(packet->scalars.size()));
+            hash =
+                _FoldU64(hash, static_cast<uint64_t>(packet->scalars.size()));
             if (!packet->scalars.empty())
                 hash = _FoldBytes(hash, packet->scalars.data(),
                                   packet->scalars.size() * sizeof(double));
@@ -710,7 +731,7 @@ _OrderedLevel1(const RigExecFrameInputs &inputs,
                              });
 }
 
-}  // namespace
+} // namespace
 
 uint64_t
 RigExecSampleDigest(const RigExecSampledInput &sample)
@@ -837,11 +858,11 @@ RigExecFrameDigestOrderHasPath(const RigExecFrameDigestOrder *order,
     }
     // `order` lists the first-win paths ascending by SdfPath's operator<,
     // the recording map's own comparison.
-    const auto found = std::lower_bound(
-        order->order.begin(), order->order.end(), path,
-        [order](uint32_t index, const SdfPath &key) {
-            return order->paths[index] < key;
-        });
+    const auto found =
+        std::lower_bound(order->order.begin(), order->order.end(), path,
+                         [order](uint32_t index, const SdfPath &key) {
+                             return order->paths[index] < key;
+                         });
     return found != order->order.end() && order->paths[*found] == path;
 }
 
@@ -858,8 +879,7 @@ RigExecFoldConstantDigest(uint64_t controlDigest, uint64_t constantDigest)
 uint64_t
 RigExecControlStateDigestWithConstants(
     const RigExecFrameInputs &inputs,
-    const std::vector<RigExecValueOverride> &overrides,
-    uint64_t constantDigest)
+    const std::vector<RigExecValueOverride> &overrides, uint64_t constantDigest)
 {
     return RigExecFoldConstantDigest(
         RigExecControlStateDigest(inputs, overrides), constantDigest);
@@ -869,25 +889,23 @@ uint64_t
 RigExecControlStateDigestWithConstants(
     const RigExecFrameInputs &inputs,
     const std::vector<RigExecValueOverride> &overrides,
-    const std::vector<RigExecUpstreamValue> &upstream,
-    uint64_t constantDigest)
+    const std::vector<RigExecUpstreamValue> &upstream, uint64_t constantDigest)
 {
     return RigExecFoldConstantDigest(
-        RigExecControlStateDigest(inputs, overrides, upstream),
-        constantDigest);
+        RigExecControlStateDigest(inputs, overrides, upstream), constantDigest);
 }
 
 uint64_t
 RigExecControlStateDigest(const RigExecFrameInputs &inputs,
-                         const std::vector<RigExecValueOverride> &overrides)
+                          const std::vector<RigExecValueOverride> &overrides)
 {
     return RigExecControlStateDigest(inputs, overrides, inputs.upstream);
 }
 
 uint64_t
 RigExecControlStateDigest(const RigExecFrameInputs &inputs,
-                         const std::vector<RigExecValueOverride> &overrides,
-                         const std::vector<RigExecUpstreamValue> &upstream)
+                          const std::vector<RigExecValueOverride> &overrides,
+                          const std::vector<RigExecUpstreamValue> &upstream)
 {
     // First sample per path wins, matching FrameInputs::Find; the survivors
     // sort by path so enqueue order cannot move the digest. Two levels --
@@ -1014,14 +1032,13 @@ RigExecControlStateDigestWithBurstCache(
                 inputs.values[recorded->order[j]];
             uint64_t level1 = 0;
             if (!burstLevel1(sample, &level1)) {
-                level1 = _OrderedLevel1(inputs, sample, recorded->prefix[j],
-                                        &names);
+                level1 =
+                    _OrderedLevel1(inputs, sample, recorded->prefix[j], &names);
             }
             hash = _FoldU64(hash, level1);
         }
     } else {
-        hash = _FoldU64(hash,
-                        static_cast<uint64_t>(cache->sortedOrder.size()));
+        hash = _FoldU64(hash, static_cast<uint64_t>(cache->sortedOrder.size()));
         for (size_t i : cache->sortedOrder) {
             const RigExecSampledInput &sample = inputs.values[i];
             uint64_t level1 = 0;
@@ -1043,18 +1060,16 @@ RigExecControlStateDigestWithBurstCache(
 }
 
 uint64_t
-RigExecRefusalControlDigest(
-    UsdTimeCode time, uint64_t stageEditSerial,
-    const std::vector<RigExecValueOverride> &overrides)
+RigExecRefusalControlDigest(UsdTimeCode time, uint64_t stageEditSerial,
+                            const std::vector<RigExecValueOverride> &overrides)
 {
     return RigExecRefusalControlDigest(time, stageEditSerial, overrides, {});
 }
 
 uint64_t
-RigExecRefusalControlDigest(
-    UsdTimeCode time, uint64_t stageEditSerial,
-    const std::vector<RigExecValueOverride> &overrides,
-    const std::vector<RigExecUpstreamValue> &upstream)
+RigExecRefusalControlDigest(UsdTimeCode time, uint64_t stageEditSerial,
+                            const std::vector<RigExecValueOverride> &overrides,
+                            const std::vector<RigExecUpstreamValue> &upstream)
 {
     uint64_t hash = 1469598103934665603ull;
     // The domain tag: a refusal digest must never equal a sampled digest
@@ -1172,14 +1187,14 @@ RigExecFrameCachePoseBytes(const RigExecRigPose &pose)
              (sizeof(SdfPath) + sizeof(RigExecPointFrame));
     total += pose.jointFramesFinal.size() *
              (sizeof(SdfPath) + sizeof(RigExecPointFrame));
-    total += pose.jointMatricesFinal.size() *
-             (sizeof(SdfPath) + sizeof(GfMatrix4d));
+    total +=
+        pose.jointMatricesFinal.size() * (sizeof(SdfPath) + sizeof(GfMatrix4d));
     total += pose.controlFrames.size() *
              (sizeof(SdfPath) + sizeof(RigExecPointFrame));
-    total += pose.providerXforms.size() *
-             (sizeof(SdfPath) + sizeof(GfMatrix4d));
-    total += pose.providerBaseXforms.size() *
-             (sizeof(SdfPath) + sizeof(GfMatrix4d));
+    total +=
+        pose.providerXforms.size() * (sizeof(SdfPath) + sizeof(GfMatrix4d));
+    total +=
+        pose.providerBaseXforms.size() * (sizeof(SdfPath) + sizeof(GfMatrix4d));
     for (const auto &kv : pose.solverFrames) {
         total += sizeof(SdfPath) + kv.second.size() * sizeof(RigExecPointFrame);
     }
@@ -1237,16 +1252,14 @@ RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key,
 }
 
 bool
-RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key,
-                          RigExecRigPose *pose,
+RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key, RigExecRigPose *pose,
                           std::shared_ptr<const void> *retainedOut) const
 {
     return Lookup(key, pose, retainedOut, nullptr);
 }
 
 bool
-RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key,
-                          RigExecRigPose *pose,
+RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key, RigExecRigPose *pose,
                           std::shared_ptr<const void> *retainedOut,
                           size_t *bytesOut) const
 {
@@ -1278,9 +1291,8 @@ RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key,
             shard.map.erase(it);
             corrupt = true;
         } else {
-            entry->lastUse.store(
-                _clock.fetch_add(1, std::memory_order_relaxed),
-                std::memory_order_relaxed);
+            entry->lastUse.store(_clock.fetch_add(1, std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
         }
     }
     if (corrupt) {
@@ -1303,9 +1315,8 @@ RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key,
 }
 
 bool
-RigExecFrameCache::LookupProvenance(
-    const RigExecFrameCacheKey &key,
-    RigExecEntryProvenance *provenance) const
+RigExecFrameCache::LookupProvenance(const RigExecFrameCacheKey &key,
+                                    RigExecEntryProvenance *provenance) const
 {
     if (!provenance) {
         return false;
@@ -1499,6 +1510,15 @@ RigExecFrameCache::Clear()
     _misses.store(0, std::memory_order_relaxed);
     _published.store(0, std::memory_order_relaxed);
     _evictions.store(0, std::memory_order_relaxed);
+    // Coverage records go too, except for the charge a live lease owns: a
+    // lease is never revoked, keeps serving the packet it pinned, and stays
+    // charged until it ends.
+    for (_Shard &shard : _shards) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        for (auto it = shard.coverage.begin(); it != shard.coverage.end();) {
+            _DetachCoverageEntry(shard, it++);
+        }
+    }
     _ReportEvictions(std::move(evicted));
 }
 
@@ -1535,8 +1555,7 @@ RigExecFrameCache::_EvictUntilUnderCap()
     // Each pass drops at most one entry; a pass that raced a touch rescans.
     // Bounded so a publisher racing us cannot spin the loop: whatever still
     // exceeds the cap is left for the next Publish or SetByteCap.
-    size_t guard =
-        _entryCount.load(std::memory_order_relaxed) + _kShardCount;
+    size_t guard = _entryCount.load(std::memory_order_relaxed) + _kShardCount;
     std::vector<RigExecFrameCacheEviction> evicted;
     while (guard-- > 0) {
         if (_bytes.load(std::memory_order_relaxed) <= cap) {
@@ -1549,8 +1568,8 @@ RigExecFrameCache::_EvictUntilUnderCap()
         for (_Shard &shard : _shards) {
             std::lock_guard<std::mutex> lock(shard.mutex);
             for (const auto &kv : shard.map) {
-                const uint64_t use = kv.second->lastUse.load(
-                    std::memory_order_relaxed);
+                const uint64_t use =
+                    kv.second->lastUse.load(std::memory_order_relaxed);
                 if (!found || use < victimUse) {
                     victim = kv.first;
                     victimUse = use;
@@ -1589,4 +1608,556 @@ RigExecFrameCache::_EvictUntilUnderCap()
     _ReportEvictions(std::move(evicted));
 }
 
-}  // namespace rigExec
+// ------------------------------------------------------------
+// Partial output coverage
+// ------------------------------------------------------------
+
+namespace {
+
+RigExecCoverageBytes
+_DomainBytes(RigExecCoverageDomain domain, size_t bytes)
+{
+    RigExecCoverageBytes delta;
+    switch (domain) {
+    case RigExecCoverageDomain::Capture:
+        delta.capture = bytes;
+        break;
+    case RigExecCoverageDomain::Workspace:
+        delta.workspace = bytes;
+        break;
+    case RigExecCoverageDomain::Payload:
+        delta.payload = bytes;
+        break;
+    case RigExecCoverageDomain::Pinned:
+        delta.pinned = bytes;
+        break;
+    }
+    return delta;
+}
+
+size_t
+_CoveragePayloadBytes(const RigExecOutputPacket &packet)
+{
+    return packet.payload.ByteCount();
+}
+
+} // namespace
+
+RigExecCoverageBytes
+RigExecFrameCache::_CoverageCharge() const
+{
+    RigExecCoverageBytes held;
+    held.capture = _coverageCapture.load(std::memory_order_relaxed);
+    held.workspace = _coverageWorkspace.load(std::memory_order_relaxed);
+    held.payload = _coveragePayload.load(std::memory_order_relaxed);
+    held.pinned = _coveragePinned.load(std::memory_order_relaxed);
+    return held;
+}
+
+bool
+RigExecFrameCache::_ChargeCoverage(const RigExecCoverageBytes &bytes) const
+{
+    size_t request = 0;
+    size_t heldTotal = 0;
+    size_t used = 0;
+    size_t projected = 0;
+    if (!bytes.TryTotal(&request) || !_CoverageCharge().TryTotal(&heldTotal) ||
+        !RigExecCheckedAdd(_bytes.load(std::memory_order_relaxed), heldTotal,
+                           &used) ||
+        !RigExecCheckedAdd(used, request, &projected) ||
+        projected > _byteCap.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const RigExecCoverageBytes held = _CoverageCharge();
+    if (bytes.capture > (std::numeric_limits<size_t>::max)() - held.capture ||
+        bytes.workspace >
+            (std::numeric_limits<size_t>::max)() - held.workspace ||
+        bytes.payload > (std::numeric_limits<size_t>::max)() - held.payload ||
+        bytes.pinned > (std::numeric_limits<size_t>::max)() - held.pinned) {
+        return false;
+    }
+    // Each domain is its own atomic add: concurrent admissions cannot lose a
+    // charge by racing a read-modify-write of a shared snapshot.
+    _coverageCapture.fetch_add(bytes.capture, std::memory_order_relaxed);
+    _coverageWorkspace.fetch_add(bytes.workspace, std::memory_order_relaxed);
+    _coveragePayload.fetch_add(bytes.payload, std::memory_order_relaxed);
+    _coveragePinned.fetch_add(bytes.pinned, std::memory_order_relaxed);
+    return true;
+}
+
+bool
+RigExecFrameCache::_ReleaseCharge(const RigExecCoverageBytes &bytes) const
+{
+    const RigExecCoverageBytes held = _CoverageCharge();
+    if (bytes.capture > held.capture || bytes.workspace > held.workspace ||
+        bytes.payload > held.payload || bytes.pinned > held.pinned) {
+        return false;
+    }
+    _coverageCapture.fetch_sub(bytes.capture, std::memory_order_relaxed);
+    _coverageWorkspace.fetch_sub(bytes.workspace, std::memory_order_relaxed);
+    _coveragePayload.fetch_sub(bytes.payload, std::memory_order_relaxed);
+    _coveragePinned.fetch_sub(bytes.pinned, std::memory_order_relaxed);
+    return true;
+}
+
+bool
+RigExecFrameCache::_PinPayload(size_t bytes) const
+{
+    const RigExecCoverageBytes held = _CoverageCharge();
+    size_t payloadAfter = 0;
+    size_t pinnedAfter = 0;
+    if (!RigExecCheckedSub(held.payload, bytes, &payloadAfter) ||
+        !RigExecCheckedAdd(held.pinned, bytes, &pinnedAfter)) {
+        return false;
+    }
+    _coveragePayload.fetch_sub(bytes, std::memory_order_relaxed);
+    _coveragePinned.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
+void
+RigExecFrameCache::_DetachCoverageEntry(_Shard &shard,
+                                        _CoverageMap::iterator it)
+{
+    // Every charge but the pinned bytes a live lease owes comes back now; the
+    // lease returns those when it ends. The record itself stays alive while a
+    // lease holds it.
+    _CoverageEntry &entry = *it->second;
+    RigExecCoverageBytes release = entry.bytes;
+    release.pinned = 0;
+    _ReleaseCharge(release);
+    entry.bytes.capture = 0;
+    entry.bytes.workspace = 0;
+    entry.bytes.payload = 0;
+    shard.coverage.erase(it);
+    _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void
+RigExecFrameCache::_EndCoverageLease(const RigExecCoverageKey &key,
+                                     const std::shared_ptr<void> &entry,
+                                     const RigExecOutputHandle &handle,
+                                     size_t bytes) const
+{
+    auto record = std::static_pointer_cast<_CoverageEntry>(entry);
+    if (!record) {
+        _ReleaseCharge(_DomainBytes(RigExecCoverageDomain::Pinned, bytes));
+        return;
+    }
+    const _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    // The lease's own record, still standing in the store. A record replaced or
+    // cleared under the lease keeps only this lease's pinned charge, so its
+    // bytes do not move back into a payload the store no longer holds.
+    const bool standing = it != shard.coverage.end() && it->second == record;
+    size_t held = 0;
+    if (standing) {
+        for (_CoveredOutput &output : record->outputs) {
+            if (output.leased && output.packet.handle == handle) {
+                output.leased = false;
+                held = _CoveragePayloadBytes(output.packet);
+                break;
+            }
+        }
+    }
+    if (record->leases > 0) {
+        record->leases -= 1;
+    }
+
+    // The pinned charge is the lease's own, taken when it pinned: it leaves the
+    // account here whether or not the record still stands.
+    if (record->bytes.pinned >= bytes) {
+        record->bytes.pinned -= bytes;
+    }
+    _coveragePinned.fetch_sub(bytes, std::memory_order_relaxed);
+    if (held > 0) {
+        record->bytes.payload += held;
+        _coveragePayload.fetch_add(held, std::memory_order_relaxed);
+    }
+    if (standing && record->outputs.empty() && !record->arenaRetained &&
+        record->leases == 0) {
+        _ReleaseCharge(record->bytes);
+        shard.coverage.erase(it);
+        _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+bool
+RigExecFrameCache::TryReserveCoverage(
+    const RigExecCoverageBytes &request,
+    RigExecCoverageReservation *reservationOut)
+{
+    if (!reservationOut || reservationOut->IsValid()) {
+        return false;
+    }
+    if (!_ChargeCoverage(request)) {
+        return false;
+    }
+    *reservationOut = RigExecCoverageReservation(this, request);
+    return true;
+}
+
+bool
+RigExecFrameCache::ReleaseCoverage(const RigExecCoverageBytes &bytes) const
+{
+    return _ReleaseCharge(bytes);
+}
+
+RigExecCoverageBytes
+RigExecFrameCache::CoverageHeld() const
+{
+    return _CoverageCharge();
+}
+
+size_t
+RigExecFrameCache::CoverageRecordCount() const
+{
+    return _coverageRecords.load(std::memory_order_relaxed);
+}
+
+bool
+RigExecCoverageReservation::Extend(RigExecCoverageDomain domain, size_t bytes)
+{
+    if (!_cache) {
+        return false;
+    }
+    RigExecCoverageBytes delta = _DomainBytes(domain, bytes);
+    size_t grownPayload = 0;
+    size_t grownPinned = 0;
+    size_t grownCapture = 0;
+    size_t grownWorkspace = 0;
+    if (!RigExecCheckedAdd(_bytes.capture, delta.capture, &grownCapture) ||
+        !RigExecCheckedAdd(_bytes.workspace, delta.workspace,
+                           &grownWorkspace) ||
+        !RigExecCheckedAdd(_bytes.payload, delta.payload, &grownPayload) ||
+        !RigExecCheckedAdd(_bytes.pinned, delta.pinned, &grownPinned)) {
+        return false;
+    }
+    if (!_cache->_ChargeCoverage(delta)) {
+        return false;
+    }
+    _bytes.capture = grownCapture;
+    _bytes.workspace = grownWorkspace;
+    _bytes.payload = grownPayload;
+    _bytes.pinned = grownPinned;
+    return true;
+}
+
+bool
+RigExecCoverageReservation::Release()
+{
+    if (!_cache) {
+        return false;
+    }
+    // A reservation that grew past what the cache still holds cannot happen:
+    // every charge it carries was taken from the same account.
+    _cache->_ReleaseCharge(_bytes);
+    _bytes = RigExecCoverageBytes();
+    _cache = nullptr;
+    return true;
+}
+
+RigExecCoverageReservation::~RigExecCoverageReservation()
+{
+    Release();
+}
+
+RigExecCoverageLease::~RigExecCoverageLease()
+{
+    Release();
+}
+
+bool
+RigExecCoverageLease::Release()
+{
+    if (!_cache) {
+        return false;
+    }
+    // _EndCoverageLease returns the pinned charge to the payload domain the
+    // record still holds, or releases it outright when the record was replaced
+    // or cleared under the lease.
+    _cache->_EndCoverageLease(_key, _entry, _handle, _bytes);
+    _cache = nullptr;
+    _bytes = 0;
+    return true;
+}
+
+bool
+RigExecFrameCache::PublishCoverage(
+    const RigExecCoverageKey &key,
+    const std::vector<RigExecOutputPacket> &packets,
+    RigExecCoverageReservation reservation, bool arenaRetained)
+{
+    if (packets.empty()) {
+        return false;
+    }
+    size_t payload = 0;
+    for (const RigExecOutputPacket &packet : packets) {
+        std::string error;
+        if (!packet.payload.IsEmpty() &&
+            !RigExecValidatePayload(packet.payload, &error)) {
+            return false;
+        }
+        if (!RigExecCheckedAdd(payload, _CoveragePayloadBytes(packet),
+                               &payload)) {
+            return false;
+        }
+    }
+    // The reservation is what the caller allocated with; the record is charged
+    // for what actually exists. Surplus comes back before the record lands.
+    if (payload > reservation.Bytes().payload) {
+        return false;
+    }
+    RigExecCoverageBytes record = reservation.Bytes();
+    record.payload = payload;
+    RigExecCoverageBytes surplus;
+    surplus.payload = reservation.Bytes().payload - payload;
+    if (!arenaRetained) {
+        surplus.workspace = record.workspace;
+        record.workspace = 0;
+    }
+    if (surplus.capture || surplus.workspace || surplus.payload ||
+        surplus.pinned) {
+        _ReleaseCharge(surplus);
+    }
+
+    std::shared_ptr<_CoverageEntry> entry = std::make_shared<_CoverageEntry>();
+    entry->bytes = record;
+    entry->arenaRetained = arenaRetained;
+    entry->outputs.reserve(packets.size());
+    for (const RigExecOutputPacket &packet : packets) {
+        entry->outputs.push_back(_CoveredOutput{packet, false});
+    }
+    // The charge now belongs to the record, not the reservation.
+    reservation._cache = nullptr;
+    reservation._bytes = RigExecCoverageBytes();
+
+    {
+        _Shard &shard = _GetCoverageShard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        const auto it = shard.coverage.find(key);
+        if (it != shard.coverage.end()) {
+            _DetachCoverageEntry(shard, it);
+        }
+        shard.coverage.emplace(key, std::move(entry));
+        _coverageRecords.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool
+RigExecFrameCache::LookupCoverage(const RigExecCoverageKey &key,
+                                  RigExecCoverageRecord *recordOut) const
+{
+    if (!recordOut) {
+        return false;
+    }
+    const _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    if (it == shard.coverage.end()) {
+        return false;
+    }
+    recordOut->key = key;
+    recordOut->packets.clear();
+    recordOut->packets.reserve(it->second->outputs.size());
+    for (const _CoveredOutput &output : it->second->outputs) {
+        recordOut->packets.push_back(output.packet);
+    }
+    recordOut->bytes = it->second->bytes;
+    recordOut->arenaRetained = it->second->arenaRetained;
+    recordOut->leases = it->second->leases;
+    return true;
+}
+
+bool
+RigExecFrameCache::CoverageAnswers(const RigExecCoverageKey &key,
+                                   const RigExecOutputHandle &handle,
+                                   RigExecOutputPacket *packetOut) const
+{
+    const _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    if (it == shard.coverage.end()) {
+        return false;
+    }
+    for (const _CoveredOutput &output : it->second->outputs) {
+        if (output.packet.Answers(handle, key.time, key.generation)) {
+            if (packetOut) {
+                *packetOut = output.packet;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t
+RigExecFrameCache::CoverageAnswerCount(
+    const RigExecCoverageKey &key,
+    const std::vector<RigExecOutputHandle> &handles,
+    std::vector<RigExecOutputPacket> *packetOut) const
+{
+    size_t answered = 0;
+    for (const RigExecOutputHandle &handle : handles) {
+        RigExecOutputPacket packet;
+        if (CoverageAnswers(key, handle, &packet)) {
+            ++answered;
+            if (packetOut) {
+                packetOut->push_back(std::move(packet));
+            }
+        }
+    }
+    return answered;
+}
+
+bool
+RigExecFrameCache::CoverageArenaRetained(const RigExecCoverageKey &key) const
+{
+    const _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    return it != shard.coverage.end() && it->second->arenaRetained;
+}
+
+bool
+RigExecFrameCache::RetireCoverageArena(const RigExecCoverageKey &key)
+{
+    _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    if (it == shard.coverage.end() || !it->second->arenaRetained) {
+        return false;
+    }
+    RigExecCoverageBytes workspace;
+    workspace.workspace = it->second->bytes.workspace;
+    it->second->bytes.workspace = 0;
+    it->second->arenaRetained = false;
+    _ReleaseCharge(workspace);
+    _CoverageEntry &entry = *it->second;
+    if (entry.outputs.empty() && entry.leases == 0) {
+        _ReleaseCharge(entry.bytes);
+        shard.coverage.erase(it);
+        _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool
+RigExecFrameCache::ReleaseCoveragePayload(const RigExecCoverageKey &key,
+                                          const RigExecOutputHandle &handle)
+{
+    _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    if (it == shard.coverage.end()) {
+        return false;
+    }
+    _CoverageEntry &entry = *it->second;
+    bool found = false;
+    for (auto output = entry.outputs.begin(); output != entry.outputs.end();
+         ++output) {
+        if (!(output->packet.handle == handle)) {
+            continue;
+        }
+        found = true;
+        const size_t bytes = _CoveragePayloadBytes(output->packet);
+        if (output->leased) {
+            // The bytes are already in the pinned charge, owed by the lease.
+            // The record drops its reference; the lease keeps the buffer alive.
+            entry.outputs.erase(output);
+        } else {
+            RigExecCoverageBytes release;
+            release.payload = bytes;
+            entry.bytes.payload -= bytes;
+            _ReleaseCharge(release);
+            output = entry.outputs.erase(output);
+        }
+        break;
+    }
+    if (!found) {
+        return false;
+    }
+    if (entry.outputs.empty() && !entry.arenaRetained && entry.leases == 0) {
+        _ReleaseCharge(entry.bytes);
+        shard.coverage.erase(it);
+        _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool
+RigExecFrameCache::PinCoverage(const RigExecCoverageKey &key,
+                               const RigExecOutputHandle &handle,
+                               RigExecCoverageLease *leaseOut)
+{
+    if (!leaseOut || leaseOut->IsValid()) {
+        return false;
+    }
+    _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    if (it == shard.coverage.end()) {
+        return false;
+    }
+    _CoverageEntry &entry = *it->second;
+    for (_CoveredOutput &output : entry.outputs) {
+        if (!output.packet.Answers(handle, key.time, key.generation) ||
+            output.leased) {
+            continue;
+        }
+        const size_t bytes = _CoveragePayloadBytes(output.packet);
+        if (!_PinPayload(bytes)) {
+            return false;
+        }
+        entry.bytes.payload -= bytes;
+        entry.bytes.pinned += bytes;
+        ++entry.leases;
+        output.leased = true;
+        *leaseOut = RigExecCoverageLease(this, key, it->second, handle,
+                                         output.packet, bytes);
+        return true;
+    }
+    return false;
+}
+
+bool
+RigExecFrameCache::EvictCoverage(const RigExecCoverageKey &key)
+{
+    _Shard &shard = _GetCoverageShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.coverage.find(key);
+    if (it == shard.coverage.end() || it->second->leases > 0) {
+        return false;
+    }
+    _ReleaseCharge(it->second->bytes);
+    shard.coverage.erase(it);
+    _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+    return true;
+}
+
+size_t
+RigExecFrameCache::ClearCoverageUnpinned()
+{
+    // One shard at a time, like the pose eviction paths. Pinned records stay:
+    // a live lease is never revoked, and its bytes stay charged until the
+    // lease releases them.
+    size_t dropped = 0;
+    for (_Shard &shard : _shards) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        for (auto it = shard.coverage.begin(); it != shard.coverage.end();) {
+            if (it->second->leases > 0) {
+                ++it;
+                continue;
+            }
+            _ReleaseCharge(it->second->bytes);
+            it = shard.coverage.erase(it);
+            _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+            ++dropped;
+        }
+    }
+    return dropped;
+}
+
+} // namespace rigExec

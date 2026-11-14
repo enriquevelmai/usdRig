@@ -112,6 +112,17 @@ libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mute
 libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
 libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
 libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
 
 libs/rigExec/frameCache.h | lock | mutable std::mutex mutex;
 libs/rigExec/frameCache.h | lock | mutable std::mutex _callbackMutex;
