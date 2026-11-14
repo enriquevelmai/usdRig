@@ -83,9 +83,11 @@ public:
             const auto &revision =
                 program.chains[entry.chain].revisions[entry.revision];
             const RigExecMoverParameters &parameters = revision.parameters;
-            if(entry.handler->encodeExternalCompiledData &&
-               !entry.handler->encodeExternalCompiledData(revision.binding,&entry.compiledRig)) {
-                *error="external mover "+revision.moverPath.GetString()+" could not encode its immutable compiled rig";
+            if (entry.handler->encodeExternalCompiledData &&
+                !entry.handler->encodeExternalCompiledData(
+                    revision.binding, &entry.compiledRig)) {
+                *error = "external mover " + revision.moverPath.GetString() +
+                         " could not encode its immutable compiled rig";
                 return false;
             }
             if (!parameters.valid || parameters.externalData.IsEmpty()) {
@@ -93,10 +95,12 @@ public:
             }
             char number[32];
             std::vector<uint8_t> sampledCompiledRig;
-            auto *compiledRig = entry.handler->encodeExternalCompiledData ? &sampledCompiledRig : &entry.compiledRig;
+            auto *compiledRig = entry.handler->encodeExternalCompiledData
+                                    ? &sampledCompiledRig
+                                    : &entry.compiledRig;
             if (!entry.handler->encodeExternal(parameters.externalData,
-                                               revision.binding,
-                                               compiledRig, &entry.frame)) {
+                                               revision.binding, compiledRig,
+                                               &entry.frame)) {
                 *error = "external mover " + revision.moverPath.GetString() +
                          " could not encode its payload at time " +
                          _FormatDouble(time, number, sizeof(number));
@@ -112,8 +116,8 @@ public:
     // failed there), and per declared phase the points authored at
     // \p time, 0 when nothing is read.
     void Fill(const RigExecBakedProgramImpl &program, double time,
-              const RigExecBakeInputs &inputs,
-              RigExecBakePathTable *paths, RigExecBakePools *pools,
+              const RigExecBakeInputs &inputs, RigExecBakePathTable *paths,
+              RigExecBakePools *pools,
               std::vector<fb::RigExecWireExternalMover> *out) const
     {
         out->clear();
@@ -124,29 +128,36 @@ public:
             mover.chain = entry.chain;
             mover.revision = entry.revision;
             mover.type = paths->Token(revision.moverPrim.GetTypeName());
-            const auto declarations=inputs.externalInputs.find({entry.chain,entry.revision});
-            if(declarations!=inputs.externalInputs.end()) {
-                mover.declaredInputs=declarations->second.reads;
-                for(size_t k=0;k<mover.declaredInputs.size();++k) {
-                    auto &row=mover.declaredInputs[k];
-                    const auto &fallback=declarations->second.fallbacks[k];
-                    if(!RigExecFormatIsArrayTag(row.read->tag)) continue;
+            const auto declarations =
+                inputs.externalInputs.find({entry.chain, entry.revision});
+            if (declarations != inputs.externalInputs.end()) {
+                mover.declaredInputs = declarations->second.reads;
+                for (size_t k = 0; k < mover.declaredInputs.size(); ++k) {
+                    auto &row = mover.declaredInputs[k];
+                    const auto &fallback = declarations->second.fallbacks[k];
+                    if (!RigExecFormatIsArrayTag(row.read->tag))
+                        continue;
                     fb::RigExecWireValue value;
-                    value.tag=row.read->tag;
-                    if(fallback.IsHolding<VtIntArray>()) {
-                        const auto &v=fallback.UncheckedGet<VtIntArray>(); value.array=pools->Ints(v.cdata(),v.size());
-                    } else if(fallback.IsHolding<VtFloatArray>()) {
-                        const auto &v=fallback.UncheckedGet<VtFloatArray>(); value.array=pools->Floats(v.cdata(),v.size());
-                    } else if(fallback.IsHolding<VtDoubleArray>()) {
-                        const auto &v=fallback.UncheckedGet<VtDoubleArray>(); value.array=pools->Doubles(v.cdata(),v.size());
-                    } else if(fallback.IsHolding<VtVec2fArray>()) {
-                        const auto &v=fallback.UncheckedGet<VtVec2fArray>();
-                        value.array=pools->Vec2fs(v.empty()?nullptr:v.cdata()->data(),v.size());
-                    } else if(fallback.IsHolding<VtVec3fArray>()) {
-                        const auto &v=fallback.UncheckedGet<VtVec3fArray>();
-                        value.array=pools->Vec3fs(v.empty()?nullptr:v.cdata()->data(),v.size());
+                    value.tag = row.read->tag;
+                    if (fallback.IsHolding<VtIntArray>()) {
+                        const auto &v = fallback.UncheckedGet<VtIntArray>();
+                        value.array = pools->Ints(v.cdata(), v.size());
+                    } else if (fallback.IsHolding<VtFloatArray>()) {
+                        const auto &v = fallback.UncheckedGet<VtFloatArray>();
+                        value.array = pools->Floats(v.cdata(), v.size());
+                    } else if (fallback.IsHolding<VtDoubleArray>()) {
+                        const auto &v = fallback.UncheckedGet<VtDoubleArray>();
+                        value.array = pools->Doubles(v.cdata(), v.size());
+                    } else if (fallback.IsHolding<VtVec2fArray>()) {
+                        const auto &v = fallback.UncheckedGet<VtVec2fArray>();
+                        value.array = pools->Vec2fs(
+                            v.empty() ? nullptr : v.cdata()->data(), v.size());
+                    } else if (fallback.IsHolding<VtVec3fArray>()) {
+                        const auto &v = fallback.UncheckedGet<VtVec3fArray>();
+                        value.array = pools->Vec3fs(
+                            v.empty() ? nullptr : v.cdata()->data(), v.size());
                     }
-                    row.read->constant=pools->Value(value);
+                    row.read->constant = pools->Value(value);
                 }
             }
             mover.v2FrameValid = entry.valid;
@@ -206,8 +217,7 @@ _PresentationInputPaths(const std::vector<uint8_t> &bytes,
     if (!presentation->controls()) {
         return;
     }
-    for (const fb::PresentationControl *control :
-         *presentation->controls()) {
+    for (const fb::PresentationControl *control : *presentation->controls()) {
         // A name that is no path is no listed input either, which
         // _VerifyPresentation reports.
         const std::string input = control->input()->str();
@@ -222,8 +232,7 @@ _PresentationInputPaths(const std::vector<uint8_t> &bytes,
 // them than the controls' inputs.
 bool
 _VerifyPresentation(const std::vector<uint8_t> &bytes,
-                    const std::vector<std::string> &listed,
-                    std::string *error)
+                    const std::vector<std::string> &listed, std::string *error)
 {
     if (bytes.size() >= FLATBUFFERS_MAX_BUFFER_SIZE) {
         *error = "the presentation is past the FlatBuffers size limit";
@@ -238,8 +247,7 @@ _VerifyPresentation(const std::vector<uint8_t> &bytes,
     if (!presentation->controls()) {
         return true;
     }
-    for (const fb::PresentationControl *control :
-         *presentation->controls()) {
+    for (const fb::PresentationControl *control : *presentation->controls()) {
         // Both fields are required, so the verifier saw them present.
         const std::string input = control->input()->str();
         if (!std::binary_search(listed.begin(), listed.end(), input)) {
@@ -251,12 +259,11 @@ _VerifyPresentation(const std::vector<uint8_t> &bytes,
     return true;
 }
 
-}  // namespace
+} // namespace
 
 bool
-RigExecBakeToBinary(RigExecRigEvaluator &evaluator,
-                    const RigExecBakeOpts &opts, RigExecBakeResult *result,
-                    std::string *error)
+RigExecBakeToBinary(RigExecRigEvaluator &evaluator, const RigExecBakeOpts &opts,
+                    RigExecBakeResult *result, std::string *error)
 {
     auto Fail = [&](const std::string &what) {
         if (error) {
@@ -313,8 +320,7 @@ RigExecBakeToBinary(RigExecRigEvaluator &evaluator,
     }
     const double bakeTime =
         std::isnan(opts.time)
-            ? RigExecBakedProbeTime(standing->GetStepGraph().stage)
-                  .GetValue()
+            ? RigExecBakedProbeTime(standing->GetStepGraph().stage).GetValue()
             : opts.time;
     char number[32];
     std::string why;
@@ -384,13 +390,14 @@ RigExecBakeToBinary(RigExecRigEvaluator &evaluator,
     RigExecBakeEnumerateProgramReads(program, bakeTime, &enumerated);
     fb::RigExecWireFile file;
     RigExecBakePools pools;
-    if (!RigExecBakeFillFile(program, inputs.GetInputs(), &paths, &pools,
-                             &file, &why) ||
+    if (!RigExecBakeFillFile(program, inputs.GetInputs(), &paths, &pools, &file,
+                             &why) ||
         !RigExecBakeCaptureStatics(program, bakeTime, inputs.GetInputs(),
                                    enumerated, &paths, &pools, &file, &why)) {
         return Fail("cannot build the .rigexec file: " + why);
     }
-    external.Fill(program, bakeTime, inputs.GetInputs(), &paths, &pools, &file.externalMovers);
+    external.Fill(program, bakeTime, inputs.GetInputs(), &paths, &pools,
+                  &file.externalMovers);
     // The file names its exports explicitly (format 33). The identity and
     // epoch are this bake's own bookkeeping for the discovery call: the
     // file carries neither, and the reader mints them when it opens.
@@ -430,4 +437,4 @@ RigExecBakeToBinary(RigExecRigEvaluator &evaluator,
     return true;
 }
 
-}  // namespace rigExec
+} // namespace rigExec

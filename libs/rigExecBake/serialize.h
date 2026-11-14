@@ -53,6 +53,6 @@ bool RigExecBakeFillExportCatalog(const RigExecOutputCatalog &catalog,
                                   fb::RigExecWireFile *file,
                                   std::string *error);
 
-}  // namespace rigExec
+} // namespace rigExec
 
-#endif  // RIGEXEC_BAKE_SERIALIZE_H
+#endif // RIGEXEC_BAKE_SERIALIZE_H

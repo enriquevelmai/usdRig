@@ -7352,7 +7352,7 @@ TestExportCatalogRefusals()
     reject(std::move(bad), "export_catalog in a format older than");
 }
 
-}  // namespace
+} // namespace
 
 int
 main()

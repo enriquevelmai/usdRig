@@ -1708,6 +1708,159 @@ TestDeclinedEnqueuesSplitByReason()
     ScopedFrameCacheMode on("on");
     if (!RigExecBackgroundWarmingEnabled()) {
         std::printf("SKIP TestDeclinedEnqueuesSplitByReason: "
+                    "warming unavailable in this process\n");
+        return;
+    }
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    scheduler.SetPerRigJobCap(1);
+    Recorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    CHECK(!scheduler.Enqueue(rig, UsdTimeCode::Default(),
+                             RigExecWarmPriority::Sweep, current,
+                             recorder.Work()));
+    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(nan), RigExecWarmPriority::Sweep,
+                             current, recorder.Work()));
+    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(1.0), RigExecWarmPriority::Sweep,
+                             current, RigExecWarmWork()));
+    CHECK(scheduler.Enqueue(rig, UsdTimeCode(1.0), RigExecWarmPriority::Sweep,
+                            current, recorder.Work()));
+    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(2.0), RigExecWarmPriority::Sweep,
+                             current, recorder.Work()));
+    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(3.0), RigExecWarmPriority::Sweep,
+                             current + 1, recorder.Work()));
+    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.declinedUnusableTime == 2);
+    CHECK(stats.declinedEmptyWork == 1);
+    CHECK(stats.declinedPerRigCap == 1);
+    CHECK(stats.declinedStaleGeneration == 1);
+    CHECK(stats.declinedFillGate == 0);
+    CHECK(stats.declinedStopping == 0);
+    CHECK(stats.declined ==
+          stats.declinedFillGate + stats.declinedStaleGeneration +
+              stats.declinedUnusableTime + stats.declinedEmptyWork +
+              stats.declinedPerRigCap + stats.declinedStopping +
+              stats.declinedFreezeRefused + stats.declinedUnsampleable +
+              stats.declinedD7Exempt);
+}
+
+// The depth and running maxima hold the peak the queue reached, and the queue
+// split adds up to the depth in both priorities.
+void
+TestQueueDepthMaximaAndPrioritySplit()
+{
+    std::printf("progress: TestQueueDepthMaximaAndPrioritySplit\n");
+    std::fflush(stdout);
+    ScopedFrameCacheMode on("on");
+    if (!RigExecBackgroundWarmingEnabled()) {
+        std::printf("SKIP TestQueueDepthMaximaAndPrioritySplit: "
+                    "warming unavailable in this process\n");
+        return;
+    }
+    SteppingClock clock;
+    RigExecBackgroundScheduler scheduler(
+        /*workerCount=*/0, [&clock] { return clock.Now(); });
+    Recorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(scheduler.Enqueue(rig, UsdTimeCode(double(i + 1)),
+                                RigExecWarmPriority::Sweep, current,
+                                recorder.Work()));
+    }
+    for (int i = 0; i < 2; ++i) {
+        CHECK(scheduler.Enqueue(rig, UsdTimeCode(double(i + 5)),
+                                RigExecWarmPriority::Neighbor, current,
+                                recorder.Work()));
+    }
+    RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.queuedDepth == 5);
+    CHECK(stats.queuedNeighbor == 2);
+    CHECK(stats.queuedSweep == 3);
+    CHECK(stats.maxQueuedDepth == 5);
+    CHECK(stats.enqueuedNeighbor == 2);
+    CHECK(stats.enqueuedSweep == 3);
+    CHECK(scheduler.RunNextQueuedForTesting());
+    CHECK(scheduler.RunNextQueuedForTesting());
+    stats = scheduler.Stats();
+    CHECK(stats.maxRunning == 1);
+    CHECK(stats.queuedDepth == 3);
+    CHECK(stats.maxQueuedDepth == 5);
+    CHECK(stats.queuedNeighbor + stats.queuedSweep == stats.queuedDepth);
+    scheduler.CancelGeneration(rig);
+    stats = scheduler.Stats();
+    CHECK(stats.queuedDepth == 0);
+    CHECK(stats.maxQueuedDepth == 5);
+}
+
+// A trigger burst that ends early says why: staleness, the sampling budget
+// (invocations or the millisecond stop), or the per-rig cap.
+void
+TestTriggerStopsSplitByCause()
+{
+    std::printf("progress: TestTriggerStopsSplitByCause\n");
+    std::fflush(stdout);
+    ScopedFrameCacheMode on("on");
+    if (!RigExecBackgroundWarmingEnabled()) {
+        std::printf("SKIP TestTriggerStopsSplitByCause: "
+                    "warming unavailable in this process\n");
+        return;
+    }
+    SteppingClock clock;
+    RigExecBackgroundScheduler scheduler(
+        /*workerCount=*/0, [&clock] { return clock.Now(); });
+    scheduler.SetPerRigJobCap(2);
+    Recorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    // Radius 2 asks for 9, 11, 8, 12: the cap closes the burst at the third.
+    CHECK(scheduler.OnEditCommitted(rig, UsdTimeCode(10.0), current, {},
+                                    recorder.Factory(), 2) == 2);
+    CHECK(scheduler.Stats().triggerStopsCap == 1);
+    CHECK(scheduler.Stats().triggerStops == 1);
+    // Draining frees the cap without bumping the generation token.
+    CHECK(scheduler.DrainQueueForTesting() == 2);
+
+    // Invocation budget: one sample, then the burst stops.
+    RigExecWarmSamplingBudget invocations;
+    invocations.maxFactoryInvocations = 1;
+    const std::vector<UsdTimeCode> sweep{UsdTimeCode(20.0), UsdTimeCode(21.0),
+                                         UsdTimeCode(22.0)};
+    CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep,
+                           recorder.Factory(), invocations) == 1);
+    CHECK(scheduler.Stats().triggerStopsBudget == 1);
+    CHECK(scheduler.DrainQueueForTesting() == 1);
+
+    // Millisecond budget, on the injected clock: every reading advances
+    // 1000us, so the first frame sees 1000us elapsed and the second 3000us
+    // against a 1.5ms stop.
+    RigExecWarmSamplingBudget msStop;
+    msStop.maxMs = 1.5;
+    CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep,
+                           recorder.Factory(), msStop) == 1);
+    CHECK(scheduler.Stats().triggerStopsBudget == 2);
+    CHECK(scheduler.DrainQueueForTesting() == 1);
+
+    // An edit landing mid-burst stops the burst as stale.
+    size_t calls = 0;
+    RigExecWarmJobFactory bumping =
+        [&](UsdTimeCode time) -> RigExecWarmFactoryResult {
+        ++calls;
+        if (calls == 2) {
+            scheduler.CancelGeneration(rig);
+        }
+        return recorder.Factory()(time);
+    };
+    CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep, bumping) ==
+          1);
+    CHECK(scheduler.Stats().triggerStopsStale == 1);
+    CHECK(scheduler.Stats().triggerStops ==
+          scheduler.Stats().triggerStopsStale +
+              scheduler.Stats().triggerStopsBudget +
+              scheduler.Stats().triggerStopsCap);
+}
+
 // ---------------------------------------------------------------------------
 // EXPLICIT. Explicit output admission shares the pool with warming.
 // ---------------------------------------------------------------------------
@@ -1874,153 +2027,6 @@ TestExplicitOutputRunsAheadOfWarming()
         return;
     }
     RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
-    scheduler.SetPerRigJobCap(1);
-    Recorder recorder;
-    const SdfPath rig("/Asset/Rig");
-    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    CHECK(!scheduler.Enqueue(rig, UsdTimeCode::Default(),
-                             RigExecWarmPriority::Sweep, current,
-                             recorder.Work()));
-    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(nan), RigExecWarmPriority::Sweep,
-                             current, recorder.Work()));
-    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(1.0), RigExecWarmPriority::Sweep,
-                             current, RigExecWarmWork()));
-    CHECK(scheduler.Enqueue(rig, UsdTimeCode(1.0), RigExecWarmPriority::Sweep,
-                            current, recorder.Work()));
-    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(2.0), RigExecWarmPriority::Sweep,
-                             current, recorder.Work()));
-    CHECK(!scheduler.Enqueue(rig, UsdTimeCode(3.0), RigExecWarmPriority::Sweep,
-                             current + 1, recorder.Work()));
-    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
-    CHECK(stats.declinedUnusableTime == 2);
-    CHECK(stats.declinedEmptyWork == 1);
-    CHECK(stats.declinedPerRigCap == 1);
-    CHECK(stats.declinedStaleGeneration == 1);
-    CHECK(stats.declinedFillGate == 0);
-    CHECK(stats.declinedStopping == 0);
-    CHECK(stats.declined ==
-          stats.declinedFillGate + stats.declinedStaleGeneration +
-              stats.declinedUnusableTime + stats.declinedEmptyWork +
-              stats.declinedPerRigCap + stats.declinedStopping +
-              stats.declinedFreezeRefused + stats.declinedUnsampleable +
-              stats.declinedD7Exempt);
-}
-
-// The depth and running maxima hold the peak the queue reached, and the queue
-// split adds up to the depth in both priorities.
-void
-TestQueueDepthMaximaAndPrioritySplit()
-{
-    std::printf("progress: TestQueueDepthMaximaAndPrioritySplit\n");
-    std::fflush(stdout);
-    ScopedFrameCacheMode on("on");
-    if (!RigExecBackgroundWarmingEnabled()) {
-        std::printf("SKIP TestQueueDepthMaximaAndPrioritySplit: "
-                    "warming unavailable in this process\n");
-        return;
-    }
-    SteppingClock clock;
-    RigExecBackgroundScheduler scheduler(
-        /*workerCount=*/0, [&clock] { return clock.Now(); });
-    Recorder recorder;
-    const SdfPath rig("/Asset/Rig");
-    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
-    for (int i = 0; i < 3; ++i) {
-        CHECK(scheduler.Enqueue(rig, UsdTimeCode(double(i + 1)),
-                                RigExecWarmPriority::Sweep, current,
-                                recorder.Work()));
-    }
-    for (int i = 0; i < 2; ++i) {
-        CHECK(scheduler.Enqueue(rig, UsdTimeCode(double(i + 5)),
-                                RigExecWarmPriority::Neighbor, current,
-                                recorder.Work()));
-    }
-    RigExecBackgroundSchedulerStats stats = scheduler.Stats();
-    CHECK(stats.queuedDepth == 5);
-    CHECK(stats.queuedNeighbor == 2);
-    CHECK(stats.queuedSweep == 3);
-    CHECK(stats.maxQueuedDepth == 5);
-    CHECK(stats.enqueuedNeighbor == 2);
-    CHECK(stats.enqueuedSweep == 3);
-    CHECK(scheduler.RunNextQueuedForTesting());
-    CHECK(scheduler.RunNextQueuedForTesting());
-    stats = scheduler.Stats();
-    CHECK(stats.maxRunning == 1);
-    CHECK(stats.queuedDepth == 3);
-    CHECK(stats.maxQueuedDepth == 5);
-    CHECK(stats.queuedNeighbor + stats.queuedSweep == stats.queuedDepth);
-    scheduler.CancelGeneration(rig);
-    stats = scheduler.Stats();
-    CHECK(stats.queuedDepth == 0);
-    CHECK(stats.maxQueuedDepth == 5);
-}
-
-// A trigger burst that ends early says why: staleness, the sampling budget
-// (invocations or the millisecond stop), or the per-rig cap.
-void
-TestTriggerStopsSplitByCause()
-{
-    std::printf("progress: TestTriggerStopsSplitByCause\n");
-    std::fflush(stdout);
-    ScopedFrameCacheMode on("on");
-    if (!RigExecBackgroundWarmingEnabled()) {
-        std::printf("SKIP TestTriggerStopsSplitByCause: "
-                    "warming unavailable in this process\n");
-        return;
-    }
-    SteppingClock clock;
-    RigExecBackgroundScheduler scheduler(
-        /*workerCount=*/0, [&clock] { return clock.Now(); });
-    scheduler.SetPerRigJobCap(2);
-    Recorder recorder;
-    const SdfPath rig("/Asset/Rig");
-    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
-    // Radius 2 asks for 9, 11, 8, 12: the cap closes the burst at the third.
-    CHECK(scheduler.OnEditCommitted(rig, UsdTimeCode(10.0), current, {},
-                                    recorder.Factory(), 2) == 2);
-    CHECK(scheduler.Stats().triggerStopsCap == 1);
-    CHECK(scheduler.Stats().triggerStops == 1);
-    // Draining frees the cap without bumping the generation token.
-    CHECK(scheduler.DrainQueueForTesting() == 2);
-
-    // Invocation budget: one sample, then the burst stops.
-    RigExecWarmSamplingBudget invocations;
-    invocations.maxFactoryInvocations = 1;
-    const std::vector<UsdTimeCode> sweep{UsdTimeCode(20.0), UsdTimeCode(21.0),
-                                         UsdTimeCode(22.0)};
-    CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep,
-                           recorder.Factory(), invocations) == 1);
-    CHECK(scheduler.Stats().triggerStopsBudget == 1);
-    CHECK(scheduler.DrainQueueForTesting() == 1);
-
-    // Millisecond budget, on the injected clock: every reading advances
-    // 1000us, so the first frame sees 1000us elapsed and the second 3000us
-    // against a 1.5ms stop.
-    RigExecWarmSamplingBudget msStop;
-    msStop.maxMs = 1.5;
-    CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep,
-                           recorder.Factory(), msStop) == 1);
-    CHECK(scheduler.Stats().triggerStopsBudget == 2);
-    CHECK(scheduler.DrainQueueForTesting() == 1);
-
-    // An edit landing mid-burst stops the burst as stale.
-    size_t calls = 0;
-    RigExecWarmJobFactory bumping =
-        [&](UsdTimeCode time) -> RigExecWarmFactoryResult {
-        ++calls;
-        if (calls == 2) {
-            scheduler.CancelGeneration(rig);
-        }
-        return recorder.Factory()(time);
-    };
-    CHECK(scheduler.OnIdle(rig, UsdTimeCode(10.0), current, sweep, bumping) ==
-          1);
-    CHECK(scheduler.Stats().triggerStopsStale == 1);
-    CHECK(scheduler.Stats().triggerStops ==
-          scheduler.Stats().triggerStopsStale +
-              scheduler.Stats().triggerStopsBudget +
-              scheduler.Stats().triggerStopsCap);
     OrderLog log;
     const SdfPath rig("/Asset/Rig");
     const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
