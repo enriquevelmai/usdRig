@@ -421,8 +421,9 @@ public:
     // cannot be satisfied, never with a different answer. Returns false when
     // the request itself is invalid (no output named, or the run did not
     // complete); \p packets still holds one packet per handle, in request
-    // order. A handle this file does not name at all is answered Unsupported
-    // and never enters the closure.
+    // order. A handle this file does not name at all, or names as an address it
+    // cannot produce, is answered Unsupported with the file's reason and never
+    // enters the closure.
     bool ExecuteRequested(const std::vector<RigExecOutputHandle> &requested,
                           const RigExecOutputTime &at,
                           const RigExecOutputGeneration &captured,

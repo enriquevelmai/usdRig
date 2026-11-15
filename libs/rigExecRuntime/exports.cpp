@@ -462,6 +462,15 @@ RrResolveOutput(const RrProgram *program, const RigExecOutputHandle &handle,
 
 namespace {
 
+// The catalog's own answer for an address it cannot produce: the reason the
+// entry names, which no run of this program can change.
+void
+_Decline(const RrExport &output, RigExecOutputPacket &packet)
+{
+    packet.status = RigExecOutputStatus::Unsupported;
+    packet.reason = output.reason;
+}
+
 // What stands for one requested output once the run joined: the catalog's own
 // answer for an address it cannot produce, otherwise this run's fact about the
 // producer value, then the typed read of the storage that value lives in.
@@ -470,8 +479,7 @@ _Answer(const RrProgram &program, const RrExport &output,
         const RigExecOutputHandle &requested, RigExecOutputPacket *packet)
 {
     if (!output.extractable) {
-        packet->status = RigExecOutputStatus::Unsupported;
-        packet->reason = output.reason;
+        _Decline(output, *packet);
         return;
     }
     const RigExecOpAdapterState &state = program.store.opAdapter;
@@ -581,7 +589,15 @@ RrRequestOutputs(RrProgram *program,
                             "; this catalog is epoch " +
                             std::to_string(program->compileEpoch);
         } else {
-            bound[i] = int64_t(index);
+            const RrExport &output = program->exports[index];
+            if (output.extractable) {
+                bound[i] = int64_t(index);
+            } else {
+                // An address the catalog cannot produce is answered here, not
+                // left Pending for a run that could never produce it, and it
+                // joins no closure.
+                _Decline(output, packet);
+            }
         }
         answers.push_back(std::move(packet));
     }

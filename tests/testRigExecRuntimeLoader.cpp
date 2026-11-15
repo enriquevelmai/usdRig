@@ -30,7 +30,9 @@
 // as the same rig's live baked program answers it, at the bake time and at a
 // frame the bake did not capture; a handle of another rig instance, compile or
 // address is refused with its reason, and a file older than the catalog names
-// no outputs and refuses a request while it still plays.
+// no outputs and refuses a request while it still plays. An entry the file
+// marks unusable, with no producer value and its reason, is answered with that
+// reason alone and beside a supported output, and its request runs nothing.
 #include "rigExecBake/bake.h"
 #include "rigExec/bakedProgram.h"
 #include "rigExec/bakedProgramImpl.h"
@@ -1958,6 +1960,8 @@ static int requestedLayouts = 0;
 static int requestedEmptyRows = 0;
 static int requestedSameClosure = 0;
 static int requestedSequences = 0;
+static int requestedUnusable = 0;
+static int requestedUnusableMixed = 0;
 
 // One payload equals another: same layout, same element count, same bytes.
 static bool
@@ -2542,6 +2546,191 @@ _TestRequestedOutputs(const RigExecExampleFixture &fixture,
     }
 }
 
+// An entry the file exports and its extractor cannot answer, spelled the way
+// a bake spells a GPU-only points chain: unusable capability, no producer
+// value, and the reason the catalog names. That answer is terminal before a
+// closure is chosen, so a request naming only such an address runs no
+// operation and still reaches it, a supported sibling changes neither its
+// status nor its reason, and a foreign instance or stale epoch is still what
+// the reader reports first.
+static void
+_TestRequestedUnextractable(const RigExecExampleFixture &fixture,
+                            const std::vector<uint8_t> &bytes, double frame)
+{
+    const std::string decline =
+        "the runtime extractor has no payload for this output";
+    std::string why;
+    const std::unique_ptr<RigExecRuntimeReader> whole =
+        RigExecRuntimeReader::Open(bytes.data(), bytes.size(), &why);
+    if (!whole || whole->GetOutputCount() == 0) {
+        return;
+    }
+    // The last address the file exports becomes the unusable one; the first
+    // stays its supported sibling.
+    std::string declinedKey, siblingKey;
+    for (size_t i = 0; i < whole->GetOutputCount(); ++i) {
+        RigExecRuntimeOutput output;
+        CHECK(whole->GetOutputAt(i, &output));
+        if (output.status != RigExecOutputStatus::Pending) {
+            continue;
+        }
+        if (siblingKey.empty()) {
+            siblingKey = output.handle.semanticKey;
+        }
+        declinedKey = output.handle.semanticKey;
+    }
+    if (declinedKey.empty()) {
+        return;
+    }
+    bool entryEdited = false;
+    const std::vector<uint8_t> unusable =
+        RigExecTestEdited(bytes, [&](fb::RigExecWireFile *file) {
+            if (!file->exportCatalog) {
+                return;
+            }
+            for (fb::RigExecWireExportEntry &entry :
+                 file->exportCatalog->entries) {
+                if (entry.semanticKey != declinedKey) {
+                    continue;
+                }
+                entry.capability = fb::ExportCapability::Unusable;
+                entry.producerValue = -1;
+                entry.reason = decline;
+                entryEdited = true;
+            }
+        });
+    CHECK(entryEdited);
+    if (!entryEdited || unusable.empty()) {
+        return;
+    }
+    const std::unique_ptr<RigExecRuntimeReader> reader =
+        RigExecRuntimeReader::Open(unusable.data(), unusable.size(), &why);
+    CHECK(reader);
+    if (!reader) {
+        std::printf("%s: unusable export open: %s\n", fixture.stage,
+                    why.c_str());
+        return;
+    }
+    // Discovery and ResolveOutput both carry the catalog's own refusal.
+    size_t index = 0;
+    RigExecRuntimeOutput asked;
+    if (!reader->FindOutput(declinedKey, &index) ||
+        !reader->GetOutputAt(index, &asked)) {
+        std::printf("%s: %s is not an output of the edited file\n",
+                    fixture.stage, declinedKey.c_str());
+        ++failures;
+        return;
+    }
+    CHECK(asked.status == RigExecOutputStatus::Unsupported);
+    CHECK(asked.reason == decline);
+    std::string resolveWhy;
+    CHECK(reader->ResolveOutput(asked.handle, &resolveWhy) ==
+          RigExecOutputStatus::Unsupported);
+    CHECK(resolveWhy == decline);
+
+    const RigExecOutputTime at = _TimeAt(frame);
+    RigExecOutputGeneration captured;
+    captured.programIdentity = reader->GetOutputCompileEpoch();
+
+    // Asked alone: nothing runs, and the refusal is still the answer.
+    std::vector<RigExecOutputPacket> packets;
+    RigExecRuntimeRequestedCounts counts;
+    CHECK(
+        reader->ExecuteRequested(std::vector<RigExecOutputHandle>{asked.handle},
+                                 at, captured, &packets, &counts, &why));
+    CHECK(why.empty());
+    CHECK(packets.size() == 1);
+    if (packets.size() == 1) {
+        CHECK(packets[0].status == RigExecOutputStatus::Unsupported);
+        CHECK(packets[0].reason == decline);
+        CHECK(packets[0].payload.IsEmpty());
+        CHECK(packets[0].handle.semanticKey == declinedKey);
+        CHECK(packets[0].Generation() == captured);
+    }
+    CHECK(counts.requestedOperations == 0);
+    CHECK(counts.executedOperations == 0);
+    CHECK(counts.clustersRun == 0);
+    // The refusal is terminal: the same request asked again answers the same
+    // way, so a host retrying it never waits on a run that cannot come.
+    std::vector<RigExecOutputPacket> again;
+    RigExecRuntimeRequestedCounts againCounts;
+    CHECK(
+        reader->ExecuteRequested(std::vector<RigExecOutputHandle>{asked.handle},
+                                 at, captured, &again, &againCounts, &why));
+    CHECK(again.size() == 1);
+    if (again.size() == 1) {
+        CHECK(again[0].status == RigExecOutputStatus::Unsupported);
+        CHECK(again[0].reason == decline);
+        CHECK(again[0].payload.IsEmpty());
+    }
+    CHECK(againCounts.requestedOperations == 0);
+    ++requestedUnusable;
+
+    // Asked beside a supported output: the sibling answers with bytes, the
+    // refusal is unchanged, and only the sibling's closure ran.
+    if (!siblingKey.empty() && siblingKey != declinedKey) {
+        RigExecRuntimeOutput sibling;
+        size_t siblingIndex = 0;
+        if (reader->FindOutput(siblingKey, &siblingIndex) &&
+            reader->GetOutputAt(siblingIndex, &sibling)) {
+            std::vector<RigExecOutputPacket> both;
+            RigExecRuntimeRequestedCounts mixed;
+            CHECK(reader->ExecuteRequested(
+                std::vector<RigExecOutputHandle>{asked.handle, sibling.handle},
+                at, captured, &both, &mixed, &why));
+            CHECK(why.empty());
+            CHECK(both.size() == 2);
+            if (both.size() == 2) {
+                CHECK(both[0].status == RigExecOutputStatus::Unsupported);
+                CHECK(both[0].reason == decline);
+                CHECK(both[0].payload.IsEmpty());
+                CHECK(both[1].status == RigExecOutputStatus::Ready);
+                CHECK(!both[1].payload.IsEmpty());
+                CHECK(both[1].handle.semanticKey == siblingKey);
+            }
+            CHECK(mixed.requestedOperations > 0);
+            CHECK(mixed.executedOperations > 0);
+            ++requestedUnusableMixed;
+        }
+    }
+
+    // A handle of another rig instance or compile epoch is refused as such,
+    // ahead of the catalog's refusal, and so is a captured generation naming
+    // another program.
+    RigExecOutputHandle otherRig = asked.handle;
+    otherRig.rigIdentity = "/Another/Rig";
+    RigExecOutputHandle stale = asked.handle;
+    stale.compileEpoch = reader->GetOutputCompileEpoch() + 1;
+    std::vector<RigExecOutputPacket> refused;
+    CHECK(reader->ExecuteRequested(std::vector<RigExecOutputHandle>{otherRig},
+                                   at, captured, &refused, nullptr, &why));
+    CHECK(refused.size() == 1);
+    if (refused.size() == 1) {
+        CHECK(refused[0].status == RigExecOutputStatus::Invalidated);
+        CHECK(refused[0].reason == "output belongs to another rig instance");
+    }
+    refused.clear();
+    CHECK(reader->ExecuteRequested(std::vector<RigExecOutputHandle>{stale}, at,
+                                   captured, &refused, nullptr, &why));
+    CHECK(refused.size() == 1);
+    if (refused.size() == 1) {
+        CHECK(refused[0].status == RigExecOutputStatus::Invalidated);
+        CHECK(refused[0].reason == "output compile epoch is stale");
+    }
+    RigExecOutputGeneration foreign;
+    foreign.programIdentity = reader->GetOutputCompileEpoch() + 3;
+    refused.clear();
+    CHECK(
+        reader->ExecuteRequested(std::vector<RigExecOutputHandle>{asked.handle},
+                                 at, foreign, &refused, nullptr, &why));
+    CHECK(refused.size() == 1);
+    if (refused.size() == 1) {
+        CHECK(refused[0].status == RigExecOutputStatus::Invalidated);
+        CHECK(refused[0].reason.find("this catalog is epoch") !=
+              std::string::npos);
+    }
+}
+
 // The requested run at a frame the bake did not capture: the reader's inputs
 // sample to that frame, and the same request on the live program at that time
 // answers the same bytes. A file with windowed operations is left out: its
@@ -3019,6 +3208,7 @@ _TestFixture(const RigExecExampleFixture &fixture, const std::string &stagePath,
     // storage a requested run left, against the same request on the live
     // program: at the bake time, and at a frame the bake did not capture.
     _TestRequestedOutputs(fixture, stage, rigPath, atFirst, bakeFrames.front());
+    _TestRequestedUnextractable(fixture, atFirst, bakeFrames.front());
     if (bakeFrames.size() > 1 && std::string(fixture.animation) != "static") {
         _TestRequestedAtFrame(fixture, stage, rigPath, atFirst,
                               bakeFrames.back());
@@ -3163,10 +3353,12 @@ main(int argc, char **argv)
                 "compared, %d row(s) scoped to their closure, %d row(s) "
                 "refusing foreign handles, %d legacy row(s) with no catalog "
                 "(%d export(s) listed, %d row(s) naming none, %d pair(s) "
-                "sharing a closure)\n",
+                "sharing a closure, %d unusable export(s) refused alone, %d "
+                "beside a supported sibling)\n",
                 requestedRows, requestedTemporal, requestedCompared,
                 requestedScoped, requestedForeign, requestedLegacyRows,
-                requestedLayouts, requestedEmptyRows, requestedSameClosure);
+                requestedLayouts, requestedEmptyRows, requestedSameClosure,
+                requestedUnusable, requestedUnusableMixed);
     CHECK(requestedSequences > 0);
     CHECK(requestedRows > 0);
     CHECK(requestedTemporal > 0);
@@ -3175,6 +3367,8 @@ main(int argc, char **argv)
     CHECK(requestedForeign > 0);
     CHECK(requestedLegacyRows > 0);
     CHECK(requestedLayouts >= 3);
+    CHECK(requestedUnusable > 0);
+    CHECK(requestedUnusableMixed > 0);
 
     if (failures == 0) {
         std::printf("testRigExecRuntimeLoader: all tests passed\n");
