@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- CPython and Qt under the hardened runtime: JIT-compiled code,
+       unsigned executable memory, and dlopen of the bundled plug-in
+       libraries (whose team IDs differ from the launcher's) must stay
+       permitted or usdview fails to start after notarization. -->
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+</dict>
+</plist>

@@ -146,6 +146,7 @@ The documentation is published at **[usdcharacter.github.io/usdRig](https://usdc
 - [Standalone runtime](docs/specs/standalone-runtime.md)
 - [Public method references](docs/references.md)
 - [Agent and contributor guide](AGENTS.md)
+- [Release bundles](packaging/README.md): self-contained `usdview` downloads built for every `v<major>.<minor>.0` tag
 
 ## Repository layout
 
@@ -167,6 +168,7 @@ The documentation is published at **[usdcharacter.github.io/usdRig](https://usdc
 | `plugin` | Schema resources and optional viewer tools |
 | `tests`, `examples`, `docs` | Verification, sample stages, and documentation |
 | `bin`, `tools` | Environment helpers and command-line programs |
+| `packaging` | Release-bundle launcher, assembly, and signing scripts |
 
 ## Development
 

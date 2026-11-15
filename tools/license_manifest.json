@@ -13,14 +13,14 @@
     "open_prs_at_boundary": [49],
     "open_pr_note": "No pull request was open at the first boundary; the inventory and this task land as their own PRs on main. The only open pull request at this boundary is this branch's own PR #49, the five files named in count_scope below.",
     "rebase_rule": "If main moves, recompute every count in this manifest against the new head before use. The archive blobs below were verified unchanged between 66b24f2, 99b250f, 543fbe98, 86d0772 and 47955a01, and every count was re-derived against 47955a01.",
-    "tracked_files_total": 1808,
+    "tracked_files_total": 1816,
     "tracked_files_at_base_commit": 1803,
     "inventory_scope_excludes": [
       "thirdparty/**",
       "plugin/usdNoodles/**"
     ],
-    "tracked_files_in_scope": 1603,
-    "license_marker_files_in_scope": 28,
+    "tracked_files_in_scope": 1611,
+    "license_marker_files_in_scope": 30,
     "marker_scan_definition": "Plain-text files (no NUL byte) whose content contains 'copyright', 'license' or 'spdx' case-insensitively, measured over every file of the audited inventory outside the scope exclusions. An earlier unqualified scan counted 26 by matching binary payloads too; see totals.false_positive_note. The scan matches the word wherever it appears, grant or mere reference, so prose that names the checker moves the count: .github/workflows/usdrig.yml joined the set when CI started invoking tools/check_licenses.py, and docs/concepts/licensing.md joined it with its summary line in the generated docs/index.md catalog.",
     "archive_members_inventory": [
       {
@@ -71,7 +71,7 @@
   },
   "precedence": {
     "rule": "A path belongs to the family with the lowest precedence number whose globs match it, after that family's carve_outs are applied. Ties are impossible because each family's glob set is disjoint by carve-out. A path matching nothing falls to the precedence-6 fallback.",
-    "verification": "The 29 families below partition the 1808 files of the audited inventory exactly once: 1808 assigned, 0 unassigned, 0 double-assigned, 0 in fallback-unclassified. Verify with tools/check_licenses.py, which re-derives the partition from the checkout.",
+    "verification": "The 29 families below partition the 1816 files of the audited inventory exactly once: 1816 assigned, 0 unassigned, 0 double-assigned, 0 in fallback-unclassified. Verify with tools/check_licenses.py, which re-derives the partition from the checkout.",
     "byte_identity_note": "Legal texts shipped inside the checked-in archives are CRLF-normalized copies of their repository sources. They match the source after CRLF -> LF normalization, except the two THIRD_PARTY_NOTICES copies, which are content-stale (see distribution.gaps)."
   },
   "families": [
@@ -690,7 +690,8 @@
         ".gitignore",
         "mkdocs.yml",
         "docs/requirements.txt",
-        "skills/**"
+        "skills/**",
+        "packaging/**"
       ],
       "carve_outs": [],
       "spdx": "MIT",
@@ -708,7 +709,7 @@
       ],
       "generator": null,
       "exception_scope": "External tools invoked by these scripts (flatc, usdGenSchema, clang-format, MkDocs, Qt/PySide) are not relicensed by the root MIT; only their checked-in scripts are project work.",
-      "matched_files": 115
+      "matched_files": 123
     },
     {
       "id": "original-example-generators",
@@ -992,17 +993,17 @@
     }
   ],
   "totals": {
-    "assigned_files": 1808,
+    "assigned_files": 1816,
     "unassigned_files": 0,
     "double_assigned_files": 0,
     "by_category": {
-      "original": 1527,
+      "original": 1535,
       "derived": 166,
       "bundled": 45,
       "generated": 70,
       "unresolved": 0
     },
-    "files_with_license_or_copyright_markers_in_scope": 28,
+    "files_with_license_or_copyright_markers_in_scope": 30,
     "false_positive_note": "examples/2d/bust_dd_b/textures/MouthLine.png matches a marker scan only because compressed PNG bytes happen to contain the substring 'spdx'; a checker must scan text files only or decode binary payloads before matching."
   },
   "distribution": {

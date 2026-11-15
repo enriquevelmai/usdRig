@@ -588,6 +588,17 @@ target_link_libraries(rigExecPose PRIVATE rigExec rigExecRuntime rigExecSampler)
 target_compile_definitions(rigExecPose PRIVATE
     RIGEXEC_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_BINARY_DIR}/usd/rigExecSchema/resources")
 
+# Bundle launcher for release downloads (packaging/README.md). No USD or
+# RigExec dependency: it locates the bundled Python/usdview relative to
+# itself, so it also builds in a tree configured without Python.
+option(RIGEXEC_BUILD_VIEWER_LAUNCHER
+       "Build the usdRigView launcher for release bundles" OFF)
+if (RIGEXEC_BUILD_VIEWER_LAUNCHER)
+    add_executable(usdRigView packaging/launcher/usdRigView.cpp)
+    target_compile_features(usdRigView PRIVATE cxx_std_17)
+    set_target_properties(usdRigView PROPERTIES OUTPUT_NAME usdRigView)
+endif()
+
 if (CMAKE_CROSSCOMPILING)
     set(_rigexec_tests_default OFF)
 else()
@@ -678,6 +689,14 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME testRigExecMoverSchemaGen COMMAND ${Python3_EXECUTABLE}
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/testRigExecMoverSchemaGen.py"
     "${RIGEXEC_TEST_USD_DIR}")
+
+if (TARGET usdRigView)
+    add_test(NAME testRigExecBundlePackaging COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/test_assemble_bundle.py"
+        "$<TARGET_FILE:usdRigView>")
+    set_tests_properties(testRigExecBundlePackaging PROPERTIES
+        LABELS "fast" TIMEOUT 120)
+endif()
 
 # The test selector must attribute an OBJECT library's sources to the
 # targets that compose it, or an imaging domain edit would select no
