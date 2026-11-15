@@ -979,9 +979,16 @@ private:
 
     // Charges or releases \p bytes across the four domains. false, having
     // charged nothing, when a domain would wrap, or (for a charge) when the
-    // budget would exceed the byte cap. As with pose publishing, a burst of
-    // concurrent charges can overshoot the cap transiently by the burst that
-    // passes the check together.
+    // budget would exceed the byte cap. Every charge, release, and
+    // payload-to-pinned transfer checks the ceiling as one step under the
+    // account lock, so concurrent coverage admissions cannot pass the check
+    // together and never overshoot the cap, even transiently. Pose
+    // publishing charges first and evicts back under the cap (see
+    // RigExecFrameCacheStats::bytes).
+    // One accounted step against the shared ceiling.
+    void _ChargePoseBytes(size_t bytes) const;
+    void _ReleasePoseBytes(size_t bytes) const;
+    size_t _AccountedBytes() const;
     bool _ChargeCoverage(const RigExecCoverageBytes &bytes) const;
     bool _ReleaseCharge(const RigExecCoverageBytes &bytes) const;
     // Moves \p bytes of a live payload from the payload charge to the pinned
@@ -1016,6 +1023,13 @@ private:
     mutable std::atomic<size_t> _coveragePayload{0};
     mutable std::atomic<size_t> _coveragePinned{0};
     mutable std::atomic<size_t> _coverageRecords{0};
+    // Pose residency and the four coverage domains share one byte ceiling, so
+    // every mutation of either total -- a coverage charge or release, a
+    // payload-to-pinned transfer, or a pose publish, eviction or clear -- runs
+    // under this lock, which is a leaf: it takes no other lock, so the only
+    // ordering is shard lock then account lock. The counters stay atomic for
+    // the lock-free readers.
+    mutable std::mutex _coverageAccountMutex;
     mutable std::mutex _callbackMutex;
     RigExecFrameCacheEvictionCallback _evictionCallback;
 };

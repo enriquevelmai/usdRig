@@ -412,6 +412,14 @@ using RigExecExplicitOutcome = RigExecWarmOutcome;
 using RigExecExplicitWork =
     std::function<RigExecExplicitOutcome(const RigExecExplicitRequest &)>;
 
+/// The seam at the end of an accepted explicit admission: it names the job
+/// that admission queued, after the queue, counters and reservation record it
+/// and after the lanes are notified, with no scheduler lock held -- so the
+/// job's own terminal state can land while the seam runs. Null by default
+/// (one branch, no cost). Tests install one; production never does.
+using RigExecExplicitAdmissionReturnHook =
+    std::function<void(const RigExecExplicitJobKey &)>;
+
 /// One per-frame queue transition, reported to the transition hook: the
 /// registry records it into the shared warm-frame index, which is what the
 /// per-frame query API reads. Delivered under the scheduler lock, in the
@@ -603,7 +611,7 @@ struct RigExecBackgroundSchedulerStats {
     /// Explicit jobs popped, then dropped by the pre-run generation check.
     size_t explicitDroppedStale = 0;
     /// Queued explicit jobs purged by CancelGeneration,
-    /// CancelGenerationTimes or ResetRig.
+    /// CancelGenerationTimes, CancelExplicitJob or ResetRig.
     size_t explicitCanceled = 0;
     /// Queued explicit jobs dropped by the destructor.
     size_t explicitDroppedAtShutdown = 0;
@@ -692,6 +700,17 @@ public:
     /// Global CancelGeneration stays for compiled rig moves only.
     size_t CancelGenerationTimes(const SdfPath &rig,
                                  const std::vector<UsdTimeCode> &times);
+
+    /// Drops the rig's one queued explicit job keyed exactly by \p key -- the
+    /// demand-retirement operation a subscription does when its last client
+    /// stops asking for a frame. No generation bump and no fence token moves:
+    /// the compiled rig did not move, so every other job stays queued and its
+    /// running jobs publish normally. Warm jobs, and explicit jobs under any
+    /// other key, are untouched, and the purged job's byte reservation comes
+    /// back. A job that already popped cannot be purged; its caller-side
+    /// liveness flag is what drops its answer. Answers whether a queued job
+    /// left the queue.
+    bool CancelExplicitJob(const RigExecExplicitJobKey &key);
 
     /// The rig's current per-time fence token for \p time: zero when the
     /// time was never scoped-purged, otherwise the token the purge
@@ -893,6 +912,14 @@ public:
     /// registry installs one recording into the shared warm-frame index;
     /// see RigExecWarmTransition for the delivery contract.
     void SetTransitionHook(RigExecWarmTransitionHook hook);
+
+    /// Installs the explicit admission-return seam (null uninstalls). It runs
+    /// on the admitting thread just before AdmitExplicitOutput returns true,
+    /// outside the scheduler lock, so a test can force the admitted job's
+    /// terminal disposition before its own admission returns. Set before the
+    /// first admission and never from inside it.
+    void
+    SetAdmissionReturnHookForTesting(RigExecExplicitAdmissionReturnHook hook);
 
     /// The worker count this scheduler runs (after clamping). Zero is the
     /// manual mode.
@@ -1184,6 +1211,7 @@ private:
     size_t _explicitDroppedAtShutdown = 0;
     size_t _explicitRunning = 0;
     RigExecWarmTransitionHook _transitionHook;
+    RigExecExplicitAdmissionReturnHook _admissionReturnHook;
     size_t _perRigCap = kRigExecBackgroundSchedulerDefaultPerRigJobs;
     size_t _explicitPerRigCap =
         kRigExecBackgroundSchedulerDefaultExplicitPerRigJobs;

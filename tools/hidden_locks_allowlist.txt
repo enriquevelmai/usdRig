@@ -43,6 +43,8 @@ libs/rigExec/backgroundScheduler.cpp | lock | std::lock_guard<std::mutex> lock(_
 libs/rigExec/backgroundScheduler.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
 libs/rigExec/backgroundScheduler.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
 libs/rigExec/backgroundScheduler.cpp | lock | std::unique_lock<std::mutex> lock(_mutex);
+libs/rigExec/backgroundScheduler.cpp | lock | std::unique_lock<std::mutex> lock(_mutex);
+libs/rigExec/backgroundScheduler.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
 
 libs/rigExec/backgroundScheduler.h | lock | std::mutex &FenceMutex() const
 libs/rigExec/backgroundScheduler.h | lock | mutable std::mutex _mutex;
@@ -277,3 +279,11 @@ libs/rigExecRuntime/inputs.cpp | env | const char *value = std::getenv(name);
 libs/rigExecRuntime/open.cpp | env | const char *value = std::getenv(name);
 
 libs/rigExecScene/sceneDescriptors.cpp | token-text | scene.primvarNames.emplace(primvar, TfToken(primvar));
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
+libs/rigExec/frameCache.h | lock | mutable std::mutex _coverageAccountMutex;
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> transfer(_coverageAccountMutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> transfer(_coverageAccountMutex);

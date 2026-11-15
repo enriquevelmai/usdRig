@@ -235,6 +235,8 @@ struct RigExecSubscriptionEvent {
     /// demanded output, otherwise the status that stopped it.
     RigExecOutputStatus status = RigExecOutputStatus::Pending;
     size_t answered = 0;
+    // The outputs the frame's run names. A handle the catalog marks
+    // unsupported answers on its own and is not counted here.
     size_t demanded = 0;
     std::string reason;
 };

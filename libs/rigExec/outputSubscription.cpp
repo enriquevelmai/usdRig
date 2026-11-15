@@ -686,7 +686,7 @@ private:
             return;
         }
         std::vector<_GroupKey> owed;
-        std::vector<std::pair<SdfPath, std::vector<UsdTimeCode>>> purges;
+        std::vector<RigExecExplicitJobKey> purges;
         {
             std::lock_guard<std::mutex> lock(_mutex);
             _PruneRetiredLocked();
@@ -705,12 +705,11 @@ private:
                 owed.push_back(group.first);
             }
         }
-        for (const auto &purge : purges) {
-            // Retirement for a frame no live client demands any more: its
-            // queued job leaves and its byte reservation comes back. An empty
-            // time list retires the default frame's job, which has no numeric
-            // value to name it by.
-            _host.scheduler->CancelGenerationTimes(purge.first, purge.second);
+        for (const RigExecExplicitJobKey &key : purges) {
+            // Retirement for a frame no live client demands any more: exactly
+            // this job leaves the queue and its byte reservation comes back.
+            // No other client's work, warm or explicit, is touched.
+            _host.scheduler->CancelExplicitJob(key);
         }
         for (const _GroupKey &group : owed) {
             _CaptureAndAdmit(group);
@@ -744,8 +743,7 @@ private:
 
     // Re-union every live client's demand. A frame no client demands leaves
     // with its queued job.
-    void _RebuildDemandLocked(
-        std::vector<std::pair<SdfPath, std::vector<UsdTimeCode>>> *purges)
+    void _RebuildDemandLocked(std::vector<RigExecExplicitJobKey> *purges)
     {
         for (auto &group : _groups) {
             group.second.desired.clear();
@@ -759,6 +757,14 @@ private:
                     group.catalog = client.catalog;
                 }
                 for (const RigExecOutputHandle &handle : demand.handles) {
+                    // A handle this client's own catalog marks unsupported has
+                    // no producer in this generation: naming it in the demand
+                    // would refuse the whole requested run and starve its
+                    // supported siblings. It answers Unsupported per handle in
+                    // the poll instead.
+                    if (_Refused(client, handle)) {
+                        continue;
+                    }
                     _UnionHandle(&group.desired, handle);
                 }
             }
@@ -768,22 +774,15 @@ private:
                 ++it;
                 continue;
             }
-            std::vector<UsdTimeCode> times;
-            if (!it->first.time.IsDefault()) {
-                times.push_back(UsdTimeCode(it->first.time.TimeCode()));
-            }
             // Retirement drops the key from this group's in-flight list, so
             // the walk takes the list out of the group first: nothing is left
             // under it to shrink.
             std::vector<RigExecExplicitJobKey> keys;
             keys.swap(it->second.inFlight);
-            const bool hadWork = !keys.empty();
             for (const RigExecExplicitJobKey &key : keys) {
                 _RetireDemandLocked(key, RigExecOutputStatus::Pending,
                                     "no live subscription demands this frame");
-            }
-            if (hadWork) {
-                purges->emplace_back(it->first.rig, std::move(times));
+                purges->push_back(key);
             }
             it = _groups.erase(it);
         }
@@ -968,25 +967,32 @@ private:
                                        const RigExecExplicitRequest &request) {
             return state->RunDemand(job, request);
         };
-        if (!_host.scheduler->AdmitExplicitOutput(admission, std::move(work))) {
-            std::lock_guard<std::mutex> lock(_mutex);
-            _NoteStatusLocked(groupKey, RigExecOutputStatus::Pending,
-                              "the pool declined this admission; the next pump "
-                              "retries it");
-            ++_stats.declinedAdmission;
-            return;
-        }
+        // The demand and its launched mask are owned before the pool sees the
+        // job. Admission notifies the lanes and returns without a completion
+        // barrier, so a worker can reach a terminal state inside this call:
+        // registering afterwards would resurrect that job's demand and stamp
+        // its terminal status back to Pending.
         {
             std::lock_guard<std::mutex> lock(_mutex);
             _demands.emplace(job->key, job);
             ++_stats.dispatches;
             const auto group = _groups.find(groupKey);
-            if (group == _groups.end()) {
-                return;
+            if (group != _groups.end()) {
+                group->second.inFlight.push_back(job->key);
+                _NoteStatusLocked(groupKey, RigExecOutputStatus::Pending,
+                                  "a job for this frame is queued");
             }
-            group->second.inFlight.push_back(job->key);
-            _NoteStatusLocked(groupKey, RigExecOutputStatus::Pending,
-                              "a job for this frame is queued");
+        }
+        if (!_host.scheduler->AdmitExplicitOutput(admission, std::move(work))) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            // Nothing was queued, so the launched mask goes back with it and
+            // the reservation dies with this job.
+            _RetireDemandLocked(job->key, RigExecOutputStatus::Pending,
+                                "the pool declined this admission; the next "
+                                "pump retries it");
+            --_stats.dispatches;
+            ++_stats.declinedAdmission;
+            return;
         }
     }
 
@@ -1207,7 +1213,11 @@ private:
             for (const RigExecOutputTimeDemand &demand :
                  client.request.demands) {
                 if (demand.time == time) {
-                    handles = demand.handles.size();
+                    for (const RigExecOutputHandle &handle : demand.handles) {
+                        if (!_Refused(client, handle)) {
+                            ++handles;
+                        }
+                    }
                     break;
                 }
             }

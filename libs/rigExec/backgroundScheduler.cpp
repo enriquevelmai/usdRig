@@ -312,6 +312,14 @@ RigExecBackgroundScheduler::SetTransitionHook(RigExecWarmTransitionHook hook)
 }
 
 void
+RigExecBackgroundScheduler::SetAdmissionReturnHookForTesting(
+    RigExecExplicitAdmissionReturnHook hook)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    _admissionReturnHook = std::move(hook);
+}
+
+void
 RigExecBackgroundScheduler::_ReportTransitionLocked(
     const _JobIdentity &identity, RigExecWarmTransitionKind kind,
     RigExecWarmOutcome outcome)
@@ -603,6 +611,33 @@ RigExecBackgroundScheduler::CancelGenerationTimes(
     return retired.size();
 }
 
+bool
+RigExecBackgroundScheduler::CancelExplicitJob(const RigExecExplicitJobKey &key)
+{
+    std::unique_lock<std::mutex> lock(_mutex);
+    const auto index = _queuedExplicitByKey.find(key);
+    if (index == _queuedExplicitByKey.end()) {
+        return false;
+    }
+    // The index is the exact key's own entry, so this purge can only name
+    // this job: no fence token moves, no other time or class is looked at.
+    auto queued = _queue.find(index->second);
+    if (queued == _queue.end()) {
+        _queuedExplicitByKey.erase(index);
+        return false;
+    }
+    _QueuedJob retired = std::move(queued->second);
+    // Retiring leaves the index entry, so `index` is dangling from here on.
+    _RetireQueuedJobLocked(retired, RigExecWarmTransitionKind::Canceled);
+    _queue.erase(queued);
+    _profiler.RecordSchedulerCancel(1, "demand");
+    _RecordQueueStateLocked();
+    lock.unlock();
+    _cv.notify_all();
+    // retired's closures die here, outside the lock.
+    return true;
+}
+
 RigExecWarmFenceToken
 RigExecBackgroundScheduler::CurrentFenceToken(const SdfPath &rig,
                                               UsdTimeCode time) const
@@ -863,8 +898,18 @@ RigExecBackgroundScheduler::AdmitExplicitOutput(
     ++_explicitAccepted;
     _ReportTransitionLocked(identity, RigExecWarmTransitionKind::Queued);
     _RecordQueueStateLocked();
+    // Taken under the lock, run after it closes: the seam sees this exact key
+    // with the whole queue recorded and holds no scheduler lock, so the job's
+    // terminal state can land inside the admission that named it.
+    RigExecExplicitAdmissionReturnHook seam;
+    if (_admissionReturnHook) {
+        seam = _admissionReturnHook;
+    }
     lock.unlock();
     _cv.notify_all();
+    if (seam) {
+        seam(key);
+    }
     return true;
 }
 

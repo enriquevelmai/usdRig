@@ -2575,6 +2575,87 @@ TestScopedCancellationRefencesExplicitRequests()
     CHECK(scheduler.Stats().explicitDeclinedGeneration == 0);
 }
 
+// Demand retirement names one job. A client that stopped asking for a frame
+// drops its own queued request and nothing else: the reservation comes back,
+// the other class's job at that same time stays queued, and no fence token
+// moves, so the work another client holds still publishes.
+void
+TestCancelExplicitJobPurgesExactlyOneJob()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest five =
+        MakeExplicitRequest(rig, NumericTime(5.0), 1, 0, 0, 0, /*bytes=*/32);
+    five.editGeneration = current;
+    RigExecExplicitRequest def =
+        MakeExplicitRequest(rig, RigExecOutputTime(), 1, 0, 0, 0, /*bytes=*/16);
+    def.editGeneration = current;
+    CHECK(scheduler.AdmitExplicitOutput(five, recorder.Work()));
+    CHECK(scheduler.AdmitExplicitOutput(def, recorder.Work()));
+    // Warming can be off in this process, so the warm job at the same frame
+    // is only queued where warming is available. The purge's own books are
+    // checked either way.
+    const bool warming = RigExecBackgroundWarmingEnabled();
+    if (warming) {
+        CHECK(scheduler.Enqueue(rig, UsdTimeCode(5.0),
+                                RigExecWarmPriority::Neighbor, current,
+                                [](const RigExecWarmRequest &) {
+                                    return RigExecWarmOutcome::Published;
+                                }));
+    }
+    CHECK(scheduler.ReservedExplicitBytes() == 48);
+    const RigExecExplicitJobKey fiveKey = five.Key();
+    const RigExecExplicitJobKey defKey = def.Key();
+
+    CHECK(scheduler.CancelExplicitJob(fiveKey));
+    CHECK(scheduler.Stats().explicitCanceled == 1);
+    const std::vector<RigExecExplicitJobKey> stillQueued =
+        scheduler.QueuedExplicitKeys(rig);
+    CHECK(stillQueued.size() == 1);
+    CHECK(stillQueued.size() == 1 && stillQueued[0] == defKey);
+    CHECK(scheduler.InFlightExplicitKeys(rig).size() == 1);
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 1);
+    CHECK(scheduler.ReservedExplicitBytes() == 16);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 16);
+    // The warm job warming that same frame is untouched, and neither the
+    // numeric time nor the default frame was re-fenced.
+    const std::vector<UsdTimeCode> warmQueued = scheduler.QueuedTimes(rig);
+    CHECK(warmQueued.size() == (warming ? 1u : 0u));
+    CHECK(warmQueued.size() == (warming ? 1u : 0u) &&
+          (warmQueued.empty() || warmQueued[0] == UsdTimeCode(5.0)));
+    CHECK(scheduler.InFlightCount(rig) == (warming ? 1u : 0u));
+    CHECK(scheduler.CurrentFenceToken(rig, UsdTimeCode(5.0)) == 0);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, NumericTime(5.0)) == 0);
+    CHECK(scheduler.CurrentExplicitFenceToken(rig, RigExecOutputTime()) == 0);
+    CHECK(scheduler.IsExplicitRequestCurrent(def));
+    CHECK(scheduler.IsWarmRequestCurrent(rig, current, UsdTimeCode(5.0), 0));
+    CHECK(scheduler.CurrentGeneration(rig) == current);
+    // The named job is gone: the same key names nothing any more, and a key
+    // never admitted never matched.
+    CHECK(!scheduler.CancelExplicitJob(fiveKey));
+    RigExecExplicitRequest never =
+        MakeExplicitRequest(rig, NumericTime(6.0), 1, 0, 0, 0, /*bytes=*/8);
+    never.editGeneration = current;
+    CHECK(!scheduler.CancelExplicitJob(never.Key()));
+    CHECK(scheduler.Stats().explicitCanceled == 1);
+    // What stands still runs: the surviving default-frame job, and the warm
+    // job at frame 5 where warming is available, publish under their standing
+    // tokens.
+    CHECK(scheduler.DrainQueueForTesting() == (warming ? 2u : 1u));
+    const std::vector<ExplicitRun> runs = recorder.Runs();
+    CHECK(runs.size() == 1);
+    CHECK(runs[0].timeIsDefault);
+    CHECK(runs[0].fenceToken == 0);
+    CHECK(runs[0].currentAtPublish);
+    CHECK(scheduler.Stats().explicitPublished == 1);
+    CHECK(scheduler.Stats().published == (warming ? 1u : 0u));
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 0);
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 0);
+}
+
 // Deactivation drops the rig's explicit state with its warm state: queued
 // jobs, in-flight count, reservations and fence tokens go, the generation
 // stands, and nothing leaks into the reactivated rig.
@@ -2843,6 +2924,7 @@ main()
     TestExplicitReservationReleasesOnEveryPath();
     TestExplicitBalancesUnderACancelRace();
     TestScopedCancellationRefencesExplicitRequests();
+    TestCancelExplicitJobPurgesExactlyOneJob();
     TestResetRigClearsExplicitState();
     TestExplicitMidRunCancelKeepsTheBooksBalanced();
     TestPlaybackAdvanceNeverShedsExplicitOutput();

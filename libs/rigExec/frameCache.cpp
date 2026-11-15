@@ -1284,7 +1284,7 @@ RigExecFrameCache::Lookup(const RigExecFrameCacheKey &key, RigExecRigPose *pose,
             // Drop, don't guess: a null, weightless, or invalid entry is
             // evicted and the lookup misses, never partially served.
             if (entry) {
-                _bytes.fetch_sub(entry->bytes, std::memory_order_relaxed);
+                _ReleasePoseBytes(entry->bytes);
             }
             _entryCount.fetch_sub(1, std::memory_order_relaxed);
             _evictions.fetch_add(1, std::memory_order_relaxed);
@@ -1409,15 +1409,15 @@ RigExecFrameCache::Publish(const RigExecFrameCacheKey &key, UsdTimeCode time,
         std::lock_guard<std::mutex> lock(shard.mutex);
         const auto it = shard.map.find(key);
         if (it != shard.map.end()) {
-            _bytes.fetch_sub(it->second->bytes, std::memory_order_relaxed);
+            _ReleasePoseBytes(it->second->bytes);
             // The displaced entry dies after the lock closes (see retired).
             retired = std::move(it->second);
             it->second = std::move(entry);
-            _bytes.fetch_add(bytes, std::memory_order_relaxed);
+            _ChargePoseBytes(bytes);
         } else {
             shard.map.emplace(key, std::move(entry));
             _entryCount.fetch_add(1, std::memory_order_relaxed);
-            _bytes.fetch_add(bytes, std::memory_order_relaxed);
+            _ChargePoseBytes(bytes);
         }
         _published.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1436,7 +1436,7 @@ RigExecFrameCache::Evict(const RigExecFrameCacheKey &key)
         if (it == shard.map.end()) {
             return false;
         }
-        _bytes.fetch_sub(it->second->bytes, std::memory_order_relaxed);
+        _ReleasePoseBytes(it->second->bytes);
         _entryCount.fetch_sub(1, std::memory_order_relaxed);
         _evictions.fetch_add(1, std::memory_order_relaxed);
         retired = std::move(it->second);
@@ -1465,7 +1465,7 @@ RigExecFrameCache::EvictCompiledRig(uint64_t compiledRigSignature)
                 ++it;
                 continue;
             }
-            _bytes.fetch_sub(it->second->bytes, std::memory_order_relaxed);
+            _ReleasePoseBytes(it->second->bytes);
             _entryCount.fetch_sub(1, std::memory_order_relaxed);
             _evictions.fetch_add(1, std::memory_order_relaxed);
             RigExecFrameCacheEviction gone;
@@ -1496,7 +1496,7 @@ RigExecFrameCache::Clear()
     for (_Shard &shard : _shards) {
         std::lock_guard<std::mutex> lock(shard.mutex);
         for (auto &kv : shard.map) {
-            _bytes.fetch_sub(kv.second->bytes, std::memory_order_relaxed);
+            _ReleasePoseBytes(kv.second->bytes);
             _entryCount.fetch_sub(1, std::memory_order_relaxed);
             RigExecFrameCacheEviction gone;
             gone.key = kv.first;
@@ -1558,7 +1558,9 @@ RigExecFrameCache::_EvictUntilUnderCap()
     size_t guard = _entryCount.load(std::memory_order_relaxed) + _kShardCount;
     std::vector<RigExecFrameCacheEviction> evicted;
     while (guard-- > 0) {
-        if (_bytes.load(std::memory_order_relaxed) <= cap) {
+        // Poses yield to coverage as well as to each other: the cap bounds
+        // both totals together.
+        if (_AccountedBytes() <= cap) {
             _ReportEvictions(std::move(evicted));
             return;
         }
@@ -1593,7 +1595,7 @@ RigExecFrameCache::_EvictUntilUnderCap()
                 victimUse) {
                 continue;
             }
-            _bytes.fetch_sub(it->second->bytes, std::memory_order_relaxed);
+            _ReleasePoseBytes(it->second->bytes);
             _entryCount.fetch_sub(1, std::memory_order_relaxed);
             _evictions.fetch_add(1, std::memory_order_relaxed);
             RigExecFrameCacheEviction gone;
@@ -1654,21 +1656,50 @@ RigExecFrameCache::_CoverageCharge() const
     return held;
 }
 
+void
+RigExecFrameCache::_ChargePoseBytes(size_t bytes) const
+{
+    std::lock_guard<std::mutex> account(_coverageAccountMutex);
+    _bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void
+RigExecFrameCache::_ReleasePoseBytes(size_t bytes) const
+{
+    std::lock_guard<std::mutex> account(_coverageAccountMutex);
+    _bytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+size_t
+RigExecFrameCache::_AccountedBytes() const
+{
+    std::lock_guard<std::mutex> account(_coverageAccountMutex);
+    size_t coverage = 0;
+    size_t total = 0;
+    if (!_CoverageCharge().TryTotal(&coverage) ||
+        !RigExecCheckedAdd(_bytes.load(std::memory_order_relaxed), coverage,
+                           &total)) {
+        return (std::numeric_limits<size_t>::max)();
+    }
+    return total;
+}
+
 bool
 RigExecFrameCache::_ChargeCoverage(const RigExecCoverageBytes &bytes) const
 {
+    std::lock_guard<std::mutex> account(_coverageAccountMutex);
     size_t request = 0;
     size_t heldTotal = 0;
     size_t used = 0;
     size_t projected = 0;
-    if (!bytes.TryTotal(&request) || !_CoverageCharge().TryTotal(&heldTotal) ||
+    const RigExecCoverageBytes held = _CoverageCharge();
+    if (!bytes.TryTotal(&request) || !held.TryTotal(&heldTotal) ||
         !RigExecCheckedAdd(_bytes.load(std::memory_order_relaxed), heldTotal,
                            &used) ||
         !RigExecCheckedAdd(used, request, &projected) ||
         projected > _byteCap.load(std::memory_order_relaxed)) {
         return false;
     }
-    const RigExecCoverageBytes held = _CoverageCharge();
     if (bytes.capture > (std::numeric_limits<size_t>::max)() - held.capture ||
         bytes.workspace >
             (std::numeric_limits<size_t>::max)() - held.workspace ||
@@ -1676,8 +1707,9 @@ RigExecFrameCache::_ChargeCoverage(const RigExecCoverageBytes &bytes) const
         bytes.pinned > (std::numeric_limits<size_t>::max)() - held.pinned) {
         return false;
     }
-    // Each domain is its own atomic add: concurrent admissions cannot lose a
-    // charge by racing a read-modify-write of a shared snapshot.
+    // The domains stay separate atomic counters for the lock-free readers;
+    // under this lock their adds are one admission, so two reservations
+    // cannot each read the same ceiling and pass it together.
     _coverageCapture.fetch_add(bytes.capture, std::memory_order_relaxed);
     _coverageWorkspace.fetch_add(bytes.workspace, std::memory_order_relaxed);
     _coveragePayload.fetch_add(bytes.payload, std::memory_order_relaxed);
@@ -1688,6 +1720,7 @@ RigExecFrameCache::_ChargeCoverage(const RigExecCoverageBytes &bytes) const
 bool
 RigExecFrameCache::_ReleaseCharge(const RigExecCoverageBytes &bytes) const
 {
+    std::lock_guard<std::mutex> account(_coverageAccountMutex);
     const RigExecCoverageBytes held = _CoverageCharge();
     if (bytes.capture > held.capture || bytes.workspace > held.workspace ||
         bytes.payload > held.payload || bytes.pinned > held.pinned) {
@@ -1703,6 +1736,9 @@ RigExecFrameCache::_ReleaseCharge(const RigExecCoverageBytes &bytes) const
 bool
 RigExecFrameCache::_PinPayload(size_t bytes) const
 {
+    // Payload and pinned move together: a reservation that read the total in
+    // the gap would see room the rig never had.
+    std::lock_guard<std::mutex> transfer(_coverageAccountMutex);
     const RigExecCoverageBytes held = _CoverageCharge();
     size_t payloadAfter = 0;
     size_t pinnedAfter = 0;
@@ -1770,10 +1806,17 @@ RigExecFrameCache::_EndCoverageLease(const RigExecCoverageKey &key,
     if (record->bytes.pinned >= bytes) {
         record->bytes.pinned -= bytes;
     }
-    _coveragePinned.fetch_sub(bytes, std::memory_order_relaxed);
+    {
+        // The lease's pinned charge leaves and its payload comes back as one
+        // accounted step, the same rule the pin followed.
+        std::lock_guard<std::mutex> transfer(_coverageAccountMutex);
+        _coveragePinned.fetch_sub(bytes, std::memory_order_relaxed);
+        if (held > 0) {
+            _coveragePayload.fetch_add(held, std::memory_order_relaxed);
+        }
+    }
     if (held > 0) {
         record->bytes.payload += held;
-        _coveragePayload.fetch_add(held, std::memory_order_relaxed);
     }
     if (standing && record->outputs.empty() && !record->arenaRetained &&
         record->leases == 0) {

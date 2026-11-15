@@ -23,7 +23,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -326,10 +328,14 @@ FindBinding(const RigExecOutputCatalog &catalog, const std::string &target,
     return nullptr;
 }
 
+// `gpuPointsChain` marks the points chain GPU-resident before discovery, so
+// its revisions keep their semantic address in the demand index and lose the
+// CPU payload -- how a real rig exports an output no run can answer.
 RigFixture
 BuildRig(const char *stageText, const SdfPath &root, const std::string &target,
          const std::string &transformTarget, const std::string &pointsTarget,
-         const std::string &identity, uint64_t epoch)
+         const std::string &identity, uint64_t epoch,
+         bool gpuPointsChain = false)
 {
     RigFixture fixture;
     fixture.root = root;
@@ -347,6 +353,15 @@ BuildRig(const char *stageText, const SdfPath &root, const std::string &target,
     }
     const RigExecBakedProgram *program = fixture.evaluator->GetBakedProgram();
     CHECK(program);
+    if (gpuPointsChain) {
+        RigExecBakedProgramImpl &stepGraph =
+            const_cast<RigExecBakedProgramImpl &>(program->GetStepGraph());
+        for (auto &chain : stepGraph.chains) {
+            if (chain.target.GetAsString() == pointsTarget) {
+                chain.gpu = true;
+            }
+        }
+    }
     fixture.catalog = std::make_shared<RigExecOutputCatalog>();
     std::string error;
     CHECK(RigExecDiscoverOutputs(*program, identity, epoch,
@@ -403,18 +418,50 @@ struct Harness {
 
     // Knobs.
     bool captureOk = true;
+    bool laneOk = true;
     uint64_t programIdentityOverride = 0;
     uint64_t inputRevision = 1;
     size_t captureBytes = 4096;
     bool gateOpen = true;
 
     // Observations.
+    // A test can install this to read the service's demand count at the
+    // moment a job enters the lane: the pool may see a job no earlier than
+    // the service owns it, so the running minimum is a per-job ordering check.
+    std::function<size_t()> demandOwnedProbe;
+    std::atomic<size_t> demandOwnedMin{std::numeric_limits<size_t>::max()};
+    std::atomic<size_t> demandOwnedAtQueued{0};
+    std::atomic<int> demandOwnedObservations{0};
+    // The pool's admission-return seam: runs on the admitting thread with the
+    // job queued, counted and announced to the lanes, holding no scheduler
+    // lock, just before that same AdmitExplicitOutput returns. SealAdmission-
+    // Return installs it; the hook names the exact key that admission queued.
+    std::function<void(const RigExecExplicitJobKey &key)> atAdmissionReturn;
+    // WatchAdmission installs the scheduler's transition hook: Queued
+    // fires on the admitting thread inside the admission call, Finished
+    // after the pool closed the job's books. The probes land on both.
+    std::atomic<int> queuedExplicit{0};
+    std::atomic<int> finishedExplicit{0};
     std::atomic<int> captures{0};
     std::atomic<int> laneRuns{0};
+    // Counts the jobs that reached the gated lane and wait there.
+    std::atomic<int> laneArrivals{0};
+    // One record per explicit job's terminal transition, in the order the
+    // pool reported it, kept under the seam's own lock so a wait for one
+    // frame's answer never holds the scheduler lock.
+    struct _Terminal {
+        SdfPath rig;
+        bool timeIsDefault = false;
+        double timeValue = 0.0;
+        RigExecWarmOutcome outcome = RigExecWarmOutcome::Published;
+    };
     std::vector<std::vector<std::string>> launchOutputs;
+    std::vector<_Terminal> terminals;
     std::mutex logMutex;
     std::mutex gateMutex;
+    std::mutex terminalMutex;
     std::condition_variable gateCv;
+    std::condition_variable terminalCv;
 
     explicit Harness(size_t workers = 0)
         : scheduler(std::make_unique<RigExecBackgroundScheduler>(workers))
@@ -468,8 +515,23 @@ struct Harness {
                                  std::string *error) {
             (void)context;
             (void)arena;
+            // The arrival is the barrier the tests wait on: a job that reached
+            // the gate is inside its bodies, so an edit applied afterwards
+            // lands while they run.
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                ++laneArrivals;
+            }
+            gateCv.notify_all();
             WaitForGate();
+            if (!laneOk) {
+                *error = "the harness lane declined the run";
+                return false;
+            }
             ++laneRuns;
+            if (demandOwnedProbe) {
+                _NoteDemandOwned(demandOwnedProbe());
+            }
             RigExecOutputTime at;
             if (!inputs.time.IsDefault() &&
                 !RigExecOutputTime::TryTimeCode(inputs.time.GetValue(), &at)) {
@@ -537,12 +599,105 @@ struct Harness {
         gateCv.notify_all();
     }
 
-    /// Waits until a queued job has reached the gated lane.
+    void _NoteDemandOwned(size_t seen)
+    {
+        ++demandOwnedObservations;
+        size_t prev = demandOwnedMin.load(std::memory_order_relaxed);
+        while (seen < prev &&
+               !demandOwnedMin.compare_exchange_weak(prev, seen)) {
+        }
+    }
+
+    // Probe every explicit queue move: the demand the pool is about to
+    // see is read on the admitting thread, inside the admission call.
+    void WatchAdmission()
+    {
+        scheduler->SetTransitionHook([this](const RigExecWarmTransition
+                                                &transition) {
+            if (transition.workClass != RigExecBackgroundWorkClass::Explicit) {
+                return;
+            }
+            if (transition.kind == RigExecWarmTransitionKind::Queued) {
+                ++queuedExplicit;
+                if (demandOwnedProbe) {
+                    const size_t owned = demandOwnedProbe();
+                    demandOwnedAtQueued.store(owned, std::memory_order_relaxed);
+                    _NoteDemandOwned(owned);
+                }
+            } else if (transition.kind == RigExecWarmTransitionKind::Finished) {
+                ++finishedExplicit;
+                {
+                    std::lock_guard<std::mutex> lock(terminalMutex);
+                    terminals.push_back(
+                        _Terminal{transition.rig, transition.timeIsDefault,
+                                  transition.timeValue, transition.outcome});
+                }
+                terminalCv.notify_all();
+                gateCv.notify_all();
+            }
+        });
+    }
+
+    // Hands the pool the seam at the end of an accepted explicit admission.
+    void SealAdmissionReturn()
+    {
+        scheduler->SetAdmissionReturnHookForTesting(
+            [this](const RigExecExplicitJobKey &key) {
+                if (atAdmissionReturn) {
+                    atAdmissionReturn(key);
+                }
+            });
+    }
+
+    const _Terminal *_FindTerminalLocked(const RigExecExplicitJobKey &key) const
+    {
+        for (const _Terminal &terminal : terminals) {
+            if (terminal.rig == key.rig &&
+                terminal.timeIsDefault == key.time.IsDefault() &&
+                (key.time.IsDefault() ||
+                 terminal.timeValue == key.time.TimeCode())) {
+                return &terminal;
+            }
+        }
+        return nullptr;
+    }
+
+    // Bounded wait for the terminal transition of the explicit job at \p key.
+    // The caller holds no scheduler, service or cache lock while waiting and
+    // holds none when this returns, so the lane can close the job's books and
+    // the seam can read them.
+    struct TerminalAnswer {
+        bool landed = false;
+        RigExecWarmOutcome outcome = RigExecWarmOutcome::Published;
+    };
+
+    TerminalAnswer WaitTerminal(const RigExecExplicitJobKey &key)
+    {
+        TerminalAnswer answer;
+        std::unique_lock<std::mutex> wait(terminalMutex);
+        answer.landed =
+            terminalCv.wait_for(wait, std::chrono::seconds(10), [&] {
+                return _FindTerminalLocked(key) != nullptr;
+            });
+        if (answer.landed) {
+            answer.outcome = _FindTerminalLocked(key)->outcome;
+        }
+        wait.unlock();
+        return answer;
+    }
+
+    /// Waits until a job has reached the gated lane and waits there. The
+    /// pool's running count turns on earlier, before the job's pre-body
+    /// fences, so waiting on it alone lets a test land an edit or a cancel
+    /// while the job still declines before its bodies run.
     bool WaitUntilRunning()
     {
         for (int spin = 0; spin < 4000; ++spin) {
-            if (scheduler->Stats().explicitRunning == 1) {
-                return true;
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                if (laneArrivals >= 1) {
+                    return true;
+                }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -1390,6 +1545,314 @@ TestLastClientLeavingAQueuedJobRetiresIt()
     CHECK(AllReady(service.PollResults(later)));
 }
 
+// Closing a client releases exactly the work that client held. The pool's
+// scoped-edit operation is an edit: it re-fences the numeric times, re-fences
+// the default frame, and purges that frame's work of both classes, so demand
+// retirement names the job's own key instead. Another client's queued
+// default-frame job, and unrelated warming at the closed frame, stay queued
+// with their tokens standing, and only the retired demand's reservation comes
+// back.
+void
+TestClosingOneClientCancelsOnlyItsOwnJob()
+{
+    Harness h(/*workers=*/1);
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    h.gateOpen = false;
+    // Two numeric frames from the client that closes: the first takes the lane
+    // and waits there, the second stays queued behind it. Then a second
+    // client's default-frame job, queued last, and warming at the closed frame
+    // that belongs to no client at all.
+    RigExecOutputRequest owed;
+    owed.demands.push_back(RigExecOutputTimeDemand{TimeOf(12.0), {a.scalar}});
+    owed.demands.push_back(RigExecOutputTimeDemand{TimeOf(13.0), {a.scalar}});
+    RigExecSubscriptionHandle closable = service.Subscribe(a.root, owed);
+    const RigExecSubscriptionHandle keeper = service.Subscribe(
+        a.root, RequestAt(RigExecOutputTime::Default(), {a.scalar}));
+    CHECK(closable.IsValid() && keeper.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 3);
+    CHECK(h.WaitUntilRunning());
+    // Unrelated warming at the frame being closed belongs to no client.
+    // Warming can be off in this process, so its queue entries are only
+    // checked where it is available; the demand purge's own books are read
+    // either way.
+    const bool warming = RigExecBackgroundWarmingEnabled();
+    if (warming) {
+        CHECK(h.scheduler->Enqueue(a.root, UsdTimeCode(12.0),
+                                   RigExecWarmPriority::Sweep,
+                                   h.scheduler->CurrentGeneration(a.root),
+                                   [](const RigExecWarmRequest &) {
+                                       return RigExecWarmOutcome::Published;
+                                   }));
+    }
+    CHECK(h.scheduler->QueuedExplicitKeys(a.root).size() == 2);
+    const size_t bytesOwed = h.scheduler->ReservedExplicitBytesFor(a.root);
+    // Three identical reservations: the running job, the closed client's
+    // queued job, and the other client's queued default-frame job.
+    CHECK(bytesOwed > 0 && bytesOwed % 3 == 0);
+
+    service.Close(closable);
+
+    // The closed client's queued job left the pool and exactly its share of
+    // the reservation came back. The other client's default-frame job is still
+    // queued under its own key, and no time was re-fenced.
+    CHECK(service.Stats().demandsInFlight == 1);
+    CHECK(service.Stats().retiredInFlight == 0);
+    CHECK(service.Stats().framesDemanded == 1);
+    CHECK(h.scheduler->Stats().explicitCanceled == 1);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 2);
+    const std::vector<RigExecExplicitJobKey> stillOwed =
+        h.scheduler->QueuedExplicitKeys(a.root);
+    CHECK(stillOwed.size() == 1);
+    CHECK(stillOwed.size() == 1 && stillOwed[0].time.IsDefault());
+    CHECK(h.scheduler->ReservedExplicitBytesFor(a.root) ==
+          bytesOwed - bytesOwed / 3);
+    CHECK(h.scheduler->CurrentExplicitFenceToken(a.root, TimeOf(12.0)) == 0);
+    CHECK(h.scheduler->CurrentExplicitFenceToken(a.root, TimeOf(13.0)) == 0);
+    CHECK(h.scheduler->CurrentExplicitFenceToken(a.root, RigExecOutputTime()) ==
+          0);
+    CHECK(h.scheduler->CurrentFenceToken(a.root, UsdTimeCode(12.0)) == 0);
+    const std::vector<UsdTimeCode> warmQueued =
+        h.scheduler->QueuedTimes(a.root);
+    CHECK(warmQueued.size() == (warming ? 1u : 0u));
+    CHECK(warmQueued.size() == (warming ? 1u : 0u) &&
+          (warmQueued.empty() || warmQueued[0] == UsdTimeCode(12.0)));
+
+    // The gate came back on the owner's thread, so the wait cannot hang.
+    h.OpenGate();
+    h.scheduler->WaitUntilIdle();
+    // The closed client's running body published nothing, and nothing
+    // re-fenced it; the default client's job ran once under its standing token
+    // and answered with no re-dispatch; frame 12's warming ran as well.
+    CHECK(h.scheduler->Stats().explicitAccepted == 3);
+    CHECK(h.scheduler->Stats().explicitDeclinedInvalid == 1);
+    CHECK(h.scheduler->Stats().explicitDeclinedGeneration == 0);
+    CHECK(h.scheduler->Stats().explicitPublished == 1);
+    CHECK(h.scheduler->Stats().published == (warming ? 1u : 0u));
+    CHECK(h.laneRuns == 2);
+    CHECK(h.cache.CoverageRecordCount() == 1);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    const std::vector<RigExecOutputPacket> kept = service.PollResults(keeper);
+    CHECK(kept.size() == 1);
+    CHECK(AllReady(kept));
+    CHECK(FirstCell(kept[0].payload) ==
+          MarkerFor("stage-A", RigExecOutputTime::Default(), h.inputRevision));
+    CHECK(service.PollResults(closable).empty());
+}
+
+// Admission notifies the lanes and returns without a completion barrier, so a
+// worker can reach its terminal state inside the call. The service owns the
+// demand and its launched mask before the pool sees the job, and the mask
+// clears only as the job retires, so the frame's next bookkeeping -- the
+// coverage answer of an answered frame, or the refusal of a declined one --
+// can only be reached with that job's terminal disposition standing.
+//
+// The seam is the pool's own admission-return boundary: it runs on the
+// admitting thread with the job queued, counted and announced to the lanes,
+// and with no scheduler lock held, just before that same admission returns.
+// The test waits there -- bounded, and holding no lock the lane needs -- for
+// the terminal transition of the exact key that admission named, and asserts
+// across the wait that the job closed its own demand, in-flight count and
+// byte reservation. Nothing pumps, drains, or re-subscribes in between.
+void
+TestWorkEndingInsideAdmissionKeepsItsDisposition()
+{
+    Harness h(/*workers=*/1);
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    h.demandOwnedProbe = [&service]() {
+        return service.Stats().demandsInFlight;
+    };
+    h.WatchAdmission();
+    h.OpenGate();
+
+    // The seam: the job this admission named has to close terminally before
+    // the call that queued it returns. Each phase names one frame, so the
+    // terminal match is this job's and no other's.
+    int seams = 0;
+    RigExecWarmOutcome expected = RigExecWarmOutcome::Published;
+    h.atAdmissionReturn = [&](const RigExecExplicitJobKey &key) {
+        ++seams;
+        const Harness::TerminalAnswer answer = h.WaitTerminal(key);
+        CHECK(answer.landed);
+        CHECK(answer.outcome == expected);
+        // The pool saw this job only once the service owned its demand: the
+        // launched mask is registered before admission, never after it.
+        CHECK(h.demandOwnedAtQueued.load() == 1);
+        // Every book closed by the job itself while this call is still open:
+        // the run retired the demand, and the pool released the reservation
+        // and the in-flight count. No prune and no pump stands behind these.
+        CHECK(service.Stats().demandsInFlight == 0);
+        CHECK(service.Stats().retiredInFlight == 0);
+        CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 0);
+        CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+        CHECK(h.scheduler->QueuedExplicitKeys(a.root).empty());
+        // Ordering across jobs: this job's terminal transition, and every
+        // earlier one, landed while its own admission had not returned.
+        CHECK(h.finishedExplicit.load() == seams);
+        CHECK(h.queuedExplicit.load() == seams);
+    };
+    h.SealAdmissionReturn();
+
+    // The answered frame: its job publishes a record, so once Subscribe
+    // returns the frame can only answer that record.
+    const RigExecSubscriptionHandle answered =
+        service.Subscribe(a.root, RequestAt(TimeOf(5.0), {a.scalar}));
+    CHECK(answered.IsValid());
+    CHECK(seams == 1);
+    CHECK(h.queuedExplicit.load() == 1);
+    CHECK(h.finishedExplicit.load() == 1);
+    // The disposition stood on return: nothing re-admitted the frame, nothing
+    // was left as a demand the pool will never see again, and the published
+    // answer is what the poll reads.
+    CHECK(service.Stats().demandsInFlight == 0);
+    CHECK(service.Stats().retiredInFlight == 0);
+    CHECK(service.Stats().declinedAdmission == 0);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 0);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    const std::vector<RigExecOutputPacket> first =
+        service.PollResults(answered);
+    CHECK(first.size() == 1);
+    CHECK(AllReady(first));
+    if (first.size() == 1) {
+        CHECK(FirstCell(first[0].payload) ==
+              MarkerFor("stage-A", TimeOf(5.0), h.inputRevision));
+    }
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    CHECK(h.scheduler->Stats().explicitPublished == 1);
+
+    // The refused frame: the lane declines the run, so the frame's answer is
+    // that refusal -- Failed with the lane's reason -- standing when
+    // Subscribe returns. A demand registered behind the admission would stamp
+    // it back to Pending and leave a demand in flight the pool never closes.
+    h.laneOk = false;
+    expected = RigExecWarmOutcome::DeclinedInvalid;
+    const RigExecSubscriptionHandle refused =
+        service.Subscribe(a.root, RequestAt(TimeOf(9.0), {a.scalar}));
+    CHECK(refused.IsValid());
+    CHECK(seams == 2);
+    CHECK(h.queuedExplicit.load() == 2);
+    CHECK(h.finishedExplicit.load() == 2);
+    CHECK(service.Stats().demandsInFlight == 0);
+    CHECK(service.Stats().retiredInFlight == 0);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 0);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    CHECK(h.scheduler->QueuedExplicitKeys(a.root).empty());
+    const std::vector<RigExecOutputPacket> refusedPackets =
+        service.PollResults(refused);
+    CHECK(refusedPackets.size() == 1);
+    for (const RigExecOutputPacket &packet : refusedPackets) {
+        CHECK(packet.status == RigExecOutputStatus::Failed);
+        CHECK(packet.reason.find("harness lane") != std::string::npos);
+    }
+    // Only the published job ran a body to the counter, and both admissions
+    // were probed with their demand already owned.
+    CHECK(h.laneRuns == 1);
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+    CHECK(h.scheduler->Stats().explicitPublished == 1);
+    CHECK(h.scheduler->Stats().explicitDeclinedInvalid == 1);
+    CHECK(h.demandOwnedMin.load() == 1);
+    CHECK(h.demandOwnedObservations.load() == 3);
+}
+
+// An output this generation cannot produce answers on its own. It must stay
+// out of the demand, where it would refuse the whole requested run and leave
+// the supported siblings of the same frame unanswered forever.
+void
+TestUnsupportedHandleKeepsItsSiblingsRunnable()
+{
+    Harness h(/*workers=*/1);
+    RigFixture a =
+        BuildRig(kStageA, SdfPath("/Asset/UnusualContainer/Character"),
+                 "/Asset/UnusualContainer/Character/RandomData.amount",
+                 "/Asset/UnusualContainer/Character/InputsAnywhere/Drive",
+                 "/Asset/UnusualContainer/Geometry/Body.points", "stage-A", 17,
+                 /*gpuPointsChain=*/true);
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    RigExecSubscriptionReceipt receipt;
+    const RigExecSubscriptionHandle sub = service.Subscribe(
+        a.root, RequestAt(TimeOf(12.0), {a.scalar, a.points}), &receipt);
+    CHECK(sub.IsValid());
+    CHECK(receipt.status == RigExecSubscriptionStatus::Accepted);
+    CHECK(receipt.unsupported.size() == 1);
+    CHECK(receipt.unsupported.size() == 1 &&
+          receipt.unsupported[0].semanticKey == a.points.semanticKey);
+
+    h.scheduler->WaitUntilIdle();
+    // The one job the pool ran named only the output it can answer.
+    CHECK(h.laneRuns == 1);
+    CHECK(h.launchOutputs.size() == 1);
+    CHECK(h.launchOutputs.size() == 1 && h.launchOutputs[0].size() == 1 &&
+          h.launchOutputs[0][0] == a.scalar.semanticKey);
+    CHECK(service.Stats().declinedAdmission == 0);
+
+    const std::vector<RigExecOutputPacket> packets = service.PollResults(sub);
+    const RigExecOutputPacket *scalar = nullptr;
+    const RigExecOutputPacket *points = nullptr;
+    for (const RigExecOutputPacket &packet : packets) {
+        if (packet.handle.semanticKey == a.scalar.semanticKey) {
+            scalar = &packet;
+        } else if (packet.handle.semanticKey == a.points.semanticKey) {
+            points = &packet;
+        }
+    }
+    CHECK(scalar != nullptr);
+    CHECK(scalar && scalar->status == RigExecOutputStatus::Ready);
+    CHECK(points != nullptr);
+    CHECK(points && points->status == RigExecOutputStatus::Unsupported);
+    CHECK(points && points->reason.find("GPU") != std::string::npos);
+}
+
+// The refused half of the admission window is deterministic: the pool
+// reserved nothing, so the demand, its launched mask and the byte
+// reservation all go back inside the call. The books are read here with no
+// second pump, and the frame stays owed to the next one.
+void
+TestRefusedAdmissionRollsBackItsDemand()
+{
+    Harness h(/*workers=*/1);
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const size_t jobCap = h.scheduler->GetExplicitPerRigJobCap();
+    h.scheduler->SetExplicitPerRigJobCap(0);
+
+    const RigExecSubscriptionHandle refused =
+        service.Subscribe(a.root, RequestAt(TimeOf(12.0), {a.scalar}));
+    CHECK(refused.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 0);
+    CHECK(h.scheduler->Stats().explicitDeclined == 1);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 0);
+    CHECK(h.scheduler->QueuedExplicitKeys(a.root).empty());
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    CHECK(service.Stats().declinedAdmission == 1);
+    CHECK(service.Stats().dispatches == 0);
+    CHECK(service.Stats().demandsInFlight == 0);
+    CHECK(service.Stats().retiredInFlight == 0);
+    const std::vector<RigExecOutputPacket> waiting =
+        service.PollResults(refused);
+    CHECK(waiting.size() == 1);
+    CHECK(AllPending(waiting));
+    CHECK(waiting.size() == 1 &&
+          waiting[0].reason.find("declined this admission") !=
+              std::string::npos);
+
+    // With room at the pool the same pump admits the frame and answers it:
+    // the rollback freed the launched mask instead of parking a demand.
+    h.scheduler->SetExplicitPerRigJobCap(jobCap);
+    service.PumpCallbacks();
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    h.scheduler->WaitUntilIdle();
+    CHECK(AllReady(service.PollResults(refused)));
+    CHECK(service.Stats().demandsInFlight == 0);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+}
+
 // A frame that already answered is answerable only from the generation its
 // latest capture named. When the replacement work that generation needs is
 // refused -- the coverage budget, the pool's byte bound, or a capture that
@@ -1508,6 +1971,10 @@ main()
     TestRefusalOfReplacementWorkEndsTheRetiredAnswer();
     TestServiceDestructionReleasesEveryLivePin();
     TestLastClientLeavingAQueuedJobRetiresIt();
+    TestClosingOneClientCancelsOnlyItsOwnJob();
+    TestWorkEndingInsideAdmissionKeepsItsDisposition();
+    TestRefusedAdmissionRollsBackItsDemand();
+    TestUnsupportedHandleKeepsItsSiblingsRunnable();
     TestBoundsRefuseBeforeAllocating();
     TestCaptureFailureAndBadGeneration();
     TestCompletionCallback();

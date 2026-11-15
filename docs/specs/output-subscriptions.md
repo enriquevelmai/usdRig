@@ -310,8 +310,10 @@ it calls; the pool itself does not change, and no second queue appears.
 | `AdmitExplicitOutput` | Reserves a job slot and the request's bytes, then queues the work. Returns false, having reserved nothing, when the request has no work or no output, mixes rig identities or compile epochs, is under a stale edit generation, passes the per-rig job cap or the pool's byte cap, or the pool is stopping. |
 | `RigExecExplicitWork` | The job body: serial, from values captured at admission, no live stage, evaluator or registry access, reporting a `RigExecExplicitOutcome` the way warm work reports its disposition. |
 | `IsExplicitRequestCurrent`, `CurrentExplicitFenceToken` | The scheduler's half of the publish fence: the rig's edit generation and the time's fence token. The default frame has a token of its own, re-issued by `CancelGenerationTimes`, because a scoped edit moves its inputs too. |
+| `CancelExplicitJob` | Demand retirement: drops the one queued job keyed exactly by the demand's own key, releases its reservation, and moves no fence token, so every other job — warm or explicit, at any time — stays queued and fenced. `CancelGenerationTimes` is the edit operation, not this one. |
 | `ExplicitInFlightCount`, `ReservedExplicitBytes`, `ReservedExplicitBytesFor`, `QueuedExplicitKeys`, `InFlightExplicitKeys` | What a rig has in flight, in jobs and in reserved bytes, and the exact keys behind them. |
 | `SetExplicitPerRigJobCap`, `SetExplicitByteCap` | The two bounds, independent of the warm job cap: how many requests one rig may hold (default 64, against warming's 96), and how many bytes the pool may hold reserved across every rig (default 64 MiB). |
+| `SetAdmissionReturnHookForTesting` | A test seam at the end of an accepted admission: it names the queued job's own key, with the queue and counters recorded and no scheduler lock held, so a test can require that job's terminal disposition before the admission returns. Production installs none. |
 
 - **Explicit demand is not warming.** `RIGEXEC_FRAME_CACHE=off`, `warm-off`,
   and `RIGEXEC_ENABLE_PARALLEL_EVAL=0` close speculative warming; they do not
@@ -329,7 +331,8 @@ it calls; the pool itself does not change, and no second queue appears.
   turns instead of one rig's burst running first. Every queued job carries its
   reservation, and every terminal path releases it — published, declined
   inside, threw, dropped stale, purged by `CancelGeneration`,
-  `CancelGenerationTimes` or `ResetRig`, or dropped at shutdown — so
+  `CancelGenerationTimes`, `CancelExplicitJob` or `ResetRig`, or dropped at
+  shutdown — so
   `ReservedExplicitBytes` is zero once the queue has drained. Byte counts come
   from `RigExecPayloadByteCount`, which refuses an overflowing element count
   before anything allocates.
@@ -398,6 +401,18 @@ subscription id and the exact frames the request demands:
   answer to give, and when it can but the replacement work is refused -- the
   coverage budget, the pool's byte bound, or a run the catalog cannot resolve
   -- the frame lands on that refusal instead of on the retired record.
+- **An output no run can answer is demanded by itself.** A handle the client's
+  catalog marks unsupported -- a GPU-only point chain, or an address with no
+  retained producer -- keeps its semantic address and answers `Unsupported`
+  with the catalog's reason, but it stays out of the set the pump demands:
+  naming it would make the requested run refuse the whole frame and leave the
+  runnable siblings of that frame `Pending` forever.
+- **The coverage account is one account.** The frame cache's byte ceiling is a
+  statement over the capture, workspace, payload and pinned domains together,
+  so a charge -- a reservation, a growth, or a release -- is one step: lanes
+  reserving beside each other cannot each read the same ceiling and pass it.
+  The domain counters stay readable without a lock, and the account they
+  report returns to zero when every reservation and lease is gone.
 - **A recompile leaves the old epoch's demand.** A pump that finds the rig's
   current catalog at another compile epoch refuses the frame `Invalidated`
   instead of running the old epoch's job closure against the new program or
@@ -407,8 +422,16 @@ subscription id and the exact frames the request demands:
   runs is owed the next launch, asked for as the union; the dispatched mask is
   never rewritten.
 - **Unreferenced demand leaves.** The last client to close a frame retires its
-  queued job and returns its byte and coverage reservations. A coverage lease
+  queued job and returns its byte and coverage reservations. The purge names
+  that job's exact key, so another client's work in the same pool — at the
+  default frame, at another frame, or speculative warming — stays queued with
+  its fence token standing; only an edit re-fences a time. A coverage lease
   another owner holds is never touched, and the record stays for the next host.
+- **The demand is owned before the pool sees the job.** The service registers
+  the demand and its launched mask, then admits it: admission notifies the
+  lanes and returns with no completion barrier, so a worker can reach its
+  terminal state inside the call, and a registered demand is what lets that
+  terminal status stand and its reservation release without another pump.
 - **The publish fence runs twice**, before the bodies and again before the
   publish, so an edit that lands while a job runs publishes nothing: the frame
   answers `Invalidated`, and the owner's next pump re-captures under the live
@@ -498,7 +521,11 @@ worker.
 | `stats()` | The service's lifecycle counters: `subscriptions`, `frames_demanded`, `demands_in_flight`, `coverage_hits`, `dispatches`, `redispatches`, `declined_coverage_budget`, `declined_admission`, `capture_failures`, `retired_in_flight`, `pinned_bytes`, `pinned_payloads`, `callbacks_queued`, `stopping`. |
 
 A service holds its `rigexec.Rig` alive, because the capture hook samples it
-on the owner thread and is the only live-USD read in the lifecycle. Every entry
+on the owner thread and is the only live-USD read in the lifecycle. Handles
+name the `rigexec.Rig` instance that discovered them: the host mints each
+instance an identity of its own, so two stages with the same rig prim path
+never resolve one another's handles, while every service over one instance
+shares its handles and a recompile still retires them by epoch. Every entry
 point gives up the GIL for its duration, and closing one subscription never
 touches a frame another client holds. `tests/python/test_rigexec_subscriptions.py`
 is the executable version of the time semantics: the default frame kept apart

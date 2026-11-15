@@ -1865,6 +1865,350 @@ TestConcurrentCoveragePublishKeepsAccountingHonest()
     CHECK(cache.CoverageHeld().pinned == 0);
 }
 
+// The cap is one ceiling over four domains, so the ceiling test and the
+// charge have to be one step. Lanes take and give back a fixed charge
+// against a cap that holds a few of them at once: the admitted charges are
+// tracked independently of the cache's per-domain counters -- those are
+// published separately and a reader can interleave them into a total that
+// stood at no single instant -- and their sum never passes the cap, growth
+// included, and every charge comes back.
+void
+TestConcurrentCoverageReservationsCannotPassTheCapTwice()
+{
+    RigExecFrameCache cache;
+    constexpr size_t kCharge = 1024;
+    constexpr size_t kCap = 4 * kCharge;
+    cache.SetByteCap(kCap);
+    constexpr int kLanes = 16;
+    constexpr int kRounds = 2000;
+    std::atomic<size_t> liveBytes{0};
+    std::atomic<size_t> peak{0};
+    std::atomic<int> admissions{0};
+    std::atomic<int> extensions{0};
+    // Every lane starts its charge loop on the same signal, so the lanes
+    // crowd the same ceiling at the same moment.
+    std::atomic<bool> go{false};
+    std::atomic<int> ready{0};
+    std::vector<std::thread> lanes;
+    lanes.reserve(kLanes);
+    for (int lane = 0; lane < kLanes; ++lane) {
+        lanes.emplace_back([&]() {
+            ++ready;
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int round = 0; round < kRounds; ++round) {
+                RigExecCoverageReservation reservation =
+                    Reserve(cache, 0, kCharge / 2, kCharge / 2);
+                if (!reservation.IsValid()) {
+                    continue;
+                }
+                ++admissions;
+                // Ownership tracked by the lanes themselves: every byte
+                // this lane holds from a live reservation, counted at its
+                // admission and extension, never sampled from the cache.
+                size_t mine = kCharge;
+                size_t live = liveBytes.fetch_add(kCharge) + kCharge;
+                size_t seen = peak.load(std::memory_order_relaxed);
+                while (live > seen && !peak.compare_exchange_weak(seen, live)) {
+                }
+                // Growth is the same admission step in a domain the
+                // reservation had not charged yet.
+                if (reservation.Extend(RigExecCoverageDomain::Pinned,
+                                       kCharge / 2)) {
+                    ++extensions;
+                    mine += kCharge / 2;
+                    live = liveBytes.fetch_add(kCharge / 2) + kCharge / 2;
+                    seen = peak.load(std::memory_order_relaxed);
+                    while (live > seen &&
+                           !peak.compare_exchange_weak(seen, live)) {
+                    }
+                }
+                // Give the tracked byte back before the cache does: every
+                // tracked charge then stands inside the cache's own live
+                // total, so the tracked peak cannot exceed a total the
+                // ceiling never held.
+                liveBytes.fetch_sub(mine);
+                reservation.Release();
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kLanes) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    for (auto &lane : lanes) {
+        lane.join();
+    }
+    CHECK(admissions.load() > 0);
+    CHECK(extensions.load() > 0);
+    CHECK(peak.load() <= kCap);
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(cache.CoverageHeld().capture == 0);
+    CHECK(cache.CoverageHeld().workspace == 0);
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == 0);
+}
+
+// Poses and coverage draw on one ceiling. Coverage already resident leaves
+// the poses less room, and a pose publication evicts down to the shared
+// ceiling instead of stacking a second full cap of residency on top.
+void
+TestPosePublicationYieldsToResidentCoverage()
+{
+    RigExecFrameCache cache;
+    const size_t poseBytes = RigExecFrameCachePoseBytes(MakePose(1.0, 1));
+    CHECK(poseBytes > 0);
+    const size_t kCap = 2 * poseBytes;
+    cache.SetByteCap(kCap);
+    CHECK(cache.Publish({1, 1}, UsdTimeCode(1.0), MakePose(1.0, 1)));
+    CHECK(cache.Stats().bytes == poseBytes);
+
+    RigExecCoverageReservation rest = Reserve(cache, 0, poseBytes, 0);
+    CHECK(rest.IsValid());
+    CHECK(CoverageTotal(cache) == kCap - poseBytes);
+
+    const size_t evictionsBefore = cache.Stats().evictions;
+    CHECK(cache.Publish({2, 2}, UsdTimeCode(2.0), MakePose(2.0, 1)));
+    CHECK(cache.Stats().evictions > evictionsBefore);
+    CHECK(cache.Stats().bytes + CoverageTotal(cache) <= kCap);
+
+    // Released, the same room is available to poses again.
+    CHECK(rest.Release());
+    CHECK(CoverageTotal(cache) == 0);
+    CHECK(cache.Publish({3, 3}, UsdTimeCode(3.0), MakePose(3.0, 1)));
+    CHECK(cache.Stats().bytes == 2 * poseBytes);
+    CHECK(CoverageTotal(cache) == 0);
+}
+
+// A pin moves a payload into the pinned domain and a released lease moves it
+// back. Neither step may leave a hole in the total for a reservation to read
+// as room: the ceiling is checked against all four domains at once.
+void
+TestReservationsBesidePayloadTransfersCannotPassTheCap()
+{
+    RigExecFrameCache cache;
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecOutputHandle handle =
+        MakeHandle("joint.frame", RigExecPayloadText::point3);
+    const RigExecCoverageKey seedKey = MakeCoverageKey(1, 99.0, gen);
+    CHECK(cache.PublishCoverage(
+        seedKey,
+        {MakePacket(handle, seedKey.time, gen, RigExecPayloadKind::Point3, 64)},
+        Reserve(cache, 0, 0, 4096), true));
+    // The record is charged for the payload that exists; the ceiling is set
+    // relative to that so a whole payload's worth of room is available.
+    const size_t seedBytes = CoverageTotal(cache);
+    CHECK(seedBytes > 0);
+    // The ceiling leaves room for exactly one reservation: a second can
+    // only land by reading the total inside a payload-to-pinned transfer.
+    const size_t kCap = 2 * seedBytes;
+    cache.SetByteCap(kCap);
+
+    // One sequential cycle first: the seed record answers its handle, pins
+    // into the pinned domain, and gives the charge back on release. If this
+    // fails, the burst below is meaningless -- diagnose the fixture before
+    // contending with it.
+    RigExecCoverageLease proof;
+    CHECK(cache.PinCoverage(seedKey, handle, &proof));
+    CHECK(proof.IsValid());
+    CHECK(proof.Packet().Answers(handle, seedKey.time, gen));
+    CHECK(cache.CoverageHeld().payload == 0);
+    CHECK(cache.CoverageHeld().pinned == seedBytes);
+    CHECK(proof.Release());
+    CHECK(cache.CoverageHeld().payload == seedBytes);
+    CHECK(cache.CoverageHeld().pinned == 0);
+
+    constexpr int kLanes = 8;
+    constexpr int kRounds = 3000;
+    std::atomic<int> transfers{0};
+    std::atomic<int> releases{0};
+    std::atomic<int> admissions{0};
+    // Ownership of admitted reservations, tracked independently of the
+    // cache's counters: the coverage domains and the pose total are
+    // published as separate relaxed reads, so a reader can interleave a
+    // stale one and see a torn cross-domain total. What must never overlap
+    // is two live reservations: the ceiling admits exactly one, and a
+    // transfer that hides its bytes from the ceiling check admits a second.
+    std::atomic<int> liveReservations{0};
+    std::atomic<int> peakLive{0};
+    std::atomic<int> doubleAdmissions{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> ready{0};
+    std::vector<std::thread> lanes;
+    lanes.reserve(kLanes);
+    for (int lane = 0; lane < kLanes; ++lane) {
+        lanes.emplace_back([&, lane]() {
+            ++ready;
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int round = 0; round < kRounds; ++round) {
+                if (lane % 2 == 0) {
+                    // A real payload-to-pinned transfer and back again.
+                    RigExecCoverageLease lease;
+                    if (cache.PinCoverage(seedKey, handle, &lease)) {
+                        ++transfers;
+                        if (lease.Release()) {
+                            ++releases;
+                        }
+                    }
+                    continue;
+                }
+                RigExecCoverageReservation held =
+                    Reserve(cache, 0, 0, seedBytes);
+                if (!held.IsValid()) {
+                    continue;
+                }
+                ++admissions;
+                const int live = liveReservations.fetch_add(1) + 1;
+                int seen = peakLive.load(std::memory_order_relaxed);
+                while (live > seen &&
+                       !peakLive.compare_exchange_weak(seen, live)) {
+                }
+                // With this reservation live the ceiling is exactly full:
+                // any admission the same moment can only come from a
+                // transfer that hid its bytes from the ceiling check. The
+                // dip is short, so sample the full ceiling repeatedly
+                // instead of once per round.
+                for (int probe = 0; probe < 8; ++probe) {
+                    RigExecCoverageReservation extra =
+                        Reserve(cache, 0, 0, seedBytes);
+                    if (!extra.IsValid()) {
+                        continue;
+                    }
+                    ++doubleAdmissions;
+                    const int over = liveReservations.fetch_add(1) + 1;
+                    seen = peakLive.load(std::memory_order_relaxed);
+                    while (over > seen &&
+                           !peakLive.compare_exchange_weak(seen, over)) {
+                    }
+                    // Hand the tracked reservation back before the cache
+                    // does: every tracked live reservation is then
+                    // concurrently charged in the cache, so two tracked
+                    // ones mean the ceiling itself admitted two.
+                    liveReservations.fetch_sub(1);
+                    extra.Release();
+                }
+                liveReservations.fetch_sub(1);
+                held.Release();
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kLanes) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    for (auto &lane : lanes) {
+        lane.join();
+    }
+    CHECK(transfers.load() > 0);
+    CHECK(releases.load() > 0);
+    CHECK(admissions.load() > 0);
+    // Exactly one reservation was ever live: the cap leaves room for one,
+    // and no transfer dipped the accounted total enough to admit a second
+    // beside it.
+    CHECK(doubleAdmissions.load() == 0);
+    CHECK(peakLive.load() == 1);
+    // The seed record still stands with its payload; every lease and
+    // reservation gave its charge back.
+    CHECK(CoverageTotal(cache) == seedBytes);
+    CHECK(cache.CoverageHeld().pinned == 0);
+    CHECK(cache.CoverageRecordCount() == 1);
+}
+
+// Reservations, transfers and pose publication in one account under
+// contention: the aggregate settles back inside the ceiling and no charge
+// or pin is left behind.
+void
+TestAccountStaysCoherentAcrossTransfersAndPosePublication()
+{
+    RigExecFrameCache cache;
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecOutputHandle handle =
+        MakeHandle("joint.frame", RigExecPayloadText::point3);
+    const RigExecCoverageKey seedKey = MakeCoverageKey(1, 77.0, gen);
+    CHECK(cache.PublishCoverage(
+        seedKey,
+        {MakePacket(handle, seedKey.time, gen, RigExecPayloadKind::Point3, 32)},
+        Reserve(cache, 0, 0, 4096), true));
+    const size_t seedBytes = CoverageTotal(cache);
+    CHECK(seedBytes > 0);
+
+    // The same sequential proof: pin, answer, release, before contention.
+    RigExecCoverageLease proof;
+    CHECK(cache.PinCoverage(seedKey, handle, &proof));
+    CHECK(proof.Packet().Answers(handle, seedKey.time, gen));
+    CHECK(proof.Release());
+    const size_t kCharge = seedBytes / 4;
+    CHECK(kCharge > 0);
+    const size_t kCap = 8 * seedBytes;
+    cache.SetByteCap(kCap);
+
+    constexpr int kLanes = 9;
+    constexpr int kRounds = 400;
+    std::atomic<int> publications{0};
+    std::atomic<int> admissions{0};
+    std::atomic<int> transfers{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> ready{0};
+    std::vector<std::thread> lanes;
+    lanes.reserve(kLanes);
+    for (int lane = 0; lane < kLanes; ++lane) {
+        lanes.emplace_back([&, lane]() {
+            ++ready;
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int round = 0; round < kRounds; ++round) {
+                switch (lane % 3) {
+                case 0: {
+                    RigExecCoverageLease lease;
+                    if (cache.PinCoverage(seedKey, handle, &lease)) {
+                        ++transfers;
+                        lease.Release();
+                    }
+                    break;
+                }
+                case 1: {
+                    if (cache.Publish({uint64_t(lane), uint64_t(round)},
+                                      UsdTimeCode(double(round)),
+                                      MakePose(double(round), 1))) {
+                        ++publications;
+                    }
+                    break;
+                }
+                default: {
+                    RigExecCoverageReservation reservation =
+                        Reserve(cache, kCharge / 4, kCharge / 4, kCharge / 2);
+                    if (reservation.IsValid()) {
+                        ++admissions;
+                        reservation.Extend(RigExecCoverageDomain::Pinned,
+                                           kCharge / 4);
+                        reservation.Release();
+                    }
+                    break;
+                }
+                }
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kLanes) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    for (auto &lane : lanes) {
+        lane.join();
+    }
+    CHECK(publications.load() > 0);
+    CHECK(admissions.load() > 0);
+    CHECK(transfers.load() > 0);
+    CHECK(cache.Stats().bytes + CoverageTotal(cache) <= kCap);
+    CHECK(CoverageTotal(cache) == seedBytes);
+    CHECK(cache.CoverageHeld().pinned == 0);
+    CHECK(cache.CoverageRecordCount() == 1);
+}
+
 } // namespace
 
 int
@@ -1920,6 +2264,10 @@ main()
     TestReleaseIsBalancedOrDeclined();
     TestCoverageSharesTheCapAndClearSweepsIt();
     TestConcurrentCoveragePublishKeepsAccountingHonest();
+    TestConcurrentCoverageReservationsCannotPassTheCapTwice();
+    TestPosePublicationYieldsToResidentCoverage();
+    TestReservationsBesidePayloadTransfersCannotPassTheCap();
+    TestAccountStaysCoherentAcrossTransfersAndPosePublication();
 
     if (failures) {
         std::printf("%d FAILURE(S)\n", failures);

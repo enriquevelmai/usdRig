@@ -412,6 +412,67 @@ def main():
     assert stage.GetSessionLayer().ExportToString() == authored, \
         "a subscription authored into the stage"
 
+    # -- handles name the rig instance, not just the prim path --------------
+    # A second, independent stage with the very same prim path and the same
+    # program shape: its handles and this rig's are never interchangeable,
+    # even while their prim paths and compile epochs read alike.
+    stage2, rig2, _, tz2 = _author_rig(Usd, Sdf, rigexec)
+    tz2.Set(7.0, Usd.TimeCode(10.0))  # stage B answers its own control value
+    other = subscriptions.SubscriptionService(rig2, workers=0)
+    foreign_bindings = other.discover()
+    foreign_points = _find(foreign_bindings, POINTS_TARGET, kind="points",
+                           phase="final")
+    assert foreign_points, "the second rig discovered no points output"
+    assert foreign_points.handle["rig_identity"] != \
+        points.handle["rig_identity"], (foreign_points.handle,
+                                        points.handle)
+    assert foreign_points.handle["rig_identity"].startswith("/Rig")
+    assert points.handle["rig_identity"].startswith("/Rig")
+
+    crossed = subs.subscribe([foreign_points], [10.0])
+    assert not crossed.ok, crossed.reason
+    assert crossed.status == "stale compile epoch", crossed.status
+    assert foreign_points.handle["rig_identity"] in crossed.reason, crossed.reason
+    back = other.subscribe([points], [10.0])
+    assert not back.ok, back.reason
+    assert back.status == "stale compile epoch", back.status
+
+    # The foreign handle is refused in company too: a subscription that
+    # names a local output beside the foreign one refuses the whole request
+    # rather than silently answering half of it.
+    mixed = subs.subscribe([points, foreign_points], [10.0])
+    assert not mixed.ok, mixed.reason
+
+    # The second stage answers its own stage: frame 10 moves by stage B's
+    # tz, not stage A's.
+    own = other.subscribe([foreign_points], [10.0])
+    assert own.ok, (own.status, own.reason)
+    assert other.settle(timeout=10.0), "the second service never drained"
+    own_packets = own.poll()
+    assert len(own_packets) == 1, own_packets
+    assert own_packets[0].status == subscriptions.READY, own_packets[0].reason
+    assert _close(own_packets[0].value.point(1)[2], REST_POINTS[1][2] + 7.0), \
+        own_packets[0].value
+    own.close()
+
+    # Same-rig sharing stands: another service over the same rigexec.Rig
+    # minted handles carries the same instance identity, and handles
+    # discovered on one service answer on the other.
+    sharing = subscriptions.SubscriptionService(rig, workers=0)
+    shared = sharing.subscribe([points], [3.0])
+    assert shared.ok, (shared.status, shared.reason)
+    assert sharing.settle(timeout=10.0)
+    shared_packets = shared.poll()
+    assert len(shared_packets) == 1, shared_packets
+    assert shared_packets[0].status == subscriptions.READY
+    assert _close(shared_packets[0].value.point(1)[2],
+                  REST_POINTS[1][2] + _expected_tz(Usd, tz_attr, 3.0)), \
+        shared_packets[0].value
+    sharing.close_all()
+    del sharing, other, rig2, stage2
+    assert stage.GetSessionLayer().ExportToString() == authored, \
+        "a subscription authored into a stage"
+
     # -- a recompile makes the handles it was built from stale -------------
     extra = rigexec.Builder.create(stage, "/Rig").new_mover_chain("second")
     extra.add_float_math_mover("again", "add", 1.0, SCALAR_TARGET)

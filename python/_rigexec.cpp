@@ -32,6 +32,7 @@
 #include "rigExecAuthoring/schemaAuthoring.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -506,9 +507,18 @@ _PythonToDependencyPaths(const py::iterable &values,
 
 // Rig: the evaluator wrapper.
 
+// Distinguishes one rigexec.Rig instance from every other one in the
+// process, so handles discovered from one instance never resolve on another
+// that shares its prim path.
+std::atomic<uint64_t> g_rigInstanceTokens{0};
+
 struct _Rig {
     UsdStageRefPtr stage; ///< keeps the stage alive for the rig's lifetime
     SdfPath rigPath;
+    // The identity this instance's subscriptions mint handles with: stable
+    // across recompiles (the compile epoch moves) and per instance (another
+    // stage with the same prim path mints a different one).
+    std::string subscriptionIdentity;
     std::unique_ptr<rigExec::RigExecRigEvaluator> evaluator;
 
     explicit _Rig(UsdStageRefPtr s, const SdfPath &p) : stage(std::move(s))
@@ -518,6 +528,8 @@ struct _Rig {
                 "could not extract a UsdStage from the given object");
         }
         rigPath = p;
+        subscriptionIdentity = rigPath.GetString() + "#" +
+                               std::to_string(g_rigInstanceTokens.fetch_add(1));
         evaluator =
             std::make_unique<rigExec::RigExecRigEvaluator>(stage, rigPath);
     }
@@ -930,7 +942,7 @@ private:
         auto catalog = std::make_shared<rigExec::RigExecOutputCatalog>();
         std::string error;
         if (!rigExec::RigExecDiscoverOutputs(*program,
-                                             _rig->rigPath.GetString(), epoch,
+                                             _rig->subscriptionIdentity, epoch,
                                              catalog.get(), &error)) {
             return nullptr;
         }
