@@ -185,6 +185,20 @@ class AssembleBundleTest(unittest.TestCase):
         module.copy_tree(src.parent.parent, copied, trim_dev=False)
         self.assertFalse(
             (copied / "Python.framework" / "Versions" / "Current").is_symlink())
+        # A link escaping the tree (setup-python's bin/python3 ->
+        # /Library/Frameworks/...) becomes a real copy, not a link
+        # back to the build machine.
+        outside = self.base / "outside-interpreter"
+        touch(outside, "interpreter\n")
+        (src.parent.parent / "bin").mkdir(parents=True, exist_ok=True)
+        (src.parent.parent / "bin" / "python3").symlink_to(outside)
+        bundled = self.base / "bundled"
+        module.copy_tree(src.parent.parent, bundled, trim_dev=False,
+                         preserve_symlinks=True)
+        copied_python = bundled / "bin" / "python3"
+        self.assertFalse(copied_python.is_symlink())
+        self.assertEqual(copied_python.read_text(encoding="utf-8"),
+                         "interpreter\n")
 
     def test_missing_inputs_report_every_problem(self):
         empty = self.base / "empty"

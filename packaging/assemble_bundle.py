@@ -105,17 +105,78 @@ def validate(args) -> list[str]:
     return problems
 
 
+def _copy_link(link: Path, dst: Path, src_root: Path,
+               trim_dev: bool) -> None:
+    """Recreate an internal symlink; materialize one that escapes the tree.
+
+    Framework-internal links (Versions/Current, a framework's binary)
+    are relative and belong to the bundle, so they are kept verbatim:
+    dereferencing them breaks the structure codesign seals. A link
+    pointing outside the copied tree (setup-python's bin/python3 ->
+    /Library/Frameworks/...) must become a real copy, or the bundle
+    depends on the build machine and patching it hits the system
+    interpreter.
+    """
+    raw = os.readlink(link)
+    if os.path.isabs(raw):
+        lexical = Path(os.path.normpath(raw))
+    else:
+        lexical = Path(os.path.normpath(link.parent.resolve() / raw))
+    if lexical.is_relative_to(src_root):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        os.symlink(raw, dst)
+        return
+    real = link.resolve()
+    if real.is_dir():
+        shutil.copytree(real, dst, dirs_exist_ok=True,
+                        ignore=_ignore(trim_dev))
+    elif real.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(real, dst)
+
+
+def _copy_tree_keeping_internal_links(src: Path, dst: Path,
+                                      trim_dev: bool) -> None:
+    src_root = src.resolve()
+    ignore = _ignore(trim_dev)
+    for dirpath, dirnames, filenames in os.walk(src):
+        current = Path(dirpath)
+        ignored = ignore(dirpath, dirnames + filenames)
+        out = dst / current.relative_to(src)
+        out.mkdir(parents=True, exist_ok=True)
+        for name in list(dirnames):
+            entry = current / name
+            if not entry.is_symlink():
+                continue
+            dirnames.remove(name)
+            if name not in ignored:
+                _copy_link(entry, out / name, src_root, trim_dev)
+        dirnames[:] = [name for name in dirnames if name not in ignored]
+        for name in filenames:
+            if name in ignored:
+                continue
+            entry = current / name
+            if entry.is_symlink():
+                _copy_link(entry, out / name, src_root, trim_dev)
+            else:
+                shutil.copy2(entry, out / name)
+
+
 def copy_tree(src: Path, dst: Path, trim_dev: bool,
               preserve_symlinks: bool = False) -> None:
-    # macOS framework bundles (Python.framework, Qt) are symlink webs;
-    # dereferencing them breaks the bundle structure codesign seals.
-    shutil.copytree(src, dst, dirs_exist_ok=True,
-                    ignore=_ignore(trim_dev), symlinks=preserve_symlinks)
+    if preserve_symlinks:
+        _copy_tree_keeping_internal_links(src, dst, trim_dev)
+    else:
+        shutil.copytree(src, dst, dirs_exist_ok=True,
+                        ignore=_ignore(trim_dev))
 
 
 def make_executable(path: Path) -> None:
     if os.name != "nt":
-        path.chmod(path.stat().st_mode | 0o755)
+        target = path.resolve() if path.is_symlink() else path
+        target.chmod(target.stat().st_mode | 0o755)
 
 
 def info_plist(version: str) -> str:
