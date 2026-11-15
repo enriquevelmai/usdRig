@@ -698,6 +698,11 @@ if (TARGET usdRigView)
         LABELS "fast" TIMEOUT 120)
 endif()
 
+add_test(NAME testRigExecMacSigning COMMAND ${Python3_EXECUTABLE}
+    "${CMAKE_CURRENT_SOURCE_DIR}/packaging/test_sign_macos.py")
+set_tests_properties(testRigExecMacSigning PROPERTIES
+    LABELS "fast" TIMEOUT 120)
+
 # The test selector must attribute an OBJECT library's sources to the
 # targets that compose it, or an imaging domain edit would select no
 # test at all. The self-check runs the selector's parse()/select()

@@ -305,7 +305,20 @@ jobs:
           AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
           AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
           AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
+          # Published releases must ship signed + notarized: the
+          # signing script fails instead of warn-skipping when this
+          # is 1. Test dispatches (publish=false) may stay unsigned.
+          RIGEXEC_REQUIRE_NOTARIZATION: ${{ needs.gate.outputs.publish == 'true' && '1' || '0' }}
         run: |
+          # Signing material never outlives this step, even on failure.
+          cleanup_signing() {
+            rm -f "${AC_API_KEY_PATH:-}" "$RUNNER_TEMP/certificate.p12"
+            if [ -f "$RUNNER_TEMP/signing.keychain-db" ]; then
+              security delete-keychain \
+                "$RUNNER_TEMP/signing.keychain-db" || true
+            fi
+          }
+          trap cleanup_signing EXIT
           bundle="dist/usdRig-$VERSION_NUM-macos-arm64"
           python3 packaging/assemble_bundle.py \
             --usd-install usd-install --rig-install usdrig-install \
@@ -330,17 +343,34 @@ jobs:
             security create-keychain -p actions "$keychain"
             security set-keychain-settings -lut 21600 "$keychain"
             security unlock-keychain -p actions "$keychain"
+            # Only codesign may use the imported private key.
             security import "$p12" -P "$MACOS_CERTIFICATE_PASSWORD" \
-              -A -t cert -f pkcs12 -k "$keychain"
-            security set-key-partition-list -S apple-tool:,apple: \
-              -k actions "$keychain"
+              -T /usr/bin/codesign -t cert -f pkcs12 -k "$keychain"
+            security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: -s -k actions "$keychain"
+            # codesign only searches keychains on the search list,
+            # and create-keychain does not add the new one to it.
+            security list-keychains -d user -s "$keychain" \
+              "$HOME/Library/Keychains/login.keychain-db"
             rm -f "$p12"
+            if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+              security find-identity -v -p codesigning "$keychain" | \
+                grep -F "$MACOS_SIGNING_IDENTITY"
+            fi
           fi
           if [ -n "${AC_API_KEY_BASE64:-}" ]; then
             export AC_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
             echo "$AC_API_KEY_BASE64" | base64 --decode > "$AC_API_KEY_PATH"
           fi
           bash packaging/sign-macos.sh "$bundle"
+          # The pre-sign smoke proves nothing about the hardened
+          # runtime: re-check the signed + notarized bundle launches.
+          "$exe" --usdRig-check
+          while IFS='=' read -r name value; do
+            export "$name=$value"
+          done < <("$exe" --usdRig-print-env)
+          "$bundle/usdRigView.app/Contents/Resources/app/python/bin/python3" \
+            -c "from pxr import Usd; import rigExecUsdview, rigexec; s = Usd.Stage.Open('$bundle/usdRigView.app/Contents/Resources/app/examples/rigexec_flat.usda'); assert s is not None; print('signed bundle smoke OK')"
           tar -C dist -czf "$bundle.tar.gz" "$(basename "$bundle")"
 
       # ---- Linux: assemble, smoke, tar ---------------------------------

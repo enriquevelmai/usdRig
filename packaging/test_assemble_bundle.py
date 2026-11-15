@@ -11,7 +11,9 @@ Or via ctest:  testRigExecBundlePackaging.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -164,6 +166,25 @@ class AssembleBundleTest(unittest.TestCase):
         with tarfile.open(self.base / "bundle-linux.tar.gz") as tf:
             self.assertTrue(any(n.endswith("/usdRigView")
                                 for n in tf.getnames()))
+
+    @unittest.skipUnless(os.name == "posix", "symlinks need POSIX")
+    def test_copy_tree_preserves_symlinks_when_asked(self):
+        spec = importlib.util.spec_from_file_location("assemble_bundle",
+                                                      ASSEMBLE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        src = self.base / "fw-src" / "Python.framework" / "Versions"
+        touch(src / "3.11" / "Python", "binary\n")
+        (src / "Current").symlink_to("3.11", target_is_directory=True)
+        kept = self.base / "kept"
+        module.copy_tree(src.parent.parent, kept, trim_dev=False,
+                         preserve_symlinks=True)
+        self.assertTrue(
+            (kept / "Python.framework" / "Versions" / "Current").is_symlink())
+        copied = self.base / "copied"
+        module.copy_tree(src.parent.parent, copied, trim_dev=False)
+        self.assertFalse(
+            (copied / "Python.framework" / "Versions" / "Current").is_symlink())
 
     def test_missing_inputs_report_every_problem(self):
         empty = self.base / "empty"

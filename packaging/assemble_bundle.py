@@ -105,9 +105,12 @@ def validate(args) -> list[str]:
     return problems
 
 
-def copy_tree(src: Path, dst: Path, trim_dev: bool) -> None:
+def copy_tree(src: Path, dst: Path, trim_dev: bool,
+              preserve_symlinks: bool = False) -> None:
+    # macOS framework bundles (Python.framework, Qt) are symlink webs;
+    # dereferencing them breaks the bundle structure codesign seals.
     shutil.copytree(src, dst, dirs_exist_ok=True,
-                    ignore=_ignore(trim_dev))
+                    ignore=_ignore(trim_dev), symlinks=preserve_symlinks)
 
 
 def make_executable(path: Path) -> None:
@@ -209,9 +212,13 @@ def assemble(args) -> Path:
                                              encoding="utf-8")
         (contents / "PkgInfo").write_text("APPL????", encoding="utf-8")
 
-    copy_tree(Path(args.usd_install), app_dir / "usd", args.trim_dev)
-    copy_tree(Path(args.rig_install), app_dir / "rig", args.trim_dev)
-    copy_tree(Path(args.python_home), app_dir / "python", args.trim_dev)
+    keep_links = platform == "macos"
+    copy_tree(Path(args.usd_install), app_dir / "usd", args.trim_dev,
+              preserve_symlinks=keep_links)
+    copy_tree(Path(args.rig_install), app_dir / "rig", args.trim_dev,
+              preserve_symlinks=keep_links)
+    copy_tree(Path(args.python_home), app_dir / "python", args.trim_dev,
+              preserve_symlinks=keep_links)
     make_executable(python_executable(app_dir / "python", platform))
 
     source = Path(args.source_root)

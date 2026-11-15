@@ -12,6 +12,7 @@ written outside the extracted directory.
 - Assembly: `packaging/assemble_bundle.py` (stdlib only)
 - Tests: `packaging/test_assemble_bundle.py` (ctest:
   `testRigExecBundlePackaging`, needs `-DRIGEXEC_BUILD_VIEWER_LAUNCHER=ON`)
+  and `packaging/test_sign_macos.py` (ctest: `testRigExecMacSigning`)
 
 ## Bundle layout
 
@@ -49,8 +50,11 @@ create/update the Release for that tag.
 ## Signing
 
 Signing happens on the platform runner, after assembly, before
-archiving; each script warns and skips when its credential is absent, so
-forks and test runs produce clearly unsigned bundles.
+archiving. On macOS every published release (tag push, or a dispatch
+with `publish` set) must sign and notarize: the workflow sets
+`RIGEXEC_REQUIRE_NOTARIZATION=1`, so missing credentials fail the job
+instead of shipping an unsigned bundle. Unpublished test dispatches
+still warn and skip, producing clearly unsigned bundles.
 
 | Platform | Mechanism | Secrets |
 |---|---|---|
