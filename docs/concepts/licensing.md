@@ -39,7 +39,7 @@ repository.
 | **generated** | machine output of a checked-in generator or an external tool | origin only: the grant comes from the generator and its inputs |
 | **unresolved** | no provenance evidence in the repository | no grant at all until an owner records an origin |
 
-At the manifest's inventory boundary the partition covers 1808 files: 1527
+At the manifest's inventory boundary the partition covers 1816 files: 1535
 original, 166 derived, 45 bundled, 70 generated and none unresolved, with
 nothing unassigned and nothing double-assigned. A path belongs to the family
 with the lowest precedence number whose globs match it, after that family's
