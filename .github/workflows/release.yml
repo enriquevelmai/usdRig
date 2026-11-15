@@ -340,7 +340,7 @@ jobs:
             export AC_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
             echo "$AC_API_KEY_BASE64" | base64 --decode > "$AC_API_KEY_PATH"
           fi
-          packaging/sign-macos.sh "$bundle"
+          bash packaging/sign-macos.sh "$bundle"
           tar -C dist -czf "$bundle.tar.gz" "$(basename "$bundle")"
 
       # ---- Linux: assemble, smoke, tar ---------------------------------
