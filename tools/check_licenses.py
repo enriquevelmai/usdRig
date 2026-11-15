@@ -688,44 +688,33 @@ def check_archives(manifest: dict, root: Path, addon_root: Path | None):
 
 
 def check_partition(manifest: dict, root: Path, files: list[str]):
+    """Re-derive the partition and check its invariants, never its size.
+
+    The manifest's recorded counts are a snapshot of the tree at its
+    inventory boundary; they go stale the moment a file is added, so
+    nothing here compares against them. What must hold on any tree:
+    every file is claimed by exactly one family (disjointness at equal
+    precedence lives in check_family_patterns) and no file falls to
+    the unclassified fallback. The derived sizes are reported as a
+    note, so a human sees them without a file addition breaking the
+    check until the manifest catches up.
+    """
     errors = check_family_patterns(manifest, files)
     assignment = {f: family_of(f, manifest["families"]) for f in files}
-    if len(files) != manifest["totals"]["assigned_files"]:
-        errors.append(f"totals.assigned_files is "
-                      f"{manifest['totals']['assigned_files']}, the tree has "
-                      f"{len(files)} tracked files")
     unassigned = [f for f in files if assignment[f] == "fallback-unclassified"]
-    if len(unassigned) != manifest["totals"]["unassigned_files"]:
+    if unassigned:
         named = ", ".join(unassigned[:10]) + (", ..." if len(unassigned) > 10 else "")
-        errors.append(f"totals.unassigned_files is "
-                      f"{manifest['totals']['unassigned_files']}, {len(unassigned)} "
-                      f"paths match no family: {named}")
-    for family in manifest["families"]:
-        actual = sum(1 for f in files if assignment[f] == family["id"])
-        if actual != family["matched_files"]:
-            errors.append(f"family {family['id']} matches {actual} files, the "
-                          f"manifest records {family['matched_files']}")
+        errors.append(f"{len(unassigned)} paths match no family: {named}")
     by_category: dict[str, int] = {}
     for f in files:
         family = next(x for x in manifest["families"] if x["id"] == assignment[f])
         by_category[family["category"]] = by_category.get(family["category"], 0) + 1
-    for category, count in manifest["totals"]["by_category"].items():
-        if by_category.get(category, 0) != count:
-            errors.append(f"totals.by_category[{category}] is {count}, the partition "
-                          f"gives {by_category.get(category, 0)}")
     markers = marker_scan(root, files, manifest)
-    recorded = manifest["totals"].get(
-        "files_with_license_or_copyright_markers_in_scope")
-    if recorded is not None and markers != recorded:
-        errors.append(f"the marker scan finds {markers} in-scope files, the manifest "
-                      f"records {recorded}")
-    excluded = manifest["inventory_boundary"].get("inventory_scope_excludes", [])
-    scope = [f for f in files if not any(glob_matches(f, g) for g in excluded)]
-    in_scope = manifest["inventory_boundary"].get("tracked_files_in_scope")
-    if in_scope is not None and len(scope) != in_scope:
-        errors.append(f"inventory_boundary.tracked_files_in_scope is {in_scope}, "
-                      f"the tree has {len(scope)} in-scope files")
-    return errors, []
+    sizes = ", ".join(f"{category} {by_category[category]}"
+                      for category in sorted(by_category))
+    notes = [f"partition derived over {len(files)} files ({sizes}); "
+             f"{markers} in-scope files carry a license or copyright marker"]
+    return errors, notes
 
 
 def find_legal_root(prefix: Path) -> Path | None:
@@ -899,14 +888,15 @@ def validate(manifest: dict, root: Path = ROOT, addon_root: Path | None = None,
     files = tracked_files(root)
     if files is None:
         notes.append("partition completeness and source-header agreement are "
-                     "unverifiable: this tree has no git, so neither the family "
-                     "counts nor the headers were re-derived")
+                     "unverifiable: this tree has no git, so neither the "
+                     "partition nor the headers were re-derived")
     else:
         errors += check_source_headers(manifest, root, files)
         if partition:
-            partition_errors, unverifiable = check_partition(manifest, root, files)
+            partition_errors, partition_notes = check_partition(
+                manifest, root, files)
             errors += partition_errors
-            notes.extend(unverifiable)
+            notes.extend(partition_notes)
     return errors, notes
 
 
@@ -1516,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
             files, extras = inventory(ROOT)
             if files is None:
                 notes.append("partition completeness is unverifiable: this tree has "
-                            "no git, so the family counts were not re-derived")
+                            "no git, so the partition was not re-derived")
             else:
                 print(f"partition re-derived over {len(files)} files")
                 if extras:

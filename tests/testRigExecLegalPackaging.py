@@ -370,9 +370,10 @@ class Partition(unittest.TestCase):
     def test_families_partition_the_tree_exactly_once(self):
         files = check_licenses.tracked_files(ROOT)
         self.assertIsNotNone(files, "the test tree must be a git checkout")
-        errors, unverifiable = check_licenses.check_partition(MANIFEST, ROOT, files)
+        errors, notes = check_licenses.check_partition(MANIFEST, ROOT, files)
         self.assertEqual(errors, [])
-        self.assertEqual(unverifiable, [])
+        self.assertTrue(any("partition derived over" in note
+                            for note in notes), notes)
 
     def test_the_project_art_families_record_an_mit_grant(self):
         """The owner answers for the project's art (PR #49, 2026-11-14): the
@@ -389,7 +390,10 @@ class Partition(unittest.TestCase):
             record = next((family for family in MANIFEST["families"]
                            if family["id"] == family_id), None)
             self.assertIsNotNone(record, f"{family_id} is missing")
-            self.assertGreater(record["matched_files"], 0, f"{family_id} is empty")
+            actual = sum(1 for name in files
+                         if check_licenses.family_of(
+                             name, MANIFEST["families"]) == family_id)
+            self.assertGreater(actual, 0, f"{family_id} is empty")
             self.assertEqual(record["category"], "original", family_id)
             self.assertEqual(record["spdx"], "MIT", family_id)
             self.assertEqual(record["holder"], legal_holder, family_id)
@@ -411,33 +415,23 @@ class Partition(unittest.TestCase):
             self.assertEqual(record["spdx"], "MIT", f"{name} in {family_id}")
             self.assertEqual(record["holder"], legal_holder, f"{name} in {family_id}")
 
-    def test_the_licensing_guide_restates_the_manifest_counts(self):
-        """docs/concepts/licensing.md spells the partition total and the art
-        family sizes, so a refreshed inventory must refresh the guide too."""
+    def test_the_licensing_guide_states_no_partition_counts(self):
+        """docs/concepts/licensing.md must not restate partition sizes:
+        the checker derives them from the tree, so a number spelled in
+        the guide is stale the moment a file is added."""
         guide_path = ROOT / "docs" / "concepts" / "licensing.md"
-        lines = guide_path.read_text(encoding="utf-8").splitlines()
-        totals = MANIFEST["totals"]
-        by_category = totals["by_category"]
-        stated = re.search(
-            r"the partition covers (\d+) files: (\d+) original, (\d+) derived,"
-            r" (\d+) bundled, (\d+) generated", " ".join(lines))
-        self.assertIsNotNone(stated, "the guide states no partition total")
-        self.assertEqual([int(group) for group in stated.groups()],
-                         [totals["assigned_files"], by_category["original"],
-                          by_category["derived"], by_category["bundled"],
-                          by_category["generated"]])
-        matched = {family["id"]: family["matched_files"]
-                   for family in MANIFEST["families"]}
-        for family_id in ("original-icon-atlas", "original-usdview-icons",
-                          "original-component-library",
-                          "original-example-assets", "original-doc-assets",
-                          "original-test-fixtures"):
-            row = next((line for line in lines
-                        if line.startswith(f"| `{family_id}` |")), None)
-            self.assertIsNotNone(row, f"the guide has no {family_id} row")
-            cells = row.split("|")
-            self.assertEqual(int(cells[3].strip()), matched[family_id],
-                             f"{family_id} size in the guide")
+        text = guide_path.read_text(encoding="utf-8")
+        self.assertIsNone(re.search(r"partition covers \d+ files", text),
+                          "the guide hardcodes a partition total")
+        rows = [line for line in text.splitlines()
+                if re.match(r"\| `original-(icon-atlas|usdview-icons|"
+                            r"component-library|example-assets|doc-assets|"
+                            r"test-fixtures)` \|", line)]
+        self.assertEqual(len(rows), 6, "the guide lost an art family row")
+        for line in rows:
+            cells = line.split("|")
+            self.assertFalse(cells[3].strip().isdigit(),
+                             f"the guide hardcodes a family size: {line}")
 
     def test_no_tracked_file_is_left_without_a_grant(self):
         """The unresolved category survives only as the precedence-6 fallback,
@@ -446,7 +440,6 @@ class Partition(unittest.TestCase):
         self.assertEqual([family["id"] for family in MANIFEST["families"]
                           if family["category"] == "unresolved"],
                          ["fallback-unclassified"])
-        self.assertEqual(MANIFEST["totals"]["by_category"]["unresolved"], 0)
         files = check_licenses.tracked_files(ROOT)
         self.assertIsNotNone(files, "the test tree must be a git checkout")
         falling = [name for name in files

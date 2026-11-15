@@ -39,13 +39,15 @@ repository.
 | **generated** | machine output of a checked-in generator or an external tool | origin only: the grant comes from the generator and its inputs |
 | **unresolved** | no provenance evidence in the repository | no grant at all until an owner records an origin |
 
-At the manifest's inventory boundary the partition covers 1816 files: 1535
-original, 166 derived, 45 bundled, 70 generated and none unresolved, with
-nothing unassigned and nothing double-assigned. A path belongs to the family
+The partition assigns every tracked file to exactly one family, with
+nothing unassigned and nothing double-assigned, and nothing in the
+unresolved category. A path belongs to the family
 with the lowest precedence number whose globs match it, after that family's
-carve-outs; a path matching nothing falls to the precedence-6 fallback, which
-the current partition reaches for zero files. The checker re-derives that
-partition from the files git tracks rather than trusting the recorded counts:
+carve-outs; a path matching nothing falls to the precedence-6 fallback,
+which a passing partition never reaches. The checker re-derives that
+partition from the files git tracks and reports the derived sizes;
+it never compares them against a recorded count, so adding a file does
+not stale the check:
 a file staged with `git add` is in that tree, so a new file must be classified
 before it can reach a commit, while a dependency tree such as an OpenUSD
 build a CI job stages inside the checkout, a build archive it downloads into
@@ -123,14 +125,14 @@ unresolved until the owner answered: the art in this repository is unique to
 the project, so it is MIT like the code (`original-*` families in the
 manifest, and the answered entries in `owner_questions`):
 
-| Family | Paths | Files | What the owner answered |
-|---|---|---|---|
-| `original-icon-atlas` | `icons/**` | 45 | project-drawn art under MIT |
-| `original-usdview-icons` | `plugin/rigExecUsdview/icons/**` | 28 | project-drawn art under MIT; the TOST terms of the plugin code around them say nothing about the images |
-| `original-component-library` | `asset_lib/**` | 14 | project work under MIT |
-| `original-example-assets` | `examples/**` | 198 | the biped geometry, the bust and rubberhose artwork and its textures are unique project art under MIT |
-| `original-doc-assets` | `docs/examples/**`, `docs/images/**`, `docs/gifs/**`, `docs/assets/**`, `docs/*.svg` | 128 | project captures and tutorial stages under MIT |
-| `original-test-fixtures` | `tests/fixtures/**` | 49 | project MIT; `rigLogicReference.inc` holds values upstream OpenRigLogic produced, and that upstream is MIT itself, so no separate grant is needed |
+| Family | Paths | What the owner answered |
+|---|---|---|
+| `original-icon-atlas` | `icons/**` | project-drawn art under MIT |
+| `original-usdview-icons` | `plugin/rigExecUsdview/icons/**` | project-drawn art under MIT; the TOST terms of the plugin code around them say nothing about the images |
+| `original-component-library` | `asset_lib/**` | project work under MIT |
+| `original-example-assets` | `examples/**` | the biped geometry, the bust and rubberhose artwork and its textures are unique project art under MIT |
+| `original-doc-assets` | `docs/examples/**`, `docs/images/**`, `docs/gifs/**`, `docs/assets/**`, `docs/*.svg` | project captures and tutorial stages under MIT |
+| `original-test-fixtures` | `tests/fixtures/**` | project MIT; `rigLogicReference.inc` holds values upstream OpenRigLogic produced, and that upstream is MIT itself, so no separate grant is needed |
 
 The recorded evidence for these six is the owner's statement, not an
 independent chain of title; the `copyright-holder` question in
@@ -229,7 +231,7 @@ only.
 
 One limit is stated rather than papered over: the partition is re-derived
 from the checkout's git file list. In a tree with no git — an extracted
-archive, a vendored copy — the checker reports the family counts as
+archive, a vendored copy — the checker reports the partition as
 unverifiable instead of passing. Source headers are compared the same way:
 a header whose SPDX id or holder contradicts its family is an error for an
 owner to resolve, and the checker never edits a header or a family to make
