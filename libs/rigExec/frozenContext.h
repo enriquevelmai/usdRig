@@ -701,6 +701,8 @@ bool RigExecRunFrozenHistoryTick(const RigExecFrozenEvalContext &context,
 /// Nothing here names a stage, an evaluator or a live handle.
 struct RigExecFrozenRequestedRun {
     RigExecDemandClosure closure;
+    /// The outputs to answer: each `valueRevision` is a constraint the answer
+    /// must match, zero asking for whatever this run leaves.
     std::vector<RigExecOutputHandle> outputs;
     RigExecOutputGeneration captured;
     std::shared_ptr<const RigExecOutputCatalog> catalog;
@@ -737,13 +739,15 @@ using RigExecFrozenRequestedStepRunner = std::function<bool(
 /// Runs \p inputs under \p context through \p runner over \p requested's
 /// closure only, and answers the outputs it names. The checks, in order: the
 /// context must carry an admitted program; the input vector's count must equal
-/// the context's sampled count; the job must name a closure, outputs and a
-/// catalog; when \p scheduler is given, the generation must be current (start
+/// the context's sampled count; the job must name a catalog, that catalog must
+/// carry the compiled-program identity of the program this context runs (a
+/// clone of it is the same compilation), and the job must name a closure and
+/// outputs; when \p scheduler is given, the generation must be current (start
 /// check); the runner executes under a serial scope against a private arena
 /// sized from the context; when \p scheduler is given, the generation must
 /// STILL be current (publish check). Anything a detached run cannot prove --
-/// an open closure, a catalog of another epoch, a lane that cannot name the
-/// storage, a stale generation -- is reported in `error` and through the
+/// an open closure, a catalog of another compilation, a lane that cannot name
+/// the storage, a stale generation -- is reported in `error` and through the
 /// per-output statuses, never answered by evaluating the rig another way.
 ///
 /// \p trace, when given, is cleared and then filled by a production runner
@@ -758,11 +762,12 @@ RigExecFrozenRequestedResult RigExecEvaluateFrozenRequested(
 
 /// Owner thread: resolve one exact frame's demand against \p catalog into the
 /// job a frozen worker runs -- the union of the named handles' closures, the
-/// handles themselves, and the generation the caller captured with the
-/// request. False, leaving \p out untouched, when the demand names an output
-/// this catalog does not know or has no producer for, or when its handles
-/// belong to another rig or epoch: the caller recaptures, it does not dispatch
-/// a partial mask.
+/// handles themselves at the value revisions the caller named, and the
+/// generation the caller captured with the request. False, leaving \p out
+/// untouched, when the demand names an output this catalog does not know or
+/// has no producer for, when its handles belong to another rig or epoch, or
+/// when one output is named at two revisions: the caller recaptures, it does
+/// not dispatch a partial mask.
 bool RigExecMakeFrozenRequestedRun(
     const std::shared_ptr<const RigExecOutputCatalog> &catalog,
     const RigExecOutputTimeDemand &demand,

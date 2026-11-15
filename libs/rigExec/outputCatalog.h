@@ -8,12 +8,20 @@
 #include "rigExecGraph/outputDemand.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace rigExec {
 
 class RigExecBakedProgram;
+
+/// The identity of one immutable compilation. A baked program mints it at
+/// Build, every frozen clone of that program inherits it, and a catalog
+/// discovered from the program holds it, so a consumer can tell that a catalog
+/// names THIS compilation before reading either. Nothing else can produce a
+/// matching handle: only the program and its own clones share the owner.
+struct RigExecProgramAffinity {};
 
 /// The USD-free spelling of a RigExecValueAddress plus its exact payload type.
 struct RigExecOutputDescriptor {
@@ -61,6 +69,14 @@ struct RigExecOutputBinding {
 /// stale epoch from an unsupported semantic address before execution starts.
 class RigExecOutputCatalog {
 public:
+    /// The compilation this catalog was discovered from. Equal to that
+    /// program's affinity and to that of any of its frozen clones, and to no
+    /// other compilation, however alike their operation graphs look.
+    const std::shared_ptr<const RigExecProgramAffinity> &
+    GetProgramAffinity() const
+    {
+        return programAffinity_;
+    }
     const std::string &GetRigIdentity() const
     {
         return rigIdentity_;
@@ -93,6 +109,7 @@ private:
 
     std::string rigIdentity_;
     uint64_t compileEpoch_ = 0;
+    std::shared_ptr<const RigExecProgramAffinity> programAffinity_;
     std::vector<RigExecOutputBinding> bindings_;
     RigExecDemandEdges requirements_;
     RigExecOutputDemandIndex demandIndex_;

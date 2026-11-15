@@ -38,9 +38,10 @@
 //     warming, is keyed exactly (rig, exact output time, whole captured
 //     generation) and coalesces only on that key, stays eligible when
 //     speculative warming is off, takes the rigs in turn, holds a bounded job
-//     and byte reservation that every terminal path releases, and is fenced
-//     by the same generation and per-time tokens -- with a token of its own
-//     for the default frame.
+//     and byte reservation that every terminal path releases, keeps a running
+//     job's cap slot across ResetRig, counts a coalescing as an accept in the
+//     balance, and is fenced by the same generation and per-time tokens --
+//     with a token of its own for the default frame.
 //   * BUDGET. The sampling budget bounds factory invocations per trigger;
 //     the millisecond stop binds sampling; already-queued merges consume
 //     nothing; the unlimited default preserves the full burst shape.
@@ -1903,6 +1904,21 @@ NumericTime(double timeCode)
     return time;
 }
 
+// The explicit balance the stats contract advertises: every accepted
+// admission that reserved a slot is either terminal or outstanding, and a
+// coalescing accepted without reserving one.
+bool
+ExplicitBalanceHolds(const RigExecBackgroundSchedulerStats &stats)
+{
+    return stats.explicitAccepted >= stats.explicitCoalesced &&
+           stats.explicitAccepted - stats.explicitCoalesced ==
+               stats.explicitPublished + stats.explicitDeclinedInvalid +
+                   stats.explicitDeclinedGeneration +
+                   stats.explicitDroppedStale + stats.explicitCanceled +
+                   stats.explicitDroppedAtShutdown + stats.explicitQueuedDepth +
+                   stats.explicitRunning;
+}
+
 // One ordered log shared by warm and explicit work: each job names itself, so
 // a mixed-class test asserts the whole pop order at once.
 class OrderLog {
@@ -2094,11 +2110,7 @@ TestExplicitOutputRunsAheadOfWarming()
               stats.droppedStale + stats.canceled + stats.shed +
               stats.droppedAtShutdown + stats.queuedDepth + stats.running ==
           2);
-    CHECK(stats.explicitAccepted - stats.explicitCoalesced ==
-          stats.explicitPublished + stats.explicitDeclinedInvalid +
-              stats.explicitDeclinedGeneration + stats.explicitDroppedStale +
-              stats.explicitCanceled + stats.explicitDroppedAtShutdown +
-              stats.explicitQueuedDepth + stats.explicitRunning);
+    CHECK(ExplicitBalanceHolds(stats));
 }
 
 // The exact time is an identity: the default frame, frame zero, negative zero,
@@ -2123,7 +2135,9 @@ TestExplicitKeysKeepDefaultZeroAndSubframesApart()
             scheduler.AdmitExplicitOutput(request, recorder.Work()) ? 1 : 0;
     }
     CHECK(accepted == 5);
+    CHECK(scheduler.Stats().explicitAccepted == 5);
     CHECK(scheduler.Stats().explicitCoalesced == 1);
+    CHECK(ExplicitBalanceHolds(scheduler.Stats()));
     const std::vector<RigExecExplicitJobKey> keys =
         scheduler.QueuedExplicitKeys(rig);
     CHECK(keys.size() == 4);
@@ -2167,7 +2181,9 @@ TestExplicitGenerationFieldsNeverCoalesce()
     RigExecExplicitRequest again = MakeExplicitRequest(rig, five, 1, 0, 0, 0);
     again.editGeneration = current;
     CHECK(scheduler.AdmitExplicitOutput(again, recorder.Work()));
+    CHECK(scheduler.Stats().explicitAccepted == 6);
     CHECK(scheduler.Stats().explicitCoalesced == 1);
+    CHECK(ExplicitBalanceHolds(scheduler.Stats()));
     CHECK(scheduler.QueuedExplicitKeys(rig).size() == 5);
     // A warm job for the same rig and time is a separate job: the rounded
     // (rig, time) warm key never merges an explicit request.
@@ -2179,6 +2195,7 @@ TestExplicitGenerationFieldsNeverCoalesce()
     CHECK(scheduler.Stats().queuedDepth == 6);
     CHECK(scheduler.DrainQueueForTesting() == 6);
     CHECK(recorder.Runs().size() == 5);
+    CHECK(ExplicitBalanceHolds(scheduler.Stats()));
 }
 
 // Explicit demand is eligible whatever the speculative-warming switches say:
@@ -2758,6 +2775,182 @@ TestExplicitMidRunCancelKeepsTheBooksBalanced()
     CHECK(recorder.Runs().back().currentAtPublish);
 }
 
+// ResetRig retires the queued work but keeps the books of a job already
+// running: its in-flight count, its byte reservation and its key stand, so the
+// per-rig cap still declines a distinct request beside it and its own
+// completion is what frees the slot.
+void
+TestResetRigKeepsTheRunningExplicitCount()
+{
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool started = false;
+    bool released = false;
+
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/1);
+    scheduler.SetExplicitPerRigJobCap(1);
+    const SdfPath rig("/Rig/ResetMid");
+    RigExecExplicitRequest running = MakeExplicitRequest(rig, NumericTime(4.0));
+    running.reservationBytes = 4096;
+    CHECK(scheduler.AdmitExplicitOutput(
+        running, [&](const RigExecExplicitRequest &) {
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                started = true;
+            }
+            gateCv.notify_all();
+            std::unique_lock<std::mutex> lock(gateMutex);
+            gateCv.wait(lock, [&] { return released; });
+            return RigExecWarmOutcome::Published;
+        }));
+
+    bool countHeld = false;
+    bool bytesHeld = false;
+    bool keyHeld = false;
+    bool capHeld = false;
+    bool distinctAdmitted = false;
+    // A distinct request for the same rig: admitted only after the reset.
+    RigExecExplicitRequest distinct =
+        MakeExplicitRequest(rig, NumericTime(5.0));
+    distinct.reservationBytes = 2048;
+    std::thread resetter([&] {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        gateCv.wait(lock, [&] { return started; });
+        lock.unlock();
+        // The reset lands with the gate closed: nothing is queued, and the
+        // only job left in the books is the one running on the worker.
+        scheduler.ResetRig(rig);
+        countHeld = scheduler.ExplicitInFlightCount(rig) == 1;
+        bytesHeld = scheduler.ReservedExplicitBytesFor(rig) == 4096;
+        keyHeld = scheduler.InFlightExplicitKeys(rig) ==
+                  std::vector<RigExecExplicitJobKey>{running.Key()};
+        capHeld = scheduler.QueuedExplicitKeys(rig).empty();
+        // A distinct request for the same rig cannot pass the cap while the
+        // reset rig's job still runs.
+        distinctAdmitted = scheduler.AdmitExplicitOutput(
+            distinct, [](const RigExecExplicitRequest &) {
+                return RigExecWarmOutcome::Published;
+            });
+        {
+            std::lock_guard<std::mutex> releaseLock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
+    });
+    resetter.join();
+    CHECK(countHeld);
+    CHECK(bytesHeld);
+    CHECK(keyHeld);
+    CHECK(capHeld);
+    CHECK(!distinctAdmitted);
+    scheduler.WaitUntilIdle();
+
+    // The running job released exactly its own slot and bytes.
+    const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.explicitAccepted == 1);
+    CHECK(stats.explicitDeclined == 1);
+    CHECK(stats.explicitDeclinedBytes == 0);
+    CHECK(stats.explicitCanceled == 0);
+    CHECK(stats.explicitCompleted == 1);
+    CHECK(stats.explicitPublished == 1);
+    CHECK(stats.explicitRunning == 0);
+    CHECK(stats.explicitQueuedDepth == 0);
+    CHECK(stats.explicitReservedBytes == 0);
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 0);
+    CHECK(scheduler.InFlightExplicitKeys(rig).empty());
+    CHECK(ExplicitBalanceHolds(stats));
+
+    // The freed slot admits again, and its job runs under the standing
+    // generation. That job is held inside the lane, so the exact in-flight
+    // count is read while it definitely runs rather than after a worker may
+    // already have completed it, and the release comes from this thread.
+    std::mutex heldMutex;
+    std::condition_variable heldCv;
+    bool heldStarted = false;
+    bool heldRelease = false;
+    ExplicitRecorder recorder(&scheduler);
+    RigExecExplicitRequest after = MakeExplicitRequest(rig, NumericTime(6.0));
+    after.reservationBytes = 1024;
+    CHECK(scheduler.AdmitExplicitOutput(
+        after, recorder.HeldWork(heldMutex, heldCv, heldStarted, heldRelease)));
+    {
+        std::unique_lock<std::mutex> lock(heldMutex);
+        heldCv.wait(lock, [&] { return heldStarted; });
+    }
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 1);
+    CHECK(scheduler.InFlightExplicitKeys(rig) ==
+          std::vector<RigExecExplicitJobKey>{after.Key()});
+    CHECK(scheduler.ReservedExplicitBytesFor(rig) == 1024);
+    CHECK(scheduler.Stats().explicitRunning == 1);
+    {
+        std::lock_guard<std::mutex> lock(heldMutex);
+        heldRelease = true;
+    }
+    heldCv.notify_all();
+    scheduler.WaitUntilIdle();
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 0);
+    CHECK(scheduler.ReservedExplicitBytes() == 0);
+    const RigExecBackgroundSchedulerStats drained = scheduler.Stats();
+    CHECK(drained.explicitAccepted == 2);
+    CHECK(drained.explicitPublished == 2);
+    CHECK(recorder.Runs().size() == 1);
+    CHECK(recorder.Runs().back().currentAtPublish);
+    CHECK(ExplicitBalanceHolds(drained));
+}
+
+// A coalescing admission is an accept that queues nothing, so it moves both
+// counters: accepted minus coalesced stays the number of jobs that reserved a
+// slot, which is what the terminal and outstanding counters add up to before
+// and after the drain.
+void
+TestExplicitCoalescingKeepsTheAcceptBalance()
+{
+    RigExecBackgroundScheduler scheduler(/*workerCount=*/0);
+    ExplicitRecorder recorder;
+    const SdfPath rig("/Asset/Rig");
+    const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
+    RigExecExplicitRequest first =
+        MakeExplicitRequest(rig, NumericTime(5.0), 1, 0, 0, 0, /*bytes=*/32);
+    first.editGeneration = current;
+    const RigExecExplicitRequest duplicate = first;
+    CHECK(scheduler.AdmitExplicitOutput(first, recorder.Work()));
+    CHECK(scheduler.AdmitExplicitOutput(duplicate, recorder.Work()));
+    CHECK(scheduler.AdmitExplicitOutput(duplicate, recorder.Work()));
+
+    RigExecBackgroundSchedulerStats stats = scheduler.Stats();
+    CHECK(stats.explicitAccepted == 3);
+    CHECK(stats.explicitCoalesced == 2);
+    CHECK(stats.explicitQueuedDepth == 1);
+    CHECK(stats.explicitRunning == 0);
+    CHECK(stats.explicitReservedBytes == 32);
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 1);
+    CHECK(ExplicitBalanceHolds(stats));
+
+    CHECK(scheduler.DrainQueueForTesting() == 1);
+    stats = scheduler.Stats();
+    CHECK(stats.explicitPublished == 1);
+    CHECK(stats.explicitCompleted == 1);
+    CHECK(stats.explicitQueuedDepth == 0);
+    CHECK(stats.explicitRunning == 0);
+    CHECK(stats.explicitReservedBytes == 0);
+    CHECK(recorder.Runs().size() == 1);
+    CHECK(ExplicitBalanceHolds(stats));
+
+    // The same key after the drain is a new job, not a merge, and the
+    // equation still closes.
+    CHECK(scheduler.AdmitExplicitOutput(duplicate, recorder.Work()));
+    stats = scheduler.Stats();
+    CHECK(stats.explicitAccepted == 4);
+    CHECK(stats.explicitCoalesced == 2);
+    CHECK(stats.explicitQueuedDepth == 1);
+    CHECK(ExplicitBalanceHolds(stats));
+    CHECK(scheduler.DrainQueueForTesting() == 1);
+    stats = scheduler.Stats();
+    CHECK(stats.explicitPublished == 2);
+    CHECK(stats.explicitQueuedDepth == 0);
+    CHECK(ExplicitBalanceHolds(stats));
+}
+
 // Playback advance sheds speculative sweep only: a frame a host asked for is
 // never shed, and its reservation stands until the job runs.
 void
@@ -2927,6 +3120,8 @@ main()
     TestCancelExplicitJobPurgesExactlyOneJob();
     TestResetRigClearsExplicitState();
     TestExplicitMidRunCancelKeepsTheBooksBalanced();
+    TestResetRigKeepsTheRunningExplicitCount();
+    TestExplicitCoalescingKeepsTheAcceptBalance();
     TestPlaybackAdvanceNeverShedsExplicitOutput();
     TestTransitionHookReportsExplicitMoves();
     TestExplicitWorkRunsUnderTheSerialScopeWithItsRequest();

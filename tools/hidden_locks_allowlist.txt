@@ -228,6 +228,7 @@ libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_m
 libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
 libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
 libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);
 libs/rigExec/outputSubscription.cpp | lock | mutable std::mutex _mutex;
 
 libs/rigExec/parallel.cpp | env | return TfGetEnvSetting(RIGEXEC_ENABLE_PARALLEL_EVAL);

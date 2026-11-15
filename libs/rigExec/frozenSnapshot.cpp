@@ -125,6 +125,7 @@ _CloneImpl(const RigExecBakedProgramImpl &src, RigExecBakedProgramImpl *dst,
     D.cycleSkipReasons = src.cycleSkipReasons;
     D.solverGuidesEnabled = nullptr;
     D.hasPropertyChains = src.hasPropertyChains;
+    D.programAffinity = src.programAffinity;
     D.paths = src.paths;
     D.pathTexts = src.pathTexts;
     D.index = src.index;

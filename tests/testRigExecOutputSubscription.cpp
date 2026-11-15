@@ -554,6 +554,11 @@ struct Harness {
             for (const RigExecOutputHandle &output : requested.outputs) {
                 RigExecOutputPacket packet;
                 packet.handle = output;
+                // A production extraction stamps the revision its run left, so
+                // the harness names one per captured generation: a poll's
+                // handle can then be pinned by a later request.
+                packet.handle.valueRevision =
+                    requested.captured.inputRevision * 1000ull + 17ull;
                 packet.time = at;
                 packet.programIdentity = requested.catalog->GetCompileEpoch();
                 packet.inputRevision = requested.captured.inputRevision;
@@ -891,6 +896,90 @@ TestTwoClientDedupAndExpansion()
     CHECK(h.cache.CoverageRecordCount() == 1);
     CHECK(h.scheduler->ReservedExplicitBytes() == 0);
     CHECK(h.cache.CoverageHeld().pinned > 0);
+}
+
+// A demand that widens while a frame's job is queued leaves outputs that job
+// never ran. Between that job's completion and the next pump, the un-run
+// output polls Pending with no payload and its event says the frame is not
+// Ready; after the redispatch it reads Ready with the payload the frame's
+// second run produced.
+void
+TestExpandedOutputStaysPendingUntilItsRun()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    std::vector<RigExecSubscriptionEvent> seen;
+    service.SetCompletionCallback(
+        [&seen](const RigExecSubscriptionEvent &event) {
+            seen.push_back(event);
+        });
+    const RigExecOutputTime frame = TimeOf(12.0);
+
+    auto narrow = service.Subscribe(a.root, RequestAt(frame, {a.scalar}));
+    auto widened = service.Subscribe(a.root, RequestAt(frame, {a.transform}));
+    CHECK(narrow.IsValid());
+    CHECK(widened.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 1);
+
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 1);
+    // The launched mask stays exactly what was admitted.
+    CHECK(h.LaunchOutput(0).size() == 1);
+    CHECK(h.LaunchNames(0, a.scalar.semanticKey));
+    CHECK(!h.LaunchNames(0, a.transform.semanticKey));
+
+    const std::vector<RigExecOutputPacket> answered =
+        service.PollResults(narrow);
+    CHECK(answered.size() == 1);
+    CHECK(AllReady(answered));
+    const double marker = MarkerFor("stage-A", frame, h.inputRevision);
+    CHECK(FirstCell(answered.front().payload) == marker);
+
+    const std::vector<RigExecOutputPacket> owed = service.PollResults(widened);
+    CHECK(owed.size() == 1);
+    CHECK(owed.front().status == RigExecOutputStatus::Pending);
+    CHECK(owed.front().payload.IsEmpty());
+    CHECK(owed.front().reason.find("next pump") != std::string::npos);
+
+    // The completion event says the same for every client of that frame: the
+    // record answers one of the two demanded outputs, so the frame is not
+    // Ready and no client is told it is.
+    CHECK(service.PumpCallbacks() == 2);
+    CHECK(seen.size() == 2);
+    for (const RigExecSubscriptionEvent &event : seen) {
+        CHECK(event.status == RigExecOutputStatus::Pending);
+        CHECK(event.answered == 1);
+        CHECK(event.demanded == 1);
+        CHECK(event.reason.find("demanded outputs") != std::string::npos);
+    }
+
+    // The next pump runs the rest as the union, and the owed output then reads
+    // Ready with a real payload.
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 2);
+    CHECK(h.LaunchOutput(1).size() == 2);
+    CHECK(h.LaunchNames(1, a.transform.semanticKey));
+    CHECK(h.LaunchNames(1, a.scalar.semanticKey));
+
+    const std::vector<RigExecOutputPacket> after = service.PollResults(widened);
+    CHECK(after.size() == 1);
+    CHECK(AllReady(after));
+    CHECK(FirstCell(after.front().payload) == marker);
+    CHECK(!after.front().payload.IsEmpty());
+    CHECK(AllReady(service.PollResults(narrow)));
+
+    CHECK(service.PumpCallbacks() == 2);
+    CHECK(seen.size() == 4);
+    for (size_t i = 2; i < seen.size(); ++i) {
+        CHECK(seen[i].status == RigExecOutputStatus::Ready);
+        CHECK(seen[i].answered == 2);
+        CHECK(seen[i].demanded == 2);
+        CHECK(seen[i].reason.empty());
+    }
 }
 
 void
@@ -1238,6 +1327,309 @@ TestCoverageHitPullsNothing()
 }
 
 void
+TestPolledHandleCarriesTheRecordRevision()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    auto open = service.Subscribe(
+        a.root, RequestAt(TimeOf(12.0), {a.scalar, a.points}));
+    CHECK(open.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 1);
+    const std::vector<RigExecOutputPacket> polled = service.PollResults(open);
+    CHECK(polled.size() == 2);
+    CHECK(AllReady(polled));
+
+    // The poll copies the coverage record's packet, so its handle names the
+    // value revision that record materialized even though the request asked
+    // with unconstrained handles.
+    RigExecCoverageKey key;
+    key.rigIdentity = a.catalog->GetRigIdentity();
+    key.compileEpoch = a.epoch;
+    key.time = TimeOf(12.0);
+    key.generation.programIdentity = a.epoch;
+    key.generation.inputRevision = h.inputRevision;
+    RigExecCoverageRecord record;
+    CHECK(h.cache.LookupCoverage(key, &record));
+    CHECK(record.packets.size() == 2);
+    uint64_t standing = 0;
+    for (const RigExecOutputPacket &packet : polled) {
+        const RigExecOutputPacket *held = nullptr;
+        for (const RigExecOutputPacket &candidate : record.packets) {
+            if (candidate.handle.SameTarget(packet.handle))
+                held = &candidate;
+        }
+        CHECK(held != nullptr);
+        if (!held)
+            continue;
+        CHECK(packet.handle.valueRevision == held->handle.valueRevision);
+        CHECK(packet.handle.valueRevision != 0);
+        standing = held->handle.valueRevision;
+    }
+    CHECK(standing != 0);
+
+    // A request pinned to the revision just read answers from that record.
+    std::vector<RigExecOutputHandle> pinned;
+    for (const RigExecOutputPacket &packet : polled)
+        pinned.push_back(packet.handle);
+    auto exact = service.Subscribe(a.root, RequestAt(TimeOf(12.0), pinned));
+    CHECK(exact.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    const std::vector<RigExecOutputPacket> exactPackets =
+        service.PollResults(exact);
+    CHECK(exactPackets.size() == 2);
+    CHECK(AllReady(exactPackets));
+    for (const RigExecOutputPacket &packet : exactPackets)
+        CHECK(packet.handle.valueRevision == standing);
+    CHECK(h.laneRuns == 1);
+
+    // A revision the record does not hold is a different answer: the poll says
+    // so with no payload, and it pulls no second run to invent one.
+    std::vector<RigExecOutputHandle> stale = {a.scalar};
+    stale[0].valueRevision = standing + 1;
+    auto staleSub = service.Subscribe(a.root, RequestAt(TimeOf(12.0), stale));
+    CHECK(staleSub.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    const std::vector<RigExecOutputPacket> stalePackets =
+        service.PollResults(staleSub);
+    CHECK(stalePackets.size() == 1);
+    CHECK(stalePackets[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(stalePackets[0].payload.IsEmpty());
+    CHECK(stalePackets[0].reason.find("the request named") !=
+          std::string::npos);
+    CHECK(h.laneRuns == 1);
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+}
+
+// A program rebuild can leave the compile epoch standing. The host then
+// resolves a catalog of the new compilation, while this subscription's handles
+// name the previous one: the service reports the rebuild rather than pulling a
+// run no program of this rig could answer.
+void
+TestProgramRebuildAtTheStandingEpochRefusesTheOldCatalog()
+{
+    Harness h(1);
+    const RigFixture a = StageA();
+    const RigFixture rebuilt = StageA();
+    // The same rig identity and compile epoch, another compilation: the same
+    // operation count and semantic addresses, no shared compiled-program
+    // identity.
+    CHECK(rebuilt.catalog->GetRigIdentity() == a.catalog->GetRigIdentity());
+    CHECK(rebuilt.catalog->GetCompileEpoch() == a.catalog->GetCompileEpoch());
+    CHECK(rebuilt.catalog->GetProgramAffinity() !=
+          a.catalog->GetProgramAffinity());
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    auto sub = service.Subscribe(a.root, RequestAt(TimeOf(12.0), {a.scalar}));
+    CHECK(sub.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(AllReady(service.PollResults(sub)));
+    CHECK(h.captures == 1);
+    CHECK(h.laneRuns == 1);
+
+    // The evaluator rebuilds its program at the standing epoch, and the host
+    // resolves the new compilation's catalog for this rig.
+    h.catalogs[a.root] = rebuilt.catalog;
+    h.scheduler->CancelGeneration(a.root);
+    service.PumpCallbacks();
+    h.scheduler->WaitUntilIdle();
+
+    const std::vector<RigExecOutputPacket> refused = service.PollResults(sub);
+    CHECK(refused.size() == 1);
+    CHECK(refused[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(refused[0].reason.find("rebuilt its program") != std::string::npos);
+    // Nothing was captured or admitted against a catalog this rig's program
+    // does not answer.
+    CHECK(h.captures == 1);
+    CHECK(h.laneRuns == 1);
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+}
+
+// A re-subscription with the current catalog recovers while its
+// old-compilation sibling stays Invalidated: demand groups carry the
+// compilation that minted the handles, so a rebuild at the standing epoch strands
+// neither client, and closing the old one after the fresh one exists changes
+// nothing for the fresh one.
+void
+TestFreshSubscriptionRecoversAfterAStandingEpochRebuild()
+{
+    Harness h(1);
+    const RigFixture a = StageA();
+    const RigFixture rebuilt = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    auto old = service.Subscribe(a.root, RequestAt(TimeOf(12.0), {a.scalar}));
+    CHECK(old.IsValid());
+    h.scheduler->WaitUntilIdle();
+    CHECK(AllReady(service.PollResults(old)));
+    CHECK(h.laneRuns == 1);
+
+    h.catalogs[a.root] = rebuilt.catalog;
+    h.scheduler->CancelGeneration(a.root);
+    service.PumpCallbacks();
+    h.scheduler->WaitUntilIdle();
+    const std::vector<RigExecOutputPacket> stale = service.PollResults(old);
+    CHECK(stale.size() == 1);
+    CHECK(stale[0].status == RigExecOutputStatus::Invalidated);
+
+    // Re-subscribing with the current catalog is exactly what that refusal
+    // asks for: it lands in its own group and answers.
+    auto fresh =
+        service.Subscribe(a.root, RequestAt(TimeOf(12.0), {rebuilt.scalar}));
+    CHECK(fresh.IsValid());
+    h.scheduler->WaitUntilIdle();
+    service.PumpCallbacks();
+    const std::vector<RigExecOutputPacket> recovered =
+        service.PollResults(fresh);
+    CHECK(recovered.size() == 1);
+    CHECK(AllReady(recovered));
+    CHECK(service.Stats().subscriptions == 2);
+    // Two compilations of one epoch hold separate frames of demand.
+    CHECK(service.Stats().framesDemanded == 2);
+
+    // The old client keeps its own disposition, and it is stable across polls.
+    const std::vector<RigExecOutputPacket> stillStale =
+        service.PollResults(old);
+    CHECK(stillStale.size() == 1);
+    CHECK(stillStale[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(stillStale[0].reason.find("rebuilt its program") !=
+          std::string::npos);
+
+    // A frame no record stands for runs on the new compilation.
+    const int runsBefore = h.laneRuns;
+    auto freshFrame =
+        service.Subscribe(a.root, RequestAt(TimeOf(9.0), {rebuilt.points}));
+    CHECK(freshFrame.IsValid());
+    h.scheduler->WaitUntilIdle();
+    const std::vector<RigExecOutputPacket> atNine =
+        service.PollResults(freshFrame);
+    CHECK(AllReady(atNine));
+    CHECK(h.laneRuns == runsBefore + 1);
+    // The frame cache binds a record to the compile epoch and captured
+    // generation, not to which build minted the handles, so the standing record
+    // answers the re-subscribed frame at that time as well; the new
+    // compilation's own run is the one above.
+
+    // Closing the old client strands nothing the fresh demand depends on.
+    old.Close();
+    service.PumpCallbacks();
+    h.scheduler->WaitUntilIdle();
+    CHECK(AllReady(service.PollResults(fresh)));
+    CHECK(AllReady(service.PollResults(freshFrame)));
+    CHECK(service.Stats().subscriptions == 2);
+    CHECK(service.Stats().framesDemanded == 2);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+}
+
+// A completion answers only the clients of its own compilation: the rebuild
+// leaves the old client with no event from the fresh run, and the fresh client
+// with its own.
+void
+TestRebuildCallbacksStayWithTheirCompilation()
+{
+    Harness h(1);
+    const RigFixture a = StageA();
+    const RigFixture rebuilt = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    auto old = service.Subscribe(a.root, RequestAt(TimeOf(12.0), {a.scalar}));
+    CHECK(old.IsValid());
+    h.scheduler->WaitUntilIdle();
+    CHECK(AllReady(service.PollResults(old)));
+
+    std::vector<RigExecSubscriptionEvent> events;
+    service.SetCompletionCallback(
+        [&events](const RigExecSubscriptionEvent &event) {
+            events.push_back(event);
+        });
+
+    h.catalogs[a.root] = rebuilt.catalog;
+    h.scheduler->CancelGeneration(a.root);
+    service.PumpCallbacks();
+    h.scheduler->WaitUntilIdle();
+    // The old frame's refusal is a poll disposition, not a completion: no event
+    // names the old client.
+    // An event queued by the first run is still waiting when the callback goes
+    // in, so measure from here rather than from an empty queue.
+    const size_t queued = events.size();
+
+    // The same frame, an output the old frame's run never launched: the fresh
+    // compilation has to run it, and its completion belongs to that frame.
+    auto fresh =
+        service.Subscribe(a.root, RequestAt(TimeOf(12.0), {rebuilt.points}));
+    CHECK(fresh.IsValid());
+    h.scheduler->WaitUntilIdle();
+    service.PumpCallbacks();
+    CHECK(AllReady(service.PollResults(fresh)));
+    CHECK(events.size() == queued + 1);
+    if (events.size() > queued) {
+        CHECK(events.back().subscription == fresh.Id());
+        CHECK(events.back().status == RigExecOutputStatus::Ready);
+        CHECK(events.back().time == TimeOf(12.0));
+    }
+    // A Ready event for this frame would contradict the old client's own poll,
+    // which says the rig rebuilt its program under it.
+    for (size_t i = queued; i < events.size(); ++i) {
+        CHECK(events[i].subscription != old.Id());
+    }
+    // The old client is untouched: still Invalidated, still asking for a
+    // re-subscribe, and no second run was made for its frame.
+    const std::vector<RigExecOutputPacket> stale = service.PollResults(old);
+    CHECK(stale.size() == 1);
+    CHECK(stale[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(h.laneRuns == 2);
+}
+
+// A running job from the previous compilation still owns its frame's key when a
+// re-subscribed client asks for that frame. The fresh pump defers instead of
+// registering a demand the pool would fold into the running job, and the fresh
+// client lands once that job reaches its terminal state.
+void
+TestRunningForeignJobCannotOccupyTheFreshFrame()
+{
+    Harness h(1);
+    const RigFixture a = StageA();
+    const RigFixture rebuilt = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const RigExecOutputTime frame = TimeOf(12.0);
+
+    h.gateOpen = false;
+    auto old = service.Subscribe(a.root, RequestAt(frame, {a.scalar}));
+    CHECK(old.IsValid());
+    // The old compilation's job is inside its bodies.
+    CHECK(h.WaitUntilRunning());
+    CHECK(h.laneRuns == 0);
+
+    // The program rebuilds at the standing epoch while that job runs.
+    h.catalogs[a.root] = rebuilt.catalog;
+    auto fresh = service.Subscribe(a.root, RequestAt(frame, {rebuilt.points}));
+    CHECK(fresh.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    CHECK(h.laneRuns == 0);
+    const std::vector<RigExecOutputPacket> waiting = service.PollResults(fresh);
+    CHECK(waiting.size() == 1);
+    CHECK(waiting[0].status == RigExecOutputStatus::Pending);
+
+    // Once the other compilation's job lands, the fresh group's own pump
+    // admits and runs the frame it demands.
+    h.OpenGate();
+    h.scheduler->WaitUntilIdle();
+    service.PumpCallbacks();
+    h.scheduler->WaitUntilIdle();
+    CHECK(h.laneRuns == 2);
+    const std::vector<RigExecOutputPacket> recovered =
+        service.PollResults(fresh);
+    CHECK(AllReady(recovered));
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+}
+
+void
 TestBoundsRefuseBeforeAllocating()
 {
     Harness h;
@@ -1441,12 +1833,27 @@ TestExistingSubscriptionRefusesARecompiledRig()
     CHECK(service.PollResults(sub)[0].status ==
           RigExecOutputStatus::Invalidated);
 
-    // Handles from the current catalog are answered afresh.
+    // Handles from the current catalog are answered afresh. A completion for
+    // that frame answers the current-epoch client only: the stale client's
+    // poll says the rig recompiled under it, and no Ready event contradicts
+    // that.
+    std::vector<RigExecSubscriptionEvent> seen;
+    service.SetCompletionCallback(
+        [&seen](const RigExecSubscriptionEvent &event) {
+            seen.push_back(event);
+        });
     auto fresh =
         service.Subscribe(a.root, RequestAt(frame, {recompiled.scalar}));
     CHECK(fresh.IsValid());
     h.scheduler->DrainQueueForTesting();
     CHECK(h.laneRuns == 2);
+    CHECK(service.PumpCallbacks() == 1);
+    CHECK(seen.size() == 1);
+    if (!seen.empty()) {
+        CHECK(seen[0].subscription == fresh.Id());
+        CHECK(seen[0].status == RigExecOutputStatus::Ready);
+    }
+    CHECK(sub.IsValid());
     const std::vector<RigExecOutputPacket> now = service.PollResults(fresh);
     CHECK(AllReady(now));
     CHECK(now[0].programIdentity == a.epoch + 1);
@@ -1957,6 +2364,7 @@ main()
 {
     TestValidationAndRaii();
     TestTwoClientDedupAndExpansion();
+    TestExpandedOutputStaysPendingUntilItsRun();
     TestUpdateAtomicity();
     TestCancellationKeepsSharedDemand();
     TestDestroyAllReleasesEverything();
@@ -1966,6 +2374,7 @@ main()
     TestExactTimesAcrossRigsAndStages();
     TestExplicitDemandRunsWhileWarmingIsOff();
     TestCoverageHitPullsNothing();
+    TestPolledHandleCarriesTheRecordRevision();
     TestEditAtTheSameFrameRedemandsTheAnswer();
     TestExistingSubscriptionRefusesARecompiledRig();
     TestRefusalOfReplacementWorkEndsTheRetiredAnswer();
@@ -1975,6 +2384,10 @@ main()
     TestWorkEndingInsideAdmissionKeepsItsDisposition();
     TestRefusedAdmissionRollsBackItsDemand();
     TestUnsupportedHandleKeepsItsSiblingsRunnable();
+    TestProgramRebuildAtTheStandingEpochRefusesTheOldCatalog();
+    TestFreshSubscriptionRecoversAfterAStandingEpochRebuild();
+    TestRebuildCallbacksStayWithTheirCompilation();
+    TestRunningForeignJobCannotOccupyTheFreshFrame();
     TestBoundsRefuseBeforeAllocating();
     TestCaptureFailureAndBadGeneration();
     TestCompletionCallback();

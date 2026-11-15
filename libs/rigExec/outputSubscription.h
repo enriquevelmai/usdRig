@@ -15,11 +15,14 @@
 // completion, outside every lock it holds.
 //
 // Demand is shared, never mutated after dispatch: outputs union into one
-// launched mask per exact key, an expansion joins the covered work when the
-// launched mask already answers it and otherwise re-dispatches after the
-// running job's terminal state. Closing a client releases only demand no other
-// live client holds, and releasing every client releases queued work and byte
-// reservations while leaving any live coverage lease untouched.
+// launched mask per exact key — rig, frame, compile epoch, and the compiled
+// program that minted the handles, so a program rebuild at a standing epoch
+// gives a re-subscribed client its own demand rather than the old client's. An
+// expansion joins the covered work when the launched mask already answers it and
+// otherwise re-dispatches after the running job's terminal state. Closing a
+// client releases only demand no other live client holds, and releasing every
+// client releases queued work and byte reservations while leaving any live
+// coverage lease untouched.
 #ifndef RIGEXEC_OUTPUT_SUBSCRIPTION_H
 #define RIGEXEC_OUTPUT_SUBSCRIPTION_H
 

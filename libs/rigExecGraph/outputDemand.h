@@ -244,6 +244,14 @@ struct RigExecOutputTimeDemand {
     std::vector<RigExecOutputHandle> handles;
 };
 
+struct RigExecOutputRequest;
+
+// True when every occurrence of an exact (time, target) in the request names
+// one value revision; declared here so the request's own gate can call it, and
+// defined below, where it can walk the demands.
+inline bool RigExecRequestRevisionsAgree(const RigExecOutputRequest &request,
+                                         std::string *error);
+
 struct RigExecOutputRequest {
     std::vector<RigExecOutputTimeDemand> demands;
     RigExecDemandPolicy policy = RigExecDemandPolicy::Explicit;
@@ -269,12 +277,64 @@ struct RigExecOutputRequest {
                     return fail("output handle has no payload type");
             }
         }
-        return true;
+        return RigExecRequestRevisionsAgree(*this, error);
     }
 };
 
+// True when every occurrence of an exact (time, target) in the request names
+// one value revision, and false with a diagnostic naming the output that names
+// two. Repeating a demand or a handle is that demand written twice and agrees
+// with itself; the same output at another time is a separate answer and never
+// conflicts here. This is the request's own half of the compatibility rule:
+// a request that pins one output at one time to two revisions has no answer a
+// single dispatch gives, so every entry point refuses it the same way.
+inline bool
+RigExecRequestRevisionsAgree(const RigExecOutputRequest &request,
+                             std::string *error)
+{
+    struct Occurrence {
+        RigExecOutputTime time;
+        // The target hash the demand index buckets by; SameTarget settles a
+        // collision, the hash alone never decides identity.
+        std::size_t targetHash = 0;
+        const RigExecOutputHandle *handle = nullptr;
+    };
+    std::vector<Occurrence> occurrences;
+    for (const RigExecOutputTimeDemand &demand : request.demands) {
+        for (const RigExecOutputHandle &handle : demand.handles) {
+            occurrences.push_back({demand.time, handle.Hash(), &handle});
+        }
+    }
+    std::sort(occurrences.begin(), occurrences.end(),
+              [](const Occurrence &a, const Occurrence &b) {
+                  if (!(a.time == b.time))
+                      return a.time < b.time;
+                  return a.targetHash < b.targetHash;
+              });
+    for (size_t i = 0; i < occurrences.size(); ++i) {
+        for (size_t j = i + 1;
+             j < occurrences.size() &&
+             occurrences[j].time == occurrences[i].time &&
+             occurrences[j].targetHash == occurrences[i].targetHash;
+             ++j) {
+            const RigExecOutputHandle &first = *occurrences[i].handle;
+            const RigExecOutputHandle &other = *occurrences[j].handle;
+            if (first.SameTarget(other) &&
+                first.valueRevision != other.valueRevision) {
+                if (error)
+                    *error = "output " + first.semanticKey +
+                             " is demanded at mismatched value revisions";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The index of the merged demand for this exact time, or -1 when the request
-// has none yet.
+// has none yet. A request that repeats a time has more than one demand at it,
+// and this names the first, so a caller that must see every occurrence scans
+// the demands itself.
 inline int
 RigExecFindDemand(const RigExecOutputRequest &request,
                   const RigExecOutputTime &time)
@@ -300,19 +360,21 @@ RigExecFindTarget(const std::vector<RigExecOutputHandle> &handles,
 
 // True when the request asks for this output at this exact time. Revision is
 // part of the comparison: the same output at another revision is a different
-// answer.
+// answer. Every demand at that exact time is searched, not only the first.
 inline bool
 RigExecRequestWants(const RigExecOutputRequest &request,
                     const RigExecOutputHandle &handle,
                     const RigExecOutputTime &time)
 {
-    const int demand = RigExecFindDemand(request, time);
-    if (demand < 0)
-        return false;
-    const std::vector<RigExecOutputHandle> &handles =
-        request.demands[size_t(demand)].handles;
-    const int at = RigExecFindTarget(handles, handle);
-    return at >= 0 && handles[size_t(at)] == handle;
+    for (const RigExecOutputTimeDemand &demand : request.demands) {
+        if (!(demand.time == time))
+            continue;
+        for (const RigExecOutputHandle &asked : demand.handles) {
+            if (asked == handle)
+                return true;
+        }
+    }
+    return false;
 }
 
 // The one rig identity and compile epoch a request names, checked across
@@ -361,11 +423,14 @@ RigExecRequestGroup(const RigExecOutputRequest &request,
 }
 
 // True when two requests can be answered by one dispatch. Every handle of
-// every demand is checked, never one representative handle: both requests
-// must name one rig identity and one compile epoch, and an output demanded at
-// the same exact time by both must be demanded at one value revision.
-// Requests that disagree are two groups; merging them would answer one handle
-// from one revision and another handle from a second.
+// every demand is checked, never one representative handle, and every
+// occurrence of an exact (time, target) is checked, never only the first: both
+// requests must name one rig identity and one compile epoch, each must name one
+// value revision per (time, target) within itself, and an output demanded at
+// the same exact time by both must be demanded at one value revision. Requests
+// that disagree are two groups; merging them would answer one handle from one
+// revision and another handle from a second, so the answer never depends on
+// which request is compared first.
 inline bool
 RigExecRequestsCompatible(const RigExecOutputRequest &a,
                           const RigExecOutputRequest &b,
@@ -376,6 +441,10 @@ RigExecRequestsCompatible(const RigExecOutputRequest &a,
     if (!RigExecRequestGroup(a, &aRig, &aEpoch, error))
         return false;
     if (!RigExecRequestGroup(b, &bRig, &bEpoch, error))
+        return false;
+    if (!RigExecRequestRevisionsAgree(a, error))
+        return false;
+    if (!RigExecRequestRevisionsAgree(b, error))
         return false;
     if (aRig != bRig) {
         if (error)
@@ -388,19 +457,20 @@ RigExecRequestsCompatible(const RigExecOutputRequest &a,
         return false;
     }
     for (const RigExecOutputTimeDemand &demand : a.demands) {
-        const int at = RigExecFindDemand(b, demand.time);
-        if (at < 0)
-            continue;
-        const std::vector<RigExecOutputHandle> &other =
-            b.demands[size_t(at)].handles;
-        for (const RigExecOutputHandle &handle : demand.handles) {
-            const int found = RigExecFindTarget(other, handle);
-            if (found >= 0 &&
-                other[size_t(found)].valueRevision != handle.valueRevision) {
-                if (error)
-                    *error = "output " + handle.semanticKey +
-                             " is demanded at mismatched value revisions";
-                return false;
+        for (const RigExecOutputTimeDemand &other : b.demands) {
+            if (!(demand.time == other.time))
+                continue;
+            for (const RigExecOutputHandle &handle : demand.handles) {
+                for (const RigExecOutputHandle &candidate : other.handles) {
+                    if (candidate.SameTarget(handle) &&
+                        candidate.valueRevision != handle.valueRevision) {
+                        if (error)
+                            *error = "output " + handle.semanticKey +
+                                     " is demanded at mismatched value "
+                                     "revisions";
+                        return false;
+                    }
+                }
             }
         }
     }
@@ -830,10 +900,12 @@ struct RigExecOutputDemandEntry {
 // Merge requests of one compiled rig into one request. Handles merge only
 // inside the demand for the same exact time: an output asked for at frame 12
 // never picks up a frame it was not asked for, so a union can never name a
-// (handle, time) pair no host requested. A target demanded at one time by two
-// requests at different value revisions is refused rather than resolved to
-// one of them: the merged request comes back empty with a diagnostic, and the
-// caller dispatches the groups separately.
+// (handle, time) pair no host requested. The merged request holds one demand
+// per exact time, and an identical duplicate appears in it once. A target
+// demanded at one time at two revisions is refused rather than resolved to one
+// of them, whether the two revisions come from two requests or from duplicates
+// inside one demand: the merged request comes back empty with a diagnostic,
+// and the caller dispatches the groups separately.
 inline RigExecOutputRequest
 RigExecUnionRequests(const std::vector<RigExecOutputRequest> &requests,
                      std::string *error = nullptr)
@@ -868,10 +940,15 @@ RigExecUnionRequests(const std::vector<RigExecOutputRequest> &requests,
         }
         explicitRequested |= request.policy == RigExecDemandPolicy::Explicit;
         for (const RigExecOutputTimeDemand &demand : request.demands) {
+            // Handles merge one at a time, never a demand copied wholesale:
+            // a duplicate inside the demand being merged is then checked like
+            // any other occurrence, so identical duplicates coalesce and a
+            // second revision for one (time, target) is refused.
             int at = RigExecFindDemand(merged, demand.time);
             if (at < 0) {
-                merged.demands.push_back(demand);
-                continue;
+                merged.demands.push_back(RigExecOutputTimeDemand{});
+                merged.demands.back().time = demand.time;
+                at = int(merged.demands.size()) - 1;
             }
             std::vector<RigExecOutputHandle> &existing =
                 merged.demands[size_t(at)].handles;

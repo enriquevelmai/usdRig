@@ -1,7 +1,7 @@
 // The subscription lifecycle implementation: demand bookkeeping on the owner
-// thread, one bounded job per exact (rig, epoch, frame, captured generation) on
-// the existing pool, coverage publication, and pinned answers for polling
-// clients.
+// thread, one bounded job per exact (rig, epoch, compilation, frame, captured
+// generation) on the existing pool, coverage publication, and pinned answers
+// for polling clients.
 //
 // Lock discipline. The state mutex guards the client, group, demand and pin
 // maps only. It is never held across a host hook, a frame-cache call, a pool
@@ -19,12 +19,15 @@
 namespace rigExec {
 namespace {
 
-// One frame of one rig at one compiled epoch: the unit demand unions into, and
-// the unit one launched mask belongs to.
+// One frame of one rig at one compiled epoch of one compilation: the unit
+// demand unions into, and the unit one launched mask belongs to. A program
+// rebuild can leave the epoch standing, so the epoch alone does not say whose
+// catalog and compile-local slots a frame's work belongs to.
 struct _GroupKey {
     SdfPath rig;
     RigExecOutputTime time;
     uint64_t compileEpoch = 0;
+    std::shared_ptr<const RigExecProgramAffinity> affinity;
 
     bool operator<(const _GroupKey &other) const
     {
@@ -34,7 +37,10 @@ struct _GroupKey {
         if (!(time == other.time)) {
             return time < other.time;
         }
-        return compileEpoch < other.compileEpoch;
+        if (compileEpoch != other.compileEpoch) {
+            return compileEpoch < other.compileEpoch;
+        }
+        return affinity.get() < other.affinity.get();
     }
 };
 
@@ -57,6 +63,28 @@ _HandleLess(const RigExecOutputHandle &a, const RigExecOutputHandle &b)
         return a.compileEpoch < b.compileEpoch;
     }
     return a.valueRevision < b.valueRevision;
+}
+
+// True when these packets answer every output the frame demands now, which can
+// be wider than the mask one launched job ran.
+bool
+_AnswersEvery(const std::vector<RigExecOutputHandle> &desired,
+              const std::vector<RigExecOutputPacket> &packets)
+{
+    for (const RigExecOutputHandle &handle : desired) {
+        bool answered = false;
+        for (const RigExecOutputPacket &packet : packets) {
+            if (packet.status == RigExecOutputStatus::Ready &&
+                packet.handle.SameTarget(handle)) {
+                answered = true;
+                break;
+            }
+        }
+        if (!answered) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // One payload the service pins for its live clients. The frame cache holds one
@@ -292,8 +320,9 @@ public:
                         packets.push_back(std::move(packet));
                         continue;
                     }
+                    // The record's handle names the revision its run
+                    // materialized; the request's may be a wildcard.
                     packet = *answer;
-                    packet.handle = handle;
                     const _PinKey pinKey{*answeredKey, answer->handle};
                     if (!client->pins.count(pinKey)) {
                         toPin.push_back(pinKey);
@@ -303,6 +332,14 @@ public:
                 }
                 packet.status = view.status;
                 packet.reason = view.reason;
+                if (view.status == RigExecOutputStatus::Ready) {
+                    // The frame's status says how its launched mask ended, not
+                    // that this output answered: an output no record covers is
+                    // owed, and never inherits its sibling's Ready.
+                    packet.status = RigExecOutputStatus::Pending;
+                    packet.reason = "no materialized answer for this output at "
+                                    "this frame; the next pump demands it";
+                }
                 packets.push_back(std::move(packet));
             }
         }
@@ -424,6 +461,10 @@ private:
         uint64_t compileEpoch = 0;
         RigExecOutputRequest request;
         std::shared_ptr<const RigExecOutputCatalog> catalog;
+        // The compilation that minted this client's handles, taken from its
+        // catalog: what separates a client from one re-subscribed after a
+        // program rebuild at the same epoch.
+        std::shared_ptr<const RigExecProgramAffinity> affinity;
         // Named outputs the catalog cannot produce, with its reason.
         std::vector<std::pair<RigExecOutputHandle, std::string>> unsupported;
         std::set<_PinKey> pins;
@@ -432,6 +473,8 @@ private:
     struct Demand {
         RigExecExplicitJobKey key;
         RigExecCoverageKey coverage;
+        // The compilation this job runs, matching its group and its catalog.
+        std::shared_ptr<const RigExecProgramAffinity> affinity;
         // The union this job answers, fixed at admission: a launched mask is
         // never widened afterwards.
         std::vector<RigExecOutputHandle> outputs;
@@ -511,6 +554,7 @@ private:
         client->compileEpoch = compileEpoch;
         client->request = request;
         client->catalog = catalog;
+        client->affinity = catalog->GetProgramAffinity();
         size_t producible = 0;
         for (const RigExecOutputTimeDemand &demand : request.demands) {
             for (const RigExecOutputHandle &handle : demand.handles) {
@@ -550,7 +594,8 @@ private:
     static _GroupKey _GroupOf(const Client &client,
                               const RigExecOutputTime &time)
     {
-        return _GroupKey{client.rig, time, client.compileEpoch};
+        return _GroupKey{client.rig, time, client.compileEpoch,
+                         client.affinity};
     }
 
     static const RigExecOutputHandle *_Refused(const Client &client,
@@ -721,21 +766,22 @@ private:
     // at shutdown. Its demand is owed again.
     void _PruneRetiredLocked()
     {
-        std::map<SdfPath, std::vector<RigExecExplicitJobKey>> queued;
+        std::map<SdfPath, std::vector<std::shared_ptr<Demand>>> queued;
         for (const auto &entry : _demands) {
-            queued[entry.first.rig].push_back(entry.first);
+            queued[entry.first.rig].push_back(entry.second);
         }
         for (const auto &entry : queued) {
             const std::vector<RigExecExplicitJobKey> standing =
                 _host.scheduler->InFlightExplicitKeys(entry.first);
-            for (const RigExecExplicitJobKey &key : entry.second) {
-                if (std::find(standing.begin(), standing.end(), key) !=
+            for (const std::shared_ptr<Demand> &job : entry.second) {
+                if (std::find(standing.begin(), standing.end(), job->key) !=
                     standing.end()) {
                     continue;
                 }
-                _RetireDemandLocked(key, RigExecOutputStatus::Pending,
+                _RetireDemandLocked(job->key, RigExecOutputStatus::Pending,
                                     "the pool retired this frame's job; the "
-                                    "next pump re-admits it");
+                                    "next pump re-admits it",
+                                    job->affinity.get());
                 ++_stats.retiredInFlight;
             }
         }
@@ -781,7 +827,8 @@ private:
             keys.swap(it->second.inFlight);
             for (const RigExecExplicitJobKey &key : keys) {
                 _RetireDemandLocked(key, RigExecOutputStatus::Pending,
-                                    "no live subscription demands this frame");
+                                    "no live subscription demands this frame",
+                                    it->first.affinity.get());
                 purges->push_back(key);
             }
             it = _groups.erase(it);
@@ -789,19 +836,24 @@ private:
     }
 
     // Drop one demand and its group link. The queued closure, and with it the
-    // byte reservation, dies wherever the pool retires the job.
+    // byte reservation, dies wherever the pool retires the job. \p affinity is
+    // the compilation that job ran: two compilations of one epoch can name the
+    // same job key, and only the group it belongs to hears about it.
     void _RetireDemandLocked(const RigExecExplicitJobKey &key,
                              RigExecOutputStatus status,
-                             const std::string &reason)
+                             const std::string &reason,
+                             const RigExecProgramAffinity *affinity)
     {
         const auto demand = _demands.find(key);
-        if (demand != _demands.end()) {
+        if (demand != _demands.end() &&
+            (!affinity || demand->second->affinity.get() == affinity)) {
             demand->second->live = false;
             _demands.erase(demand);
         }
         for (auto &group : _groups) {
             if (!(group.first.rig == key.rig && group.first.time == key.time &&
-                  group.first.compileEpoch == key.generation.programIdentity)) {
+                  group.first.compileEpoch == key.generation.programIdentity) ||
+                (affinity && group.first.affinity.get() != affinity)) {
                 continue;
             }
             group.second.inFlight.erase(
@@ -859,6 +911,19 @@ private:
                     "; these outputs were minted at epoch " +
                     std::to_string(catalog->GetCompileEpoch()) +
                     ": re-subscribe with handles from the current catalog");
+            return;
+        }
+        // A program rebuild can leave the epoch standing. Its catalogs name
+        // the previous compilation, and no run of the new program answers them.
+        if (current->GetProgramAffinity() != catalog->GetProgramAffinity()) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _NoteStatusLocked(
+                groupKey, RigExecOutputStatus::Invalidated,
+                "the rig rebuilt its program at epoch " +
+                    std::to_string(current->GetCompileEpoch()) +
+                    "; these outputs were minted from the previous "
+                    "compilation: re-subscribe with handles from the current "
+                    "catalog");
             return;
         }
 
@@ -935,6 +1000,10 @@ private:
         }
 
         RigExecFrozenRequestedRun requested;
+        // One record answers every client of this frame: the job asks for
+        // whatever the run produces, and Poll validates a pinned revision.
+        for (RigExecOutputHandle &handle : demand.handles)
+            handle.valueRevision = 0;
         if (!RigExecMakeFrozenRequestedRun(catalog, demand, capture->captured,
                                            &requested, &error)) {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -947,6 +1016,7 @@ private:
         job->key.rig = groupKey.rig;
         job->key.time = groupKey.time;
         job->key.generation = capture->captured;
+        job->affinity = catalog->GetProgramAffinity();
         job->coverage = coverageKey;
         job->outputs = desired;
         job->capture = capture;
@@ -974,6 +1044,20 @@ private:
         // its terminal status back to Pending.
         {
             std::lock_guard<std::mutex> lock(_mutex);
+            // The pool keys a job by rig, frame and captured generation, which
+            // two compilations of one epoch can share. A job already in flight
+            // from another compilation owns that key: this pump waits for it to
+            // reach its terminal state rather than registering a second demand
+            // the pool would fold into the first.
+            const auto standing = _demands.find(job->key);
+            if (standing != _demands.end() &&
+                standing->second->affinity != job->affinity) {
+                _NoteStatusLocked(
+                    groupKey, RigExecOutputStatus::Pending,
+                    "a job admitted from another compilation still owns this "
+                    "frame; the next pump re-admits it");
+                return;
+            }
             _demands.emplace(job->key, job);
             ++_stats.dispatches;
             const auto group = _groups.find(groupKey);
@@ -989,7 +1073,8 @@ private:
             // the reservation dies with this job.
             _RetireDemandLocked(job->key, RigExecOutputStatus::Pending,
                                 "the pool declined this admission; the next "
-                                "pump retries it");
+                                "pump retries it",
+                                job->affinity.get());
             --_stats.dispatches;
             ++_stats.declinedAdmission;
             return;
@@ -1142,9 +1227,10 @@ private:
                                       const std::string &reason)
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        _RetireDemandLocked(job->key, status, reason);
-        _QueueEventsLocked(request.rig, job->coverage.time, status, reason, 0,
-                           job->outputs.size());
+        _RetireDemandLocked(job->key, status, reason, job->affinity.get());
+        _QueueEventsLocked(request.rig, job->coverage.time,
+                           job->key.generation.programIdentity, job->affinity,
+                           status, reason, 0, job->outputs.size());
         return outcome;
     }
 
@@ -1178,11 +1264,14 @@ private:
             demand->second->live = false;
             _demands.erase(demand);
         }
+        RigExecOutputStatus frameStatus = status;
+        std::string frameReason = reason;
         for (auto &group : _groups) {
             if (!(group.first.rig == job->key.rig &&
                   group.first.time == job->key.time &&
                   group.first.compileEpoch ==
-                      job->key.generation.programIdentity)) {
+                      job->key.generation.programIdentity) ||
+                group.first.affinity != job->affinity) {
                 continue;
             }
             group.second.inFlight.erase(
@@ -1190,23 +1279,50 @@ private:
                             group.second.inFlight.end(), job->key),
                 group.second.inFlight.end());
             _RememberCoverageLocked(group.first, job->coverage);
-            group.second.status = status;
-            group.second.reason = reason;
+            RigExecOutputStatus groupStatus = status;
+            std::string groupReason = reason;
+            // A launched mask is fixed at admission, so a demand that widened
+            // while this job ran leaves outputs no packet answers: the frame
+            // owes them to the next pump and is not Ready.
+            if (status == RigExecOutputStatus::Ready &&
+                !_AnswersEvery(group.second.desired, packets)) {
+                groupStatus = RigExecOutputStatus::Pending;
+                groupReason = "the frame's run answered " +
+                              std::to_string(answered) + " of " +
+                              std::to_string(group.second.desired.size()) +
+                              " demanded outputs; the rest waits for the "
+                              "next pump";
+            }
+            group.second.status = groupStatus;
+            group.second.reason = groupReason;
+            if (status == RigExecOutputStatus::Ready &&
+                groupStatus != RigExecOutputStatus::Ready) {
+                frameStatus = groupStatus;
+                frameReason = groupReason;
+            }
         }
-        _QueueEventsLocked(request.rig, job->coverage.time, status, reason,
-                           answered, job->outputs.size());
+        _QueueEventsLocked(request.rig, job->coverage.time,
+                           job->key.generation.programIdentity, job->affinity,
+                           frameStatus, frameReason, answered,
+                           job->outputs.size());
     }
 
     // One event per live client of the frame. Pump drops an event whose client
-    // closed before it ran.
-    void _QueueEventsLocked(const SdfPath &rig, const RigExecOutputTime &time,
-                            RigExecOutputStatus status,
-                            const std::string &reason, size_t answered,
-                            size_t demanded)
+    // closed before it ran. A client whose handles were minted at another
+    // compile epoch, or by another compilation of this epoch, is not answered
+    // by this run and gets no event: its poll already says the rig rebuilt
+    // under it.
+    void _QueueEventsLocked(
+        const SdfPath &rig, const RigExecOutputTime &time,
+        uint64_t compileEpoch,
+        const std::shared_ptr<const RigExecProgramAffinity> &affinity,
+        RigExecOutputStatus status, const std::string &reason, size_t answered,
+        size_t demanded)
     {
         for (const auto &entry : _clients) {
             const Client &client = *entry.second;
-            if (!(client.rig == rig)) {
+            if (!(client.rig == rig) || client.compileEpoch != compileEpoch ||
+                client.affinity != affinity) {
                 continue;
             }
             size_t handles = 0;

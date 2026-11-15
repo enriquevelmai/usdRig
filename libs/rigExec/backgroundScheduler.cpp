@@ -530,11 +530,14 @@ RigExecBackgroundScheduler::ResetRig(const SdfPath &rig)
         it = _queue.erase(it);
     }
     _inFlight.erase(rig);
-    _explicitInFlight.erase(rig);
     _explicitOrdinal.erase(rig);
-    // Byte reservations are not swept here: purged jobs released theirs, and
-    // what remains belongs to jobs still running, which release it when they
-    // finish. Subtracting the map entry would count those bytes twice.
+    // Explicit in-flight counts and byte reservations are not swept here: the
+    // purged jobs above released theirs through _RetireQueuedJobLocked, and
+    // what remains belongs to jobs still running, which release both when they
+    // finish. Erasing the count would let a re-admitted job pass the per-rig
+    // cap beside a running one, and the running job's completion would then
+    // subtract from the new count; subtracting the bytes would count them
+    // twice.
     if (!retired.empty()) {
         _profiler.RecordSchedulerCancel(retired.size(), "reset");
     }
@@ -857,7 +860,11 @@ RigExecBackgroundScheduler::AdmitExplicitOutput(
     // revision, or a subframe step can never be answered by -- or overwrite
     // -- the queued job's answer.
     const RigExecExplicitJobKey key = request.Key();
+    // A coalescing is an accept that queues nothing, so it moves both
+    // counters: the books keep accepted - coalesced == jobs that reserved a
+    // slot, which is what every terminal path below balances against.
     if (_queuedExplicitByKey.find(key) != _queuedExplicitByKey.end()) {
+        ++_explicitAccepted;
         ++_explicitCoalesced;
         return true;
     }

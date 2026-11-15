@@ -601,17 +601,20 @@ class ExecStackPanel(QtWidgets.QDialog):
         self.Rebuild()
 
     def _OnPrimSelection(self, added=None, removed=None):
-        """A prim picked in the viewport names the outputs to inspect."""
+        """A prim picked in the viewport names the outputs to inspect.
+
+        The signal carries two sets of Sdf.Path, not prims
+        (Usdviewq/selectionDataModel.py), and its path is what names an
+        exported output.
+        """
         if not self.isVisible():
             return
-        for prim in (added or ()):
-            try:
-                path = str(prim.GetPath())
-            except Exception:
-                continue
-            if path:
-                self._InspectPath(path)
-                return
+        picked = sorted(str(path) for path in (added or ()) if str(path))
+        if not picked:
+            return
+        # The selection never empties, so a pick that leaves only usdview's
+        # standing root path inspects the root; otherwise a named prim wins.
+        self._InspectPath(next((p for p in picked if p != "/"), picked[0]))
 
     def showEvent(self, event):
         # A hidden panel skipped its ticks: catch up on what the service

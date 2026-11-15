@@ -439,10 +439,13 @@ RigExecDiscoverOutputs(const RigExecBakedProgram &program,
     const RigExecBakedProgramImpl &compiled = program.GetStepGraph();
     if (!compiled.opAdapter.compiled)
         return fail("baked program has no canonical operation graph");
+    if (!compiled.programAffinity)
+        return fail("baked program has no compiled-program identity");
 
     RigExecOutputCatalog result;
     result.rigIdentity_ = rigIdentity;
     result.compileEpoch_ = compileEpoch;
+    result.programAffinity_ = compiled.programAffinity;
     std::map<std::string, size_t> semanticKeys;
     if (!AddPropertyOutputs(compiled, rigIdentity, compileEpoch, &semanticKeys,
                             &result.bindings_, error) ||

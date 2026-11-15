@@ -308,18 +308,25 @@ RigExecImagingRegistry::_AdmitDemandWork(const std::vector<double> &times)
             const RigExecRigEvaluator &evaluator =
                 session.bridge->GetEvaluator();
             const uint64_t epoch = evaluator.GetCompiledRigSignature();
+            const RigExecBakedProgram *program = evaluator.GetBakedProgram();
+            const std::shared_ptr<const RigExecProgramAffinity> affinity =
+                program ? program->GetProgramAffinity() : nullptr;
             _DemandCatalogEntry &entry = _demandCatalogs[session.rigPath];
-            if (entry.epoch != epoch) {
+            // A catalog names one compilation, and a program rebuild mints a
+            // new identity without moving the epoch, so both have to stand
+            // before this entry can answer an exact request.
+            if (entry.epoch != epoch || entry.affinity != affinity) {
                 entry.epoch = epoch;
+                entry.affinity = affinity;
                 entry.catalog.reset();
-                auto catalog = std::make_shared<RigExecOutputCatalog>();
-                std::string error;
-                const RigExecBakedProgram *program =
-                    evaluator.GetBakedProgram();
-                if (program && RigExecDiscoverOutputs(
-                                   *program, session.rigPath.GetString(), epoch,
-                                   catalog.get(), &error)) {
-                    entry.catalog = std::move(catalog);
+                if (program) {
+                    auto catalog = std::make_shared<RigExecOutputCatalog>();
+                    std::string error;
+                    if (RigExecDiscoverOutputs(*program,
+                                               session.rigPath.GetString(),
+                                               epoch, catalog.get(), &error)) {
+                        entry.catalog = std::move(catalog);
+                    }
                 }
             }
             if (!entry.catalog) {

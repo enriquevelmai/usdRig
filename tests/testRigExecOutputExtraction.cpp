@@ -1473,6 +1473,58 @@ TestNoBaseAtTheFrameAnswersWithAStatus()
     CHECK(BytesOf(atSampled.front()) == held);
 }
 
+/// A catalog from another compilation, however alike the two graphs look,
+/// cannot answer this program's values.
+void
+TestForeignCatalogCannotAnswerThisProgram()
+{
+    Rig rig = BuildRig();
+    Rig twin = BuildRig();
+    if (!rig.program || !twin.program)
+        return;
+
+    // Two independent compilations of the same stage: the same operation
+    // count, the same semantic keys, and no shared compiled-program identity.
+    CHECK(rig.catalog.GetDemandIndex().OperationCount() ==
+          twin.catalog.GetDemandIndex().OperationCount());
+    CHECK(rig.catalog.GetProgramAffinity());
+    CHECK(rig.catalog.GetProgramAffinity() !=
+          twin.catalog.GetProgramAffinity());
+    CHECK(rig.program->GetStepGraph().programAffinity ==
+          rig.catalog.GetProgramAffinity());
+
+    const size_t amount = SlotForPhase(rig, kAmount, "final");
+    const size_t twinAmount = SlotForPhase(twin, kAmount, "final");
+    if (amount == size_t(-1) || twinAmount == size_t(-1))
+        return;
+
+    RigExecRequestedRunReport report;
+    std::string error;
+    CHECK(Request(rig, UsdTimeCode::Default(), ClosureFor(rig, {amount}),
+                  &report, &error));
+
+    // The twin's catalog, its handles, its captured epoch, and this program's
+    // run: the request is refused, so no byte computed here is ever labeled
+    // with the twin's rig identity.
+    std::vector<RigExecOutputPacket> foreign;
+    CHECK(!rig.program->ExtractRequestedOutputs(
+        twin.catalog, report, UsdTimeCode::Default(), Captured(twin),
+        HandlesForSlots(twin, {twinAmount}), &foreign, &error));
+    CHECK(foreign.empty());
+    CHECK(error.find("not this program's compiled graph") != std::string::npos);
+
+    // Its own catalog answers the same output.
+    std::vector<RigExecOutputPacket> own;
+    CHECK(rig.program->ExtractRequestedOutputs(
+        rig.catalog, report, UsdTimeCode::Default(), Captured(rig),
+        HandlesForSlots(rig, {amount}), &own, &error));
+    CHECK(own.size() == 1);
+    if (!own.empty()) {
+        CHECK(own.front().status == RigExecOutputStatus::Ready);
+        CHECK(own.front().handle.rigIdentity == "requested-rig");
+    }
+}
+
 } // namespace
 
 int
@@ -1490,6 +1542,7 @@ main()
     TestAnOutputItCannotAnswerHasAStatus();
     TestNoBaseAtTheFrameAnswersWithAStatus();
     TestRetainedPayloadsStandAcrossRuns();
+    TestForeignCatalogCannotAnswerThisProgram();
     if (failures)
         std::printf("%d failures\n", failures);
     return failures ? 1 : 0;

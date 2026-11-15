@@ -3158,6 +3158,9 @@ RigExecBakedProgram::_BuildWithSceneCaptureAttempt(
     }
     auto impl = std::make_unique<RigExecBakedProgramImpl>();
     RigExecBakedProgramImpl &B = *impl;
+    // One compilation, one identity: this is the only place a new one is
+    // minted, and every catalog and frozen clone inherits it from here.
+    B.programAffinity = std::make_shared<RigExecProgramAffinity>();
     B.evaluator = evaluator;
     B.stage = E._stage;
     // What the bodies would otherwise read from the environment or a
@@ -5390,7 +5393,12 @@ RigExecBakedExtractRequestedOutputs(
     const RigExecBakedProgramImpl &B = program;
     if (!B.opAdapter.compiled)
         return fail("baked program has no canonical operation graph");
-    if (catalog.GetDemandIndex().OperationCount() != B.opGraph.ops.size())
+    // The catalog is read by binding id and consulted for storage, so it has
+    // to name THIS compilation: an equally shaped graph from another one
+    // answers with these values under another rig's identity. Affinity is the
+    // identity minted at Build and inherited by frozen clones; operation
+    // counts alone are not.
+    if (!B.programAffinity || catalog.GetProgramAffinity() != B.programAffinity)
         return fail("output catalog is not this program's compiled graph");
 
     // The default frame is its own identity; a numeric one must be a finite
@@ -5615,6 +5623,12 @@ const RigExecBakedProgramImpl &
 RigExecBakedProgram::GetStepGraph() const
 {
     return *_impl;
+}
+
+const std::shared_ptr<const RigExecProgramAffinity> &
+RigExecBakedProgram::GetProgramAffinity() const
+{
+    return _impl->programAffinity;
 }
 
 const std::set<SdfPath> &

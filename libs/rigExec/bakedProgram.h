@@ -139,6 +139,9 @@ std::vector<RigExecUpstreamArrayRow>
 RigExecBakedUpstreamAdmissibleArrays(const RigExecRigEvaluator &evaluator);
 
 struct RigExecRigPose;
+/// The identity of one immutable compiled program, shared by that program's
+/// output catalogs and its frozen clones (outputCatalog.h).
+struct RigExecProgramAffinity;
 /// The program's whole state, declared in bakedProgramImpl.h so that the
 /// files building and running each domain of it can name the same type.
 struct RigExecBakedProgramImpl;
@@ -620,6 +623,14 @@ public:
     /// see it. RigExecBakedProgramImpl is declared in bakedProgramImpl.h,
     /// which only this library's own sources and its tests include.
     const RigExecBakedProgramImpl &GetStepGraph() const;
+
+    /// The identity of this compilation. A catalog RigExecDiscoverOutputs
+    /// builds from this program and every frozen clone of it carry the same
+    /// one, and no other program can name it, so a consumer that pairs a
+    /// catalog with a running program can check the pairing out of the two
+    /// objects it already holds.
+    const std::shared_ptr<const RigExecProgramAffinity> &
+    GetProgramAffinity() const;
 
     /// The steps the last run executed, in completion order, and the step
     /// graph as plain records (bakedTrace.h). Observability only.

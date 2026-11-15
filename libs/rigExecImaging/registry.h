@@ -85,6 +85,7 @@ namespace rigExec {
 
 class RigExecImagingDirectory;
 class RigExecOutputCatalog;
+struct RigExecProgramAffinity;
 struct RigExecWarmWorkspacePool;
 
 /// The span an upstream pull reconstructs (RigExecImagingRegistry::
@@ -1239,11 +1240,13 @@ private:
     /// identity never uses a rounded time.
     struct _DemandCatalogEntry {
         uint64_t epoch = 0;
+        std::shared_ptr<const RigExecProgramAffinity> affinity;
         std::shared_ptr<const RigExecOutputCatalog> catalog;
     };
-    /// The catalog of each rig's current compile epoch, rebuilt when the
-    /// epoch moves. An empty catalog means the epoch cannot answer an exact
-    /// request: the rewarm lane stays that frame's route. _mutex held.
+    /// The catalog of each rig's standing compilation, rebuilt when the epoch
+    /// moves or the program is rebuilt at the same epoch. An empty catalog
+    /// means the epoch cannot answer an exact request: the rewarm lane stays
+    /// that frame's route. _mutex held.
     std::map<SdfPath, _DemandCatalogEntry> _demandCatalogs;
     /// Admits the demanded frames as explicit output requests on the
     /// scheduler, sampling each job's work on the calling (owner) thread

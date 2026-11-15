@@ -59,7 +59,11 @@ nothing here claims their implementation or measures against them.
 - **A request is a set of per-time demands.** Outputs union inside the demand
   for one exact time; a demand for one time never carries an output asked for
   only at another. `RigExecRequestWants` answers whether one (output, time)
-  pair was really requested.
+  pair was really requested, searching every demand at that exact time. Writing
+  one (output, time) twice is that demand written twice and coalesces; naming
+  two value revisions for it has no answer one run gives, so
+  `RigExecRequestRevisionsAgree` refuses it and `IsWellFormed` carries that
+  refusal into every entry point.
 - **Grouping checks every handle.** `RigExecRequestGroup` returns the one rig
   identity and compile epoch a request names, and fails when any handle of any
   demand disagrees. `RigExecRequestsCompatible` compares the groups: same rig
@@ -70,7 +74,9 @@ nothing here claims their implementation or measures against them.
 - **A union never invents a request.** `RigExecUnionRequests` merges handles
   only inside the demand for the same time, never across times, so merging
   never produces a Cartesian product of handles and times that no host asked
-  for. A target demanded at one time at two revisions is refused: the merged
+  for. The merged request holds one demand per exact time and each output once.
+  A target demanded at one time at two revisions is refused, whether the two
+  revisions arrive in separate requests or inside one demand: the merged
   request comes back empty with a diagnostic, and the caller dispatches the
   two groups separately. An explicit request outranks a speculative one.
 - **Every packet carries its status and its whole generation key.** An owner
@@ -177,6 +183,11 @@ is no second evaluator, no fallback walk and no operation named by text.
   produced it, whether clean retained storage stands for it, and whether it
   was missing when the run began. An extractor reads a value only when the
   closure names its producer and the facts say it materialized.
+- **The catalog names one compilation.** A catalog carries the identity its
+  program minted at build, and a frozen clone of that program inherits it, so
+  a catalog discovered from another compilation — even one whose operation
+  graph has the same shape — is refused before any body runs, instead of
+  answering these values under another rig's identity.
 - **An output that did not materialize is reported, not invented.** A value
   the closure did not name answers `Pending` rather than being read out of
   storage that may hold another generation's bytes. A producer that ran and
@@ -204,7 +215,7 @@ whole-frame job, and nothing published: a partial run is not a full pose.
 
 | Declaration | Says |
 | --- | --- |
-| `RigExecMakeFrozenRequestedRun(catalog, demand, captured, out, error)` | Owner thread: resolve one exact frame's demand into the job a lane runs — the union of the named handles' closures, the handles, the captured generation, and the catalog of the epoch that minted them. False, having dispatched nothing, when the catalog does not know a handle, an output has no producer, or the handles belong to another rig or epoch: the caller recaptures rather than dispatching a partial mask. |
+| `RigExecMakeFrozenRequestedRun(catalog, demand, captured, out, error)` | Owner thread: resolve one exact frame's demand into the job a lane runs — the union of the named handles' closures, the handles at the value revisions the caller named, the captured generation, and the catalog of the epoch that minted them. False, having dispatched nothing, when the catalog does not know a handle, an output has no producer, the handles belong to another rig or epoch, or one output is named at two revisions: the caller recaptures rather than dispatching a partial mask. |
 | `RigExecFrozenRequestedRun` | That job: closure, output handles, captured generation, and the catalog of the epoch that minted the handles. Inputs and history ride the same `RigExecFrameInputs` a warming job carries. |
 | `RigExecEvaluateFrozenRequested(context, inputs, requested, runner, scheduler, rig, trace)` | Run the job over `requested`'s closure under the entry point's checks and both generation fences, and answer its outputs. `RigExecFrozenRequestedResult` says which outputs answered, and `error` says why a run declined or was dropped. |
 | `RigExecMakeProductionRequestedStepRunner()` | The serial runner behind that entry: the lane's clone, the job's inputs, the masked executor, the extraction, no publication. |
@@ -335,10 +346,15 @@ it calls; the pool itself does not change, and no second queue appears.
   shutdown — so
   `ReservedExplicitBytes` is zero once the queue has drained. Byte counts come
   from `RigExecPayloadByteCount`, which refuses an overflowing element count
-  before anything allocates.
+  before anything allocates. A job already running is not purged by `ResetRig`:
+  its reservation and its place in the rig's queued-plus-running count stand
+  until it finishes, so the per-rig cap keeps bounding that rig.
 - **The counters split by class.** `RigExecBackgroundSchedulerStats` keeps the
-  warm equations as they were and adds the `explicit*` counters beside them;
-  the transition hook tags every move with its class and says when the time
+  warm equations as they were and adds the `explicit*` counters beside them; a
+  coalescing moves `explicitAccepted` and `explicitCoalesced` together, so
+  `explicitAccepted - explicitCoalesced` is the admissions that reserved a
+  slot, which the terminal and outstanding explicit counters add up to. The
+  transition hook tags every move with its class and says when the time
   names no frame at all.
 
 ## The subscription lifecycle
@@ -350,12 +366,19 @@ frame cache, and hands packets back at `PollResults`. One service per pool and
 cache: the host owns both and keeps them alive until the pool has joined its
 lanes.
 
+Demand unions per rig, frame, compile epoch, and the compiled program that minted
+the handles. A program rebuild can leave the epoch standing, so the epoch alone
+does not say whose compile-local slots a frame's work reads: a client re-subscribed
+with the current catalog gets its own demand, its own captures and its own
+completion events, while a client still holding the previous compilation's handles
+stays `Invalidated` with the re-subscribe reason until it closes.
+
 | Declaration | Says |
 | --- | --- |
 | `Subscribe(rig, request, receipt)` | Validate the request against the rig's current catalog, then demand its frames. A handle naming another rig instance or compile epoch refuses the whole subscription rather than resolving to one of them. The receipt carries the refusal reason and the outputs the catalog can name but cannot produce. |
 | `RigExecSubscriptionHandle` | A live subscription: movable, not copyable. Destroying it closes the subscription, so a host cannot leak one by losing the handle. |
 | `UpdateSubscription(subscription, request)` | Replaces a subscription's request. The new request is validated before the old demand becomes unreferenced. |
-| `PollResults(subscription)` | What stands for each demanded (output, frame) pair, in request order: a packet copied from a coverage record, or the status that stopped it and the reason. Polling evaluates and dispatches nothing. |
+| `PollResults(subscription)` | What stands for each demanded (output, frame) pair, in request order: a packet copied from a coverage record, its handle naming the value revision that record materialized, or the status that stopped it and the reason. A later request may pin that revision. Polling evaluates and dispatches nothing. |
 | `PumpCallbacks()` | Runs what the pool completed since the last pump, delivers the queued events, and re-dispatches the demand a retired generation or a launched-mask expansion left owed. |
 | `SetCompletionCallback` | Installs the owner-thread completion callback (null uninstalls). |
 | `Close`, `CloseAll` | Ends one subscription, or every client, with the same release for each demand that no other client holds. |
@@ -453,14 +476,17 @@ unprobed. Each answer says which part of the machinery refused it:
 | Status | Where it comes from |
 | --- | --- |
 | `Ready` | A coverage record answers the handle at the frame's exact time and generation, and its payload matches the handle's declared layout. |
-| `Pending` | Nothing has answered yet: the demand is not reconciled, or the coverage budget or the pool declined the frame and the next pump retries it. |
+| `Pending` | Nothing has answered yet: the demand is not reconciled, or the coverage budget or the pool declined the frame and the next pump retries it, or the frame's run answered a narrower mask than the demand now names and the rest is owed to the next pump. |
 | `Invalidated` | The capture names another program epoch, the rig recompiled past the epoch the subscription's handles came from, the pool retired the frame while its job ran, or the record's value revision is not the one a non-zero request handle named. |
 | `Unsupported` | The catalog cannot produce the output, or a capture's demand could not be resolved into a job. |
 | `Failed` | The capture hook refused the frame, the run declined, the coverage budget refused the payloads at publish, the cache declined the record, or the run answered fewer outputs than the frame demanded. |
 
 A completion event carries the frame's disposition — `Ready` when the record
 answers every demanded output of that frame, otherwise the status that
-stopped it.
+stopped it. A frame whose run covered only part of the widened demand is not
+Ready: its event says Pending and the next pump runs the rest. A client whose
+handles were minted at another compile epoch receives no event for that frame,
+because the run does not answer it.
 
 ### Retained bytes and backpressure
 

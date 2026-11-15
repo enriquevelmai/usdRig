@@ -1918,6 +1918,11 @@ struct RigExecBakedProgramImpl {
     /// disappearing is a structural edit, which recompiles and rebuilds this
     /// program, so this one is a captured constant and not a pointer.
     bool hasPropertyChains = false;
+    /// The identity of this immutable compilation, minted once at Build. Every
+    /// frozen clone inherits it and every catalog discovered from this program
+    /// holds it, which is what lets extraction and a requested run refuse a
+    /// catalog belonging to another compilation before reading either.
+    std::shared_ptr<const RigExecProgramAffinity> programAffinity;
 
     // The slot table is the ordered UNION of the two provider families the
     // dynamic walk holds in one frame map: the RigExec providers exec seeds

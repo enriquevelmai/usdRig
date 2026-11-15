@@ -222,6 +222,26 @@ def main():
         for binding in outputs:
             assert (binding.semantic_key, time) in keyed, (binding, time)
 
+    # The answer names the value revision it materialized, so a host can pin
+    # exactly that in a later request instead of accepting whatever stands.
+    standing = keyed[(points.semantic_key, 2.5)].handle["value_revision"]
+    assert standing, keyed[(points.semantic_key, 2.5)].handle
+    pinned = subs.subscribe([{**points.handle, "value_revision": standing}], 2.5)
+    assert pinned.ok, (pinned.status, pinned.reason)
+    _drain(subs)
+    pinned_packet = _by_key(pinned.poll())[(points.semantic_key, 2.5)]
+    assert pinned_packet.status == subscriptions.READY, (pinned_packet.status,
+                                                        pinned_packet.reason)
+    assert pinned_packet.handle["value_revision"] == standing, \
+        pinned_packet.handle
+    ahead = subs.subscribe([{**points.handle,
+                            "value_revision": standing + 1}], 2.5)
+    assert ahead.ok, (ahead.status, ahead.reason)
+    _drain(subs)
+    ahead_packet = _by_key(ahead.poll())[(points.semantic_key, 2.5)]
+    assert ahead_packet.status == subscriptions.INVALIDATED, (
+        ahead_packet.status, ahead_packet.reason)
+
     def matrix_at(time):
         return keyed[(transform.semantic_key, time)].value.matrix
 
@@ -318,6 +338,35 @@ def main():
     assert tuple(retained.doubles) == snapshot, "a retained payload moved"
     assert _close(retained.point(0)[2], 1.25), tuple(retained.doubles)
     assert _close(retained_matrix[14], -0.5), retained_matrix
+
+    # -- an output that joined the frame while its job ran stays Pending -----
+    # The launched mask is fixed at admission, so the narrow job answers only
+    # its own output. Polling the output that joined mid-flight, before the
+    # next pump, must never copy a Ready packet from its sibling.
+    widening = subs.subscribe([scalar], [21.0])
+    joined = subs.subscribe([points], [21.0])
+    assert widening.ok and joined.ok, (widening.status, joined.status)
+    assert subs.run_next_queued(), "the narrow job never ran"
+    ran_first = _by_key(widening.poll())[(scalar.semantic_key, 21.0)]
+    assert ran_first.status == subscriptions.READY, ran_first.reason
+    unrun = _by_key(joined.poll())[(points.semantic_key, 21.0)]
+    assert unrun.status == subscriptions.PENDING, (unrun.status, unrun.reason)
+    assert not unrun.ready and unrun.value is None, unrun
+    assert not unrun._bytes, unrun
+    assert "next pump" in unrun.reason, unrun.reason
+
+    # The next pump runs the widened demand, and that output then reads Ready
+    # with the payload the frame's second run produced.
+    subs.pump()
+    assert subs.run_next_queued(), "the widened demand was never re-admitted"
+    answered = _by_key(joined.poll())[(points.semantic_key, 21.0)]
+    assert answered.status == subscriptions.READY, answered.reason
+    assert _close(answered.value.point(0)[2],
+                  _expected_tz(Usd, tz_attr, 21.0)), answered.value.points
+    assert _by_key(widening.poll())[(scalar.semantic_key, 21.0)].status == \
+        subscriptions.READY
+    joined.close()
+    widening.close()
 
     # -- an edit at an answered frame re-earns the answer ------------------
     before_edit = subs.stats()

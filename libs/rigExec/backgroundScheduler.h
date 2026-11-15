@@ -592,8 +592,9 @@ struct RigExecBackgroundSchedulerStats {
     uint64_t maxQueueWaitUs = 0;
     uint64_t totalRunUs = 0;
     uint64_t maxRunUs = 0;
-    /// Explicit admissions that reserved a job slot. A coalescing is an
-    /// accept that queued nothing, like a warm merge.
+    /// Explicit admissions the scheduler accepted, coalescings included. A
+    /// coalescing is an accept that queued nothing, like a warm merge, so
+    /// accepted minus coalesced is the jobs that reserved a slot.
     size_t explicitAccepted = 0;
     /// Admissions merged into an already-queued job under the identical key.
     /// Only an identical rig, exact time and whole generation coalesce.

@@ -30,14 +30,15 @@ import rigexec_test_env
 
 rigexec_test_env.SetupPluginTest()
 
-from pxr import Usd, UsdGeom  # noqa: E402
+from pxr import Sdf, Usd, UsdGeom  # noqa: E402
 from pxr.Usdviewq.qt import QtCore, QtWidgets  # noqa: E402
 
 import execStackUI  # noqa: E402
 import outputInspectorModel as insp  # noqa: E402
 import rigexec  # noqa: E402
 from test_output_inspector_model import (  # noqa: E402
-    DATA_PATH, SCALAR_TARGET, SHOWN_FRAME, TZ_SAMPLES, _author_rig)
+    BODY_PATH, DATA_PATH, POINTS_TARGET, SCALAR_TARGET, SHOWN_FRAME,
+    TZ_SAMPLES, _author_rig)
 
 STATUS_WORDS = set(insp.STATUS_LABELS.values())
 
@@ -314,13 +315,18 @@ def main():
     _Check(all(row.time == 4.0 for row in rows), [row.time for row in rows])
 
     # -- a prim picked in the viewport names the request -----------------
+    # The selection data model emits two sets of Sdf.Path, never prims, so
+    # that is exactly what the stand-in emits. Clearing first makes the pick's
+    # effect the only thing that can fill the selection.
+    panel._inspector.Select([])
     data.selection.signalPrimSelectionChanged.emit(
-        [stage.GetPrimAtPath(DATA_PATH)])
-    _Check([panel._inspector.Binding(key).target
-            for key in panel._inspector.Selected()]
-           == [SCALAR_TARGET] * len(panel._inspector.Selected()),
-           [panel._inspector.Binding(key).target
-            for key in panel._inspector.Selected()])
+        {Sdf.Path(DATA_PATH)}, set())
+    scalarKeys = panel._inspector.Selected()
+    _Check(scalarKeys,
+           "a viewport pick left the inspector with no selection")
+    _Check([panel._inspector.Binding(key).target for key in scalarKeys]
+           == [SCALAR_TARGET] * len(scalarKeys),
+           [panel._inspector.Binding(key).target for key in scalarKeys])
     # A blank frame field is the default frame, spelled as the default.
     panel._frameEdit.setText("")
     panel._ApplyFrameEdit()
@@ -337,6 +343,21 @@ def main():
     live = float(rig.evaluate().moved_property(SCALAR_TARGET))
     _Check(_Close(float(final[0].packet.value.scalar), live),
            (final[0].ValueText(), live))
+    # Picking another output's prim replaces the selection with that output's
+    # exact handles: the panel follows the signal rather than keeping its
+    # last pick, and the new pick is demanded at the frame already shown.
+    data.selection.signalPrimSelectionChanged.emit(
+        {Sdf.Path(BODY_PATH)}, {Sdf.Path(DATA_PATH)})
+    bodyKeys = panel._inspector.Selected()
+    _Check(bodyKeys, "picking the body prim left no selection")
+    _Check(set(bodyKeys) != set(scalarKeys),
+           "picking another output answered the same selection")
+    _Check([panel._inspector.Binding(key).target for key in bodyKeys]
+           == [POINTS_TARGET] * len(bodyKeys),
+           [panel._inspector.Binding(key).target for key in bodyKeys])
+    bodyRows = _TickUntilAnswered(panel)
+    _Check(bodyRows and all(row.kind == "points" for row in bodyRows),
+           [(row.kind, row.status) for row in bodyRows])
     # A prim with nothing exported says so instead of emptying the panel.
     panel._InspectPath("/Model/Geom/NoSuchPrim")
     _Check("writes no exported output" in panel._inspectorStatus.text(),

@@ -9654,6 +9654,214 @@ TestFrozenRequestedExpandsAFreshArena()
                            rebuilt);
 }
 
+// A handle pinned to a value revision is a constraint the lane answers
+// against: the job carries the caller's revision, the run answers Ready at the
+// revision it left, and Invalidated at one it does not hold -- the disposition
+// native extraction gives the same request.
+void
+TestFrozenRequestedAnswersThePinnedValueRevision()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/true);
+    if (!rig.frozen || !rig.catalog)
+        return;
+    const size_t legFinal =
+        RequestedSlotFor(*rig.catalog, kRequestedLeg, "final");
+    CHECK(legFinal != size_t(-1));
+    if (legFinal == size_t(-1))
+        return;
+    const std::string legKey =
+        rig.catalog->GetDemandIndex().Handle(legFinal).semanticKey;
+    RigExecFrameInputs inputs;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode(8.0), {},
+                                   &inputs, &error));
+
+    RigExecFrozenRequestedRun open;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode(8.0)),
+        RequestedCaptured(*rig.catalog), &open, &error));
+    CHECK(open.outputs.size() == 1);
+    CHECK(open.outputs.front().valueRevision == 0);
+    const RigExecFrozenRequestedResult first =
+        RunFrozenRequested(rig, inputs, open, nullptr, nullptr);
+    CHECK(first.ran);
+    const RigExecOutputPacket *standing =
+        RequestedPacket(first.packets, legKey);
+    CHECK(standing && standing->status == RigExecOutputStatus::Ready);
+    if (!standing)
+        return;
+    const uint64_t revision = standing->handle.valueRevision;
+
+    RigExecOutputTimeDemand pinnedDemand =
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode(8.0));
+    for (RigExecOutputHandle &handle : pinnedDemand.handles)
+        handle.valueRevision = revision;
+    RigExecFrozenRequestedRun pinned;
+    CHECK(RigExecMakeFrozenRequestedRun(rig.catalog, pinnedDemand,
+                                        RequestedCaptured(*rig.catalog),
+                                        &pinned, &error));
+    CHECK(pinned.outputs.size() == 1);
+    CHECK(pinned.outputs.front().valueRevision == revision);
+
+    const RigExecFrozenRequestedResult exact =
+        RunFrozenRequested(rig, inputs, pinned, nullptr, nullptr);
+    CHECK(exact.ran);
+    const RigExecOutputPacket *exactAnswer =
+        RequestedPacket(exact.packets, legKey);
+    CHECK(exactAnswer && exactAnswer->status == RigExecOutputStatus::Ready);
+    if (exactAnswer) {
+        CHECK(exactAnswer->handle.valueRevision == revision);
+        CHECK(standing->payload.bytes && exactAnswer->payload.bytes);
+        if (standing->payload.bytes && exactAnswer->payload.bytes)
+            CHECK(*standing->payload.bytes == *exactAnswer->payload.bytes);
+    }
+
+    RigExecOutputTimeDemand staleDemand =
+        RequestedDemand(*rig.catalog, {legFinal}, UsdTimeCode(8.0));
+    for (RigExecOutputHandle &handle : staleDemand.handles)
+        handle.valueRevision = uint64_t(-1);
+    RigExecFrozenRequestedRun staleJob;
+    CHECK(RigExecMakeFrozenRequestedRun(rig.catalog, staleDemand,
+                                        RequestedCaptured(*rig.catalog),
+                                        &staleJob, &error));
+    CHECK(staleJob.outputs.size() == 1);
+    CHECK(staleJob.outputs.front().valueRevision == uint64_t(-1));
+    const RigExecFrozenRequestedResult stale =
+        RunFrozenRequested(rig, inputs, staleJob, nullptr, nullptr);
+    CHECK(stale.ran);
+    const RigExecOutputPacket *staleAnswer =
+        RequestedPacket(stale.packets, legKey);
+    CHECK(staleAnswer &&
+          staleAnswer->status == RigExecOutputStatus::Invalidated);
+    CHECK(staleAnswer && staleAnswer->payload.IsEmpty());
+    CHECK(staleAnswer &&
+          staleAnswer->reason.find("the request named") != std::string::npos);
+    const RigExecOutputStatus laneStatus =
+        staleAnswer ? staleAnswer->status : RigExecOutputStatus::Failed;
+
+    RequestedRig nativeRig = BuildRequestedRig(/*evaluateFirst=*/false);
+    std::vector<std::string> reasons;
+    auto holder =
+        RigExecBakedProgram::Build(nativeRig.evaluator.get(), &reasons);
+    auto nativeCatalog = holder ? RequestedCatalog(*holder) : nullptr;
+    CHECK(holder != nullptr);
+    CHECK(nativeCatalog != nullptr);
+    if (!holder || !nativeCatalog)
+        return;
+    const size_t nativeSlot =
+        RequestedSlotFor(*nativeCatalog, kRequestedLeg, "final");
+    CHECK(nativeSlot != size_t(-1));
+    if (nativeSlot == size_t(-1))
+        return;
+    RigExecRequestedRunReport nativeReport;
+    CHECK(holder->RunRequested(
+        UsdTimeCode(8.0), nativeCatalog->GetDemandIndex().Union({nativeSlot}),
+        &nativeReport, &error));
+    RigExecOutputHandle ahead =
+        nativeCatalog->GetDemandIndex().Handle(nativeSlot);
+    ahead.valueRevision = uint64_t(-1);
+    std::vector<RigExecOutputPacket> nativePackets;
+    CHECK(holder->ExtractRequestedOutputs(
+        *nativeCatalog, nativeReport, UsdTimeCode(8.0),
+        RequestedCaptured(*nativeCatalog), {ahead}, &nativePackets, &error));
+    CHECK(nativePackets.size() == 1);
+    if (!nativePackets.empty()) {
+        CHECK(nativePackets.front().status == laneStatus);
+        CHECK(nativePackets.front().payload.IsEmpty());
+    }
+}
+
+// A requested job names the compilation its catalog was discovered from. A
+// catalog from another compilation is refused before the lane runs a single
+// operation, while a clone of the same compilation answers normally.
+void
+TestFrozenRequestedRefusesAForeignCatalog()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/true);
+    RequestedRig twin = BuildRequestedRig(/*evaluateFirst=*/true);
+    if (!rig.frozen || !rig.catalog || !twin.frozen || !twin.catalog)
+        return;
+
+    // The same stage compiled twice: the same operation count and the same
+    // semantic keys, and no shared compiled-program identity. The lane clone
+    // of rig's program inherits rig's affinity.
+    CHECK(rig.catalog->GetDemandIndex().OperationCount() ==
+          twin.catalog->GetDemandIndex().OperationCount());
+    CHECK(rig.catalog->GetProgramAffinity());
+    CHECK(rig.catalog->GetProgramAffinity() !=
+          twin.catalog->GetProgramAffinity());
+    CHECK(rig.frozen->program->programAffinity ==
+          rig.catalog->GetProgramAffinity());
+
+    const size_t leg = RequestedSlotFor(*rig.catalog, kRequestedLeg, "final");
+    const size_t twinLeg =
+        RequestedSlotFor(*twin.catalog, kRequestedLeg, "final");
+    CHECK(leg != size_t(-1));
+    if (leg == size_t(-1) || twinLeg == size_t(-1))
+        return;
+
+    RigExecFrameInputs inputs;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode(8.0), {},
+                                   &inputs, &error));
+
+    RigExecFrozenRequestedRun foreign;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        twin.catalog,
+        RequestedDemand(*twin.catalog, {twinLeg}, UsdTimeCode(8.0)),
+        RequestedCaptured(*twin.catalog), &foreign, &error));
+    CHECK(foreign.catalog == twin.catalog);
+    // A wrapper counting the production runner says whether any operation
+    // executed; the trace alone cannot, because a refused run clears it.
+    const RigExecFrozenRequestedStepRunner production =
+        RigExecMakeProductionRequestedStepRunner();
+    int dispatched = 0;
+    const RigExecFrozenRequestedStepRunner counting =
+        [&](const RigExecFrozenEvalContext &frozenContext,
+            const RigExecFrameInputs &frozenInputs, RigExecFrozenArena &arena,
+            const RigExecFrozenRequestedRun &job,
+            RigExecRequestedRunReport *report,
+            std::vector<RigExecOutputPacket> *packets, std::string *why) {
+            ++dispatched;
+            return production(frozenContext, frozenInputs, arena, job, report,
+                              packets, why);
+        };
+    RigExecFrozenEvalContext context =
+        RequestedContext(*rig.evaluator, *rig.frozen, inputs, rig.lane.get());
+    RigExecFrozenRunReport refusedTrace;
+    const RigExecFrozenRequestedResult refused = RigExecEvaluateFrozenRequested(
+        context, inputs, foreign, counting, nullptr, SdfPath(kRequestedRigPath),
+        &refusedTrace);
+    CHECK(!refused.ran);
+    CHECK(refused.packets.empty());
+    CHECK(refused.error.find("not this program's") != std::string::npos);
+    // Refused ahead of dispatch: the lane executed nothing whose bytes could be
+    // labeled with the twin's rig identity.
+    CHECK(dispatched == 0);
+    CHECK(refusedTrace.region.empty());
+    CHECK(!refusedTrace.ran);
+
+    // The same request through this compilation's own catalog still answers,
+    // so the gate holds the foreign catalog and not the lane itself.
+    RigExecFrozenRequestedRun own;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog, RequestedDemand(*rig.catalog, {leg}, UsdTimeCode(8.0)),
+        RequestedCaptured(*rig.catalog), &own, &error));
+    RigExecFrozenRunReport ownTrace;
+    const RigExecFrozenRequestedResult answered =
+        RigExecEvaluateFrozenRequested(context, inputs, own, counting, nullptr,
+                                       SdfPath(kRequestedRigPath), &ownTrace);
+    CHECK(answered.ran);
+    CHECK(dispatched == 1);
+    CHECK(!ownTrace.region.empty());
+    const std::string legKey =
+        rig.catalog->GetDemandIndex().Handle(leg).semanticKey;
+    const RigExecOutputPacket *packet =
+        RequestedPacket(answered.packets, legKey);
+    CHECK(packet && packet->status == RigExecOutputStatus::Ready);
+}
+
 // A payload a requested run handed out is an immutable lease: every later run
 // on that lane -- another request, then a whole frame job -- leaves the bytes a
 // retained packet describes exactly as they were.
@@ -9870,6 +10078,8 @@ main(int argc, char **argv)
     TestFrozenRequestedMatchesNativeEvaluation();
     TestFrozenRequestedRunsNothingOutsideItsClosure();
     TestFrozenRequestedExpandsAFreshArena();
+    TestFrozenRequestedAnswersThePinnedValueRevision();
+    TestFrozenRequestedRefusesAForeignCatalog();
     TestFrozenRequestedPayloadsStandAcrossLaterRuns();
     TestFrozenRequestedDeclinesAndReports();
     if (argc > 1)

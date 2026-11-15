@@ -396,6 +396,115 @@ TestUnionKeepsPerTimeDemands()
     CHECK(error.find("compile epochs") != std::string::npos);
 }
 
+// One (time, target) has one value revision, however many times a request
+// writes it. Compatibility checks every occurrence and never depends on which
+// request is named first, an internally conflicting request is refused by the
+// request's own gate, and a union refuses a conflict it finds inside the first
+// demand it merges. Duplicates that repeat one revision coalesce, and a
+// revision at another time stays independent.
+void
+TestDuplicateOccurrencesAreChecked()
+{
+    const RigExecOutputTime frame1 = Code(1.0);
+    const RigExecOutputTime frame2 = Code(2.0);
+    const RigExecOutputHandle first = Handle("leftPose", 1);
+    const RigExecOutputHandle second = Handle("leftPose", 2);
+    std::string error;
+
+    // The same demand written twice, and the same handle twice inside one
+    // demand, are one demand.
+    RigExecOutputRequest repeated;
+    repeated.demands.push_back({frame1, {first}});
+    repeated.demands.push_back({frame1, {first}});
+    repeated.demands.push_back({frame1, {first, first}});
+    CHECK(repeated.IsWellFormed(&error));
+    CHECK(RigExecRequestRevisionsAgree(repeated, &error));
+    CHECK(RigExecRequestWants(repeated, first, frame1));
+    CHECK(!RigExecRequestWants(repeated, second, frame1));
+
+    const RigExecOutputRequest single = RequestAt(frame1, {first});
+    CHECK(RigExecRequestsCompatible(single, repeated, &error));
+    CHECK(RigExecRequestsCompatible(repeated, single, &error));
+    const RigExecOutputRequest coalesced =
+        RigExecUnionRequests({repeated, single, repeated}, &error);
+    CHECK(coalesced.demands.size() == 1);
+    CHECK(coalesced.demands.size() == 1 &&
+          coalesced.demands[0].handles.size() == 1);
+    CHECK(RigExecRequestWants(coalesced, first, frame1));
+
+    // A request pinning one output at one time to two revisions cannot be
+    // answered by one run, whichever half of it carries the second demand.
+    RigExecOutputRequest splitTime;
+    splitTime.demands.push_back({frame1, {first}});
+    splitTime.demands.push_back({frame1, {second}});
+    const RigExecOutputRequest splitHandles =
+        RequestAt(frame1, {first, second});
+    CHECK(!splitTime.IsWellFormed(&error));
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+    CHECK(!splitHandles.IsWellFormed(&error));
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+    CHECK(!RigExecRequestRevisionsAgree(splitTime, &error));
+    CHECK(!RigExecRequestRevisionsAgree(splitHandles, &error));
+    CHECK(!RigExecRequestsCompatible(single, splitTime, &error));
+    CHECK(!RigExecRequestsCompatible(splitTime, single, &error));
+    CHECK(!RigExecRequestsCompatible(single, splitHandles, &error));
+    CHECK(!RigExecRequestsCompatible(splitHandles, single, &error));
+    CHECK(!RigExecRequestsCompatible(splitTime, splitHandles, &error));
+
+    // The conflict is on the initial demand, so nothing merges: the union of
+    // that request alone, and of it with a compatible one, comes back empty.
+    CHECK(RigExecUnionRequests({splitTime}, &error).demands.empty());
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+    CHECK(RigExecUnionRequests({splitHandles}, &error).demands.empty());
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+    error.clear();
+    CHECK(RigExecUnionRequests({splitTime, single}, &error).demands.empty());
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+
+    // A conflict carried by the second demand at one time is still one: here
+    // neither request conflicts with itself, and the answer cannot depend on
+    // which request is named first.
+    RigExecOutputRequest hidden;
+    hidden.demands.push_back({frame1, {Handle("jointTransforms", 7)}});
+    hidden.demands.push_back({frame1, {Handle("leftPose", 2)}});
+    const RigExecOutputRequest pinned =
+        RequestAt(frame1, {Handle("leftPose", 1)});
+    CHECK(hidden.IsWellFormed(&error));
+    CHECK(pinned.IsWellFormed(&error));
+    error.clear();
+    CHECK(!RigExecRequestsCompatible(pinned, hidden, &error));
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+    CHECK(!RigExecRequestsCompatible(hidden, pinned, &error));
+    error.clear();
+    CHECK(RigExecUnionRequests({hidden, pinned}, &error).demands.empty());
+    CHECK(error.find("mismatched value revisions") != std::string::npos);
+    error.clear();
+    CHECK(RigExecUnionRequests({pinned, hidden}, &error).demands.empty());
+
+    // Distinct times keep their own revisions, in one request and across two,
+    // and a repeated time keeps every output named at it.
+    RigExecOutputRequest frames;
+    frames.demands.push_back({frame1, {Handle("leftPose", 1)}});
+    frames.demands.push_back({frame2, {Handle("leftPose", 2)}});
+    CHECK(frames.IsWellFormed(&error));
+    CHECK(RigExecRequestsCompatible(frames, single, &error));
+    CHECK(RigExecRequestsCompatible(single, frames, &error));
+    RigExecOutputRequest beside;
+    beside.demands.push_back({frame1, {Handle("jointTransforms", 7)}});
+    beside.demands.push_back({frame1, {Handle("driverField", 3)}});
+    CHECK(beside.IsWellFormed(&error));
+    const RigExecOutputRequest kept =
+        RigExecUnionRequests({frames, beside}, &error);
+    CHECK(kept.IsWellFormed(&error));
+    CHECK(kept.demands.size() == 2);
+    CHECK(RigExecRequestWants(kept, Handle("leftPose", 1), frame1));
+    CHECK(RigExecRequestWants(kept, Handle("leftPose", 2), frame2));
+    CHECK(RigExecRequestWants(kept, Handle("jointTransforms", 7), frame1));
+    CHECK(RigExecRequestWants(kept, Handle("driverField", 3), frame1));
+    CHECK(!RigExecRequestWants(kept, Handle("leftPose", 2), frame1));
+    CHECK(!RigExecRequestWants(kept, Handle("leftPose", 1), frame2));
+}
+
 void
 TestPayloadLayout()
 {
@@ -807,6 +916,7 @@ main()
     TestWellFormedRequest();
     TestRequestGroupValidation();
     TestUnionKeepsPerTimeDemands();
+    TestDuplicateOccurrencesAreChecked();
     TestPayloadLayout();
     TestGenerationKeyAndPacket();
     TestProducersAndClosures();

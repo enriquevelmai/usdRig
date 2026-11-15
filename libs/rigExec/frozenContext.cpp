@@ -417,8 +417,26 @@ RigExecMakeFrozenRequestedRun(
     job.closure = index.Union(producible);
     if (job.closure.Empty())
         return fail("the request closes no operation of this program");
-    for (size_t slot : producible)
-        job.outputs.push_back(index.Handle(slot));
+    // The catalog's handle names no value revision; the demand's handle is the
+    // constraint extraction answers against, so it travels into the job. One
+    // target named at two revisions has no answer one run could give.
+    for (size_t slot : producible) {
+        RigExecOutputHandle output = index.Handle(slot);
+        uint64_t pinned = 0;
+        bool named = false;
+        for (const RigExecOutputHandle &asked : demand.handles) {
+            if (!asked.SameTarget(output))
+                continue;
+            if (named && pinned != asked.valueRevision)
+                return fail(output.semanticKey + " is named at two value "
+                                                 "revisions; one run answers "
+                                                 "one revision");
+            pinned = asked.valueRevision;
+            named = true;
+        }
+        output.valueRevision = pinned;
+        job.outputs.push_back(std::move(output));
+    }
     job.captured = captured;
     job.catalog = catalog;
     *out = std::move(job);
@@ -458,6 +476,16 @@ RigExecEvaluateFrozenRequested(const RigExecFrozenEvalContext &context,
     }
     if (!requested.catalog) {
         result.error = "the job names no output catalog";
+        return result;
+    }
+    // The catalog must name the compilation this context runs, checked before
+    // any operation executes: a job built from another program's catalog would
+    // run this closure and read this storage under another rig's bindings.
+    // A lane cloned from this snapshot holds the same affinity.
+    if (context.frozen && context.frozen->program &&
+        requested.catalog->GetProgramAffinity() !=
+            context.frozen->program->programAffinity) {
+        result.error = "the job's output catalog is not this program's";
         return result;
     }
     if (requested.closure.Empty()) {
