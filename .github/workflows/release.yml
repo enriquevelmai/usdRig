@@ -420,6 +420,55 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout usdRig (version sources for the notes)
+        uses: actions/checkout@v4
+
+      # Every value below is read from its source of truth at publish
+      # time, so the notes cannot restate a stale version: the API
+      # version from CMakeLists.txt, the .rigexec format range from
+      # format.h, and the OpenUSD/Python pins from this workflow.
+      - name: Compatibility notes
+        env:
+          VERSION_NUM: ${{ needs.gate.outputs.version-num }}
+        run: |
+          api="$(sed -n \
+            's/^project(rigExec VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)"
+          format="$(sed -n \
+            's/^inline constexpr uint32_t RigExecFormatVersion = \([0-9]*\);/\1/p' \
+            libs/rigExecBinary/format.h)"
+          oldest="$(sed -n \
+            's/^inline constexpr uint32_t RigExecFormatOldestReadable = \([0-9]*\);/\1/p' \
+            libs/rigExecBinary/format.h)"
+          usd="$(grep -A5 'Checkout OpenUSD' .github/workflows/release.yml | \
+            sed -n 's/.*ref: v\([0-9.]*\)/\1/p' | head -1)"
+          python="$(sed -n \
+            's/.*python-version: "\([0-9.]*\)"/\1/p' \
+            .github/workflows/release.yml | head -1)"
+          for value in "$api" "$format" "$oldest" "$usd" "$python"; do
+            if [ -z "$value" ]; then
+              echo "could not derive a compatibility version" >&2
+              exit 1
+            fi
+          done
+          if [ "$api" != "$VERSION_NUM" ]; then
+            echo "CMake API version $api != release $VERSION_NUM" >&2
+            exit 1
+          fi
+          cat > release-notes.md <<EOF
+          ## Compatibility
+
+          | | |
+          |---|---|
+          | usdRig API | $api (0.x: APIs and file formats may change without notice) |
+          | OpenUSD | $usd with OpenExec (bundled in every download; no separate install needed) |
+          | Python | $python (bundled) |
+          | \`.rigexec\` format | writes format $format; reads formats $oldest-$format |
+          | Platforms | Windows x64, macOS Apple Silicon (macOS 13+), Linux Ubuntu x86-64 |
+
+          The macOS download is signed with Developer ID and notarized by Apple.
+          EOF
+          cat release-notes.md
+
       - name: Download all bundles
         uses: actions/download-artifact@v4
         with:
@@ -452,6 +501,7 @@ jobs:
         with:
           tag_name: ${{ needs.gate.outputs.version }}
           name: usdRig ${{ needs.gate.outputs.version }}
+          body_path: release-notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
