@@ -384,8 +384,25 @@ subscription id and the exact frames the request demands:
 - **Demand is shared; work is not.** Live subscriptions group by rig, exact
   time and compile epoch, and their outputs union into that group's demand.
   Two clients on one frame get one job, one coverage record, and one lease per
-  payload, and a second subscription for an already-answered frame captures and
-  admits nothing.
+  payload, and a second subscription for an already-answered frame captures it
+  again and dispatches nothing.
+- **Coverage is probed at the live generation.** A frame's group keeps one
+  coverage key, the one its latest capture named, and the pump captures before
+  it probes: an edit at a frame whose answers already stand moves the input
+  revision, and only a capture reads what the frame's inputs now stand at. A
+  key from a retired generation is never consulted, and a poll answers only
+  from the key the live generation named, so an edit leaves the frame
+  `Pending` with its new numbers arriving on the next pump rather than
+  repeating the retired values. A frame stays answerable only while a capture
+  validated it: when the pump cannot read the live generation the frame has no
+  answer to give, and when it can but the replacement work is refused -- the
+  coverage budget, the pool's byte bound, or a run the catalog cannot resolve
+  -- the frame lands on that refusal instead of on the retired record.
+- **A recompile leaves the old epoch's demand.** A pump that finds the rig's
+  current catalog at another compile epoch refuses the frame `Invalidated`
+  instead of running the old epoch's job closure against the new program or
+  labelling new answers with the retired epoch. The host re-subscribes with
+  handles from the current catalog.
 - **A launched mask is fixed at admission.** An expansion noticed while the job
   runs is owed the next launch, asked for as the union; the dispatched mask is
   never rewritten.
@@ -405,16 +422,16 @@ subscription id and the exact frames the request demands:
 
 ### What each status means where it comes from
 
-A poll answers each (output, frame) pair from the coverage records that
-frame's group remembers, newest captured first — at most eight generations are
-probed, and an older record stays in the cache until the cache retires it,
-simply unprobed. Each answer says which part of the machinery refused it:
+A poll answers each (output, frame) pair from the coverage record its frame's
+group keys by — the one key at the generation its latest capture named — and
+an older record stays in the cache until the cache retires it, simply
+unprobed. Each answer says which part of the machinery refused it:
 
 | Status | Where it comes from |
 | --- | --- |
 | `Ready` | A coverage record answers the handle at the frame's exact time and generation, and its payload matches the handle's declared layout. |
 | `Pending` | Nothing has answered yet: the demand is not reconciled, or the coverage budget or the pool declined the frame and the next pump retries it. |
-| `Invalidated` | The capture names another program epoch, the pool retired the frame while its job ran, or the record's value revision is not the one a non-zero request handle named. |
+| `Invalidated` | The capture names another program epoch, the rig recompiled past the epoch the subscription's handles came from, the pool retired the frame while its job ran, or the record's value revision is not the one a non-zero request handle named. |
 | `Unsupported` | The catalog cannot produce the output, or a capture's demand could not be resolved into a job. |
 | `Failed` | The capture hook refused the frame, the run declined, the coverage budget refused the payloads at publish, the cache declined the record, or the run answered fewer outputs than the frame demanded. |
 

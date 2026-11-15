@@ -10,11 +10,14 @@ own numbers:
     defaulted;
   * an answer is a read-only copy that stands unchanged across later runs,
     across its subscription's close, and across the service's close;
+  * an edit at an already answered frame is demanded again, not answered from
+    the retired record;
   * leaving a subscription's scope releases its demand, and so does closing it;
   * updating a request replaces its demand, and a recompile makes the handles
-    it was built from stale;
+    it was built from stale -- for a subscription already open too;
   * two clients on one frame get one job, and a subscription for an already
-    answered frame takes a coverage hit instead of pulling the evaluator.
+    answered frame captures the frame and takes a coverage hit instead of
+    pulling the evaluator.
 
 The host drives everything with ``pump()`` and ``poll()`` -- no Qt, no timer,
 and with ``workers=0`` not a thread. The last section runs a real pool.
@@ -316,6 +319,30 @@ def main():
     assert _close(retained.point(0)[2], 1.25), tuple(retained.doubles)
     assert _close(retained_matrix[14], -0.5), retained_matrix
 
+    # -- an edit at an answered frame re-earns the answer ------------------
+    before_edit = subs.stats()
+    tz_attr.Set(9.0, Usd.TimeCode(7.0))
+    _drain(subs)
+    after_edit = subs.stats()
+    # Same frame, same outputs, same demand: only what the frame's inputs
+    # stand at moved. The pump reads that in its own capture, so the frame is
+    # demanded again rather than answered from the retired record.
+    assert after_edit["dispatches"] > before_edit["dispatches"], after_edit
+    assert after_edit["capture_failures"] == 0, after_edit
+    edited = _by_key(fresh.poll())
+    edited_also = _by_key(also.poll())
+    for keyed in (edited, edited_also):
+        for packet in keyed.values():
+            assert packet.status == subscriptions.READY, (packet.semantic_key,
+                                                          packet.status,
+                                                          packet.reason)
+    assert _close(edited[(points.semantic_key, 7.0)].value.point(0)[2],
+                  9.0), edited[(points.semantic_key, 7.0)].value.points
+    assert _close(edited_also[(transform.semantic_key, 7.0)].value.matrix[14],
+                  9.0), edited_also[(transform.semantic_key, 7.0)].value.matrix
+    # The answer polled before the edit still reads what it read then.
+    assert _close(fresh_packet.value.point(0)[2], 3.5), fresh_packet.value.points
+
     # -- update replaces the demand ----------------------------------------
     receipt = second.update([points], [11.0, 12.0])
     assert receipt["status"] == subscriptions.ACCEPTED, receipt
@@ -389,6 +416,20 @@ def main():
     extra = rigexec.Builder.create(stage, "/Rig").new_mover_chain("second")
     extra.add_float_math_mover("again", "add", 1.0, SCALAR_TARGET)
     rig.compile()
+
+    # A subscription already open was built from the retired epoch's handles.
+    # The pump refuses its frames rather than running the old epoch's job
+    # closure over the new program, and stops answering them from the retired
+    # epoch's record.
+    _drain(subs)
+    stale_frames = sub.poll()
+    assert len(stale_frames) == 12, len(stale_frames)
+    for packet in stale_frames:
+        assert packet.status == subscriptions.INVALIDATED, (packet.semantic_key,
+                                                            packet.time,
+                                                            packet.status,
+                                                            packet.reason)
+        assert "epoch" in packet.reason, packet.reason
 
     stale = subs.subscribe([points], [0.0])
     assert stale.status == "stale compile epoch", (stale.status, stale.reason)

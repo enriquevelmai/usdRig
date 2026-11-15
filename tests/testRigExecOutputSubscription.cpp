@@ -593,13 +593,19 @@ AllReady(const std::vector<RigExecOutputPacket> &packets)
 }
 
 RigFixture
-StageA()
+StageAAt(uint64_t epoch)
 {
     return BuildRig(kStageA, SdfPath("/Asset/UnusualContainer/Character"),
                     "/Asset/UnusualContainer/Character/RandomData.amount",
                     "/Asset/UnusualContainer/Character/InputsAnywhere/Drive",
                     "/Asset/UnusualContainer/Geometry/Body.points", "stage-A",
-                    17);
+                    epoch);
+}
+
+RigFixture
+StageA()
+{
+    return StageAAt(17);
 }
 
 RigFixture
@@ -1062,7 +1068,10 @@ TestCoverageHitPullsNothing()
     const size_t acceptedBefore = h.scheduler->Stats().explicitAccepted;
     auto second = service.Subscribe(a.root, request);
     CHECK(second.IsValid());
-    CHECK(h.captures == capturesBefore);
+    // The capture names the generation the frame stands at now, so it runs;
+    // the record at that key already answers, so no job and no lane pull
+    // happens for the second client.
+    CHECK(h.captures == capturesBefore + 1);
     CHECK(h.scheduler->Stats().explicitAccepted == acceptedBefore);
     CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 0);
     CHECK(service.Stats().coverageHits >= 1);
@@ -1186,6 +1195,285 @@ TestCompletionCallback()
     CHECK(seen.size() == 1);
 }
 
+// An edit at a frame whose answers already stand moves the generation, not the
+// time or the demand: the next pump has to notice through its own capture and
+// re-earn the answer instead of handing the retired one out again.
+void
+TestEditAtTheSameFrameRedemandsTheAnswer()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const RigExecOutputTime frame = TimeOf(12.0);
+    auto sub =
+        service.Subscribe(a.root, RequestAt(frame, {a.scalar, a.points}));
+    CHECK(sub.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 1);
+    const std::vector<RigExecOutputPacket> before = service.PollResults(sub);
+    CHECK(AllReady(before));
+    const double oldMarker = MarkerFor("stage-A", frame, h.inputRevision);
+    for (const RigExecOutputPacket &packet : before) {
+        CHECK(FirstCell(packet.payload) == oldMarker);
+        CHECK(packet.inputRevision == h.inputRevision);
+    }
+
+    // Same frame, same outputs, new input value.
+    h.inputRevision = 2;
+    service.PumpCallbacks();
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+    CHECK(service.Stats().coverageHits == 0);
+    const std::vector<RigExecOutputPacket> waiting = service.PollResults(sub);
+    CHECK(AllPending(waiting));
+    for (const RigExecOutputPacket &packet : waiting) {
+        CHECK(packet.payload.IsEmpty());
+    }
+
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 2);
+    const std::vector<RigExecOutputPacket> after = service.PollResults(sub);
+    CHECK(AllReady(after));
+    const double newMarker = MarkerFor("stage-A", frame, h.inputRevision);
+    CHECK(newMarker != oldMarker);
+    for (const RigExecOutputPacket &packet : after) {
+        CHECK(FirstCell(packet.payload) == newMarker);
+        CHECK(packet.inputRevision == 2);
+    }
+    // The retired record stays in the cache; it is simply no longer the key
+    // this frame is probed by.
+    CHECK(h.cache.CoverageRecordCount() == 2);
+    // And the packets handed out before the edit still read what they read
+    // then, with their payloads alive.
+    for (const RigExecOutputPacket &packet : before) {
+        CHECK(FirstCell(packet.payload) == oldMarker);
+        CHECK(packet.inputRevision == 1);
+    }
+    // Each poll holds its own generation's leases until the client leaves.
+    CHECK(service.Stats().pinnedPayloads == 4);
+}
+
+// A subscription made at one compile epoch cannot be answered from another:
+// the capture would run the old epoch's job closure over the new program and
+// label the answers with the retired epoch.
+void
+TestExistingSubscriptionRefusesARecompiledRig()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const RigExecOutputTime frame = TimeOf(12.0);
+    auto sub = service.Subscribe(a.root, RequestAt(frame, {a.scalar}));
+    CHECK(sub.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 1);
+    const std::vector<RigExecOutputPacket> answered = service.PollResults(sub);
+    CHECK(AllReady(answered));
+
+    // The host's catalog hook now names another epoch: the rig recompiled.
+    const RigFixture recompiled = StageAAt(a.epoch + 1);
+    h.catalogs[a.root] = recompiled.catalog;
+    service.PumpCallbacks();
+    const std::vector<RigExecOutputPacket> refused = service.PollResults(sub);
+    CHECK(refused.size() == 1);
+    CHECK(refused[0].status == RigExecOutputStatus::Invalidated);
+    CHECK(refused[0].reason.find("epoch") != std::string::npos);
+    CHECK(refused[0].payload.IsEmpty());
+    service.PumpCallbacks();
+    CHECK(h.laneRuns == 1);
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    CHECK(service.PollResults(sub)[0].status ==
+          RigExecOutputStatus::Invalidated);
+
+    // Handles from the current catalog are answered afresh.
+    auto fresh =
+        service.Subscribe(a.root, RequestAt(frame, {recompiled.scalar}));
+    CHECK(fresh.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 2);
+    const std::vector<RigExecOutputPacket> now = service.PollResults(fresh);
+    CHECK(AllReady(now));
+    CHECK(now[0].programIdentity == a.epoch + 1);
+    CHECK(now[0].payload.bytes != answered[0].payload.bytes);
+}
+
+// Destroying the service with clients still live releases every payload lease
+// it holds, and the release walks the pin map it is editing.
+void
+TestServiceDestructionReleasesEveryLivePin()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    const RigFixture b = StageB();
+    h.catalogs[a.root] = a.catalog;
+    h.catalogs[b.root] = b.catalog;
+    // The handles outlive the service on purpose: the shutdown pass, not a
+    // client closing, is what has to release the pins.
+    std::vector<RigExecSubscriptionHandle> subs;
+    {
+        auto service = h.MakeService();
+        subs.push_back(service.Subscribe(
+            a.root, RequestAt(TimeOf(12.0), {a.scalar, a.points})));
+        subs.push_back(
+            service.Subscribe(a.root, RequestAt(TimeOf(13.0), {a.transform})));
+        subs.push_back(service.Subscribe(
+            b.root, RequestAt(TimeOf(14.0), {b.points, b.transform})));
+        subs.push_back(service.Subscribe(
+            b.root, RequestAt(RigExecOutputTime::Default(), {b.scalar})));
+        h.scheduler->DrainQueueForTesting();
+        CHECK(h.laneRuns == 4);
+        for (const RigExecSubscriptionHandle &sub : subs) {
+            CHECK(AllReady(service.PollResults(sub)));
+        }
+        CHECK(service.Stats().pinnedPayloads == 6);
+        CHECK(h.cache.CoverageHeld().pinned > 0);
+    }
+    // Every lease came back exactly once: the cache charges no pinned bytes
+    // for a service that no longer exists, and the records stay.
+    CHECK(h.cache.CoverageHeld().pinned == 0);
+    CHECK(h.cache.CoverageRecordCount() == 4);
+    CHECK(h.cache.CoverageHeld().payload > 0);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+}
+
+// The last client to leave a frame takes its queued job and its reservation
+// with it, whether it closes or moves its demand.
+void
+TestLastClientLeavingAQueuedJobRetiresIt()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const RigExecOutputTime frame = TimeOf(12.0);
+    auto first = service.Subscribe(a.root, RequestAt(frame, {a.scalar}));
+    auto second = service.Subscribe(a.root, RequestAt(frame, {a.points}));
+    CHECK(first.IsValid() && second.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 1);
+    CHECK(h.scheduler->ReservedExplicitBytes() > 0);
+
+    // One client leaving leaves the shared queued job standing.
+    service.Close(first);
+    CHECK(h.scheduler->Stats().explicitCanceled == 0);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 1);
+    CHECK(service.Stats().demandsInFlight == 1);
+
+    // The last one retires it: the queue loses the job, the group's in-flight
+    // key goes, and the reservation comes back.
+    service.Close(second);
+    CHECK(h.scheduler->Stats().explicitCanceled == 1);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 0);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    CHECK(service.Stats().demandsInFlight == 0);
+    CHECK(service.Stats().framesDemanded == 0);
+    CHECK(h.scheduler->DrainQueueForTesting() == 0);
+    CHECK(h.laneRuns == 0);
+
+    // The same frame demanded again is admitted again.
+    auto later = service.Subscribe(a.root, RequestAt(frame, {a.points}));
+    CHECK(later.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+
+    // An update that moves the demand retires that frame's job while it is
+    // still only queued, and the queue really loses it.
+    const size_t canceledBefore = h.scheduler->Stats().explicitCanceled;
+    const RigExecSubscriptionReceipt moved = service.UpdateSubscription(
+        later, RequestAt(TimeOf(20.0), {a.transform}));
+    CHECK(moved.IsAccepted());
+    CHECK(h.scheduler->Stats().explicitCanceled == canceledBefore + 1);
+    CHECK(h.scheduler->ExplicitInFlightCount(a.root) == 1);
+    CHECK(service.Stats().framesDemanded == 1);
+    CHECK(h.scheduler->DrainQueueForTesting() == 1);
+    CHECK(h.laneRuns == 1);
+    CHECK(AllReady(service.PollResults(later)));
+}
+
+// A frame that already answered is answerable only from the generation its
+// latest capture named. When the replacement work that generation needs is
+// refused -- the coverage budget, the pool's byte bound, or a capture that
+// cannot run -- the retired payload stops answering the frame, while the
+// packet handed out before the edit keeps its bytes.
+void
+TestRefusalOfReplacementWorkEndsTheRetiredAnswer()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const RigExecOutputTime frame = TimeOf(12.0);
+    auto sub = service.Subscribe(a.root, RequestAt(frame, {a.scalar}));
+    CHECK(sub.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 1);
+    const std::vector<RigExecOutputPacket> before = service.PollResults(sub);
+    CHECK(AllReady(before));
+    const double oldMarker = MarkerFor("stage-A", frame, h.inputRevision);
+    CHECK(FirstCell(before[0].payload) == oldMarker);
+    CHECK(h.cache.CoverageRecordCount() == 1);
+
+    // An edit at the answered frame, and the coverage budget declines the job
+    // the new generation needs.
+    h.inputRevision = 2;
+    h.captureBytes = size_t(1) << 40;
+    service.PumpCallbacks();
+    CHECK(service.Stats().declinedCoverageBudget == 1);
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    const std::vector<RigExecOutputPacket> overBudget =
+        service.PollResults(sub);
+    CHECK(overBudget.size() == 1);
+    CHECK(overBudget[0].status == RigExecOutputStatus::Pending);
+    CHECK(overBudget[0].reason.find("budget") != std::string::npos);
+    CHECK(overBudget[0].payload.IsEmpty());
+
+    // The pool's own byte bound declines the same frame, and its coverage
+    // reservation comes back with the refusal.
+    h.captureBytes = 4096;
+    h.scheduler->SetExplicitByteCap(64);
+    service.PumpCallbacks();
+    CHECK(service.Stats().declinedAdmission == 1);
+    CHECK(h.scheduler->Stats().explicitDeclinedBytes == 1);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    const std::vector<RigExecOutputPacket> declined = service.PollResults(sub);
+    CHECK(declined.size() == 1);
+    CHECK(declined[0].status == RigExecOutputStatus::Pending);
+    CHECK(declined[0].reason.find("pool declined") != std::string::npos);
+    CHECK(declined[0].payload.IsEmpty());
+
+    // A capture that cannot read the frame leaves it Failed: nothing validated
+    // this frame's generation, so no standing record answers it.
+    h.scheduler->SetExplicitByteCap(size_t(8) << 20);
+    h.captureOk = false;
+    service.PumpCallbacks();
+    CHECK(service.Stats().captureFailures == 1);
+    const std::vector<RigExecOutputPacket> uncaptured =
+        service.PollResults(sub);
+    CHECK(uncaptured.size() == 1);
+    CHECK(uncaptured[0].status == RigExecOutputStatus::Failed);
+    CHECK(uncaptured[0].reason.find("capture") != std::string::npos);
+    CHECK(uncaptured[0].payload.IsEmpty());
+    h.captureOk = true;
+
+    // The retired record stayed in the cache the whole time, simply not
+    // consulted: lifting the refusals re-earns the frame at the live
+    // generation, and the packet handed out before the edit never moved.
+    CHECK(h.cache.CoverageRecordCount() == 1);
+    service.PumpCallbacks();
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 2);
+    const std::vector<RigExecOutputPacket> after = service.PollResults(sub);
+    CHECK(AllReady(after));
+    const double newMarker = MarkerFor("stage-A", frame, h.inputRevision);
+    CHECK(newMarker != oldMarker);
+    CHECK(FirstCell(after[0].payload) == newMarker);
+    CHECK(after[0].inputRevision == 2);
+    CHECK(h.cache.CoverageRecordCount() == 2);
+    CHECK(FirstCell(before[0].payload) == oldMarker);
+    CHECK(before[0].inputRevision == 1);
+}
+
 void
 TestEstimateAndStatusText()
 {
@@ -1215,6 +1503,11 @@ main()
     TestExactTimesAcrossRigsAndStages();
     TestExplicitDemandRunsWhileWarmingIsOff();
     TestCoverageHitPullsNothing();
+    TestEditAtTheSameFrameRedemandsTheAnswer();
+    TestExistingSubscriptionRefusesARecompiledRig();
+    TestRefusalOfReplacementWorkEndsTheRetiredAnswer();
+    TestServiceDestructionReleasesEveryLivePin();
+    TestLastClientLeavingAQueuedJobRetiresIt();
     TestBoundsRefuseBeforeAllocating();
     TestCaptureFailureAndBadGeneration();
     TestCompletionCallback();

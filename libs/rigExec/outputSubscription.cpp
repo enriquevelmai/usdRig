@@ -128,10 +128,6 @@ _PayloadFloorBytes(const std::vector<RigExecOutputHandle> &handles)
     return bytes;
 }
 
-// How many generations one frame remembers for coverage probes. Older records
-// stay in the cache until the cache retires them; they are simply not probed.
-constexpr size_t kRigExecSubscriptionGenerationWindow = 8;
-
 } // namespace
 
 class RigExecSubscriptionState
@@ -246,7 +242,8 @@ public:
                 _GroupView view;
                 const auto group = _groups.find(key);
                 if (group != _groups.end()) {
-                    view.captured = group->second.captured;
+                    view.coverage = group->second.coverage;
+                    view.hasCoverage = group->second.hasCoverage;
                     view.status = group->second.status;
                     view.reason = group->second.reason;
                 } else {
@@ -276,15 +273,11 @@ public:
                 const RigExecOutputPacket *answer = nullptr;
                 RigExecCoverageRecord record;
                 const RigExecCoverageKey *answeredKey = nullptr;
-                for (const RigExecCoverageKey &key : view.captured) {
-                    if (!_host.frameCache ||
-                        !_host.frameCache->LookupCoverage(key, &record)) {
-                        continue;
-                    }
+                if (view.hasCoverage && _host.frameCache &&
+                    _host.frameCache->LookupCoverage(view.coverage, &record)) {
                     answer = _RecordAnswer(record, handle);
                     if (answer) {
-                        answeredKey = &key;
-                        break;
+                        answeredKey = &view.coverage;
                     }
                 }
                 if (answer) {
@@ -452,8 +445,12 @@ private:
         std::shared_ptr<const RigExecOutputCatalog> catalog;
         std::vector<RigExecOutputHandle> desired;
         std::vector<RigExecExplicitJobKey> inFlight;
-        // The coverage keys this frame was captured under, newest first.
-        std::vector<RigExecCoverageKey> captured;
+        // The coverage key of the generation this frame stands at now, from
+        // the latest capture. A key from a retired generation is not kept:
+        // it would answer a poll with values the current inputs do not stand
+        // for.
+        RigExecCoverageKey coverage;
+        bool hasCoverage = false;
         RigExecOutputStatus status = RigExecOutputStatus::Pending;
         std::string reason;
     };
@@ -464,7 +461,8 @@ private:
     };
 
     struct _GroupView {
-        std::vector<RigExecCoverageKey> captured;
+        RigExecCoverageKey coverage;
+        bool hasCoverage = false;
         RigExecOutputStatus status = RigExecOutputStatus::Pending;
         std::string reason;
     };
@@ -588,7 +586,8 @@ private:
     }
 
     // Call with the state lock held. Stages the client's last lease on each
-    // payload so the caller can drop it outside the lock.
+    // payload so the caller can drop it outside the lock. The pin leaves
+    // `_pins` through this caller's iterator.
     void _CloseClientLocked(uint64_t id)
     {
         const auto found = _clients.find(id);
@@ -602,7 +601,8 @@ private:
             }
             pin->second.clients.erase(id);
             if (pin->second.clients.empty()) {
-                _StagesPinLocked(pinKey);
+                _stagedPins.push_back(std::move(pin->second.lease));
+                _pins.erase(pin);
             }
         }
         _clients.erase(found);
@@ -614,24 +614,18 @@ private:
             _events.end());
     }
 
-    void _StagesPinLocked(const _PinKey &pinKey)
-    {
-        const auto pin = _pins.find(pinKey);
-        if (pin == _pins.end()) {
-            return;
-        }
-        _stagedPins.push_back(std::move(pin->second.lease));
-        _pins.erase(pin);
-    }
-
     // Pins are the owner thread's; releasing one takes a cache shard lock, so
-    // the lease always dies with the state lock closed.
+    // the lease always dies with the state lock closed. The iteration advances
+    // through the erase: restaging by key would free the entry being walked.
     void _StageClientPins(uint64_t id)
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        for (auto &pin : _pins) {
-            if (pin.second.clients.erase(id) && pin.second.clients.empty()) {
-                _StagesPinLocked(pin.first);
+        for (auto pin = _pins.begin(); pin != _pins.end();) {
+            if (pin->second.clients.erase(id) && pin->second.clients.empty()) {
+                _stagedPins.push_back(std::move(pin->second.lease));
+                pin = _pins.erase(pin);
+            } else {
+                ++pin;
             }
         }
     }
@@ -778,8 +772,13 @@ private:
             if (!it->first.time.IsDefault()) {
                 times.push_back(UsdTimeCode(it->first.time.TimeCode()));
             }
-            const bool hadWork = !it->second.inFlight.empty();
-            for (const RigExecExplicitJobKey &key : it->second.inFlight) {
+            // Retirement drops the key from this group's in-flight list, so
+            // the walk takes the list out of the group first: nothing is left
+            // under it to shrink.
+            std::vector<RigExecExplicitJobKey> keys;
+            keys.swap(it->second.inFlight);
+            const bool hadWork = !keys.empty();
+            for (const RigExecExplicitJobKey &key : keys) {
                 _RetireDemandLocked(key, RigExecOutputStatus::Pending,
                                     "no live subscription demands this frame");
             }
@@ -816,12 +815,11 @@ private:
     }
 
     // Capture this frame's job on the owner thread and admit it -- unless the
-    // cache already answers the whole demand, which pulls nothing.
+    // generation that capture names is already answered, which pulls nothing.
     void _CaptureAndAdmit(const _GroupKey &groupKey)
     {
         std::shared_ptr<const RigExecOutputCatalog> catalog;
         std::vector<RigExecOutputHandle> desired;
-        std::vector<RigExecCoverageKey> captured;
         {
             std::lock_guard<std::mutex> lock(_mutex);
             const auto group = _groups.find(groupKey);
@@ -831,19 +829,37 @@ private:
             }
             catalog = group->second.catalog;
             desired = group->second.desired;
-            captured = group->second.captured;
         }
         if (!catalog || !_host.capture) {
             std::lock_guard<std::mutex> lock(_mutex);
+            _DropCoverageLocked(groupKey);
             _NoteStatusLocked(groupKey, RigExecOutputStatus::Failed,
                               "no capture hook for this rig");
             return;
         }
-        if (_CoverageCovers(captured, desired)) {
+        // The epoch the handles were minted at has to be the epoch standing
+        // now: a recompile would otherwise run this epoch's job closure over
+        // the new program and label the answers with the old epoch.
+        const std::shared_ptr<const RigExecOutputCatalog> current =
+            _host.resolveCatalog ? _host.resolveCatalog(groupKey.rig) : nullptr;
+        if (!current) {
             std::lock_guard<std::mutex> lock(_mutex);
-            _NoteStatusLocked(groupKey, RigExecOutputStatus::Ready,
-                              "the coverage record already answers this frame");
-            ++_stats.coverageHits;
+            _NoteStatusLocked(
+                groupKey, RigExecOutputStatus::Invalidated,
+                "the rig names no output catalog any more; re-subscribe with "
+                "handles from the current catalog");
+            return;
+        }
+        if (current->GetCompileEpoch() != catalog->GetCompileEpoch() ||
+            current->GetRigIdentity() != catalog->GetRigIdentity()) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _NoteStatusLocked(
+                groupKey, RigExecOutputStatus::Invalidated,
+                "the rig recompiled to epoch " +
+                    std::to_string(current->GetCompileEpoch()) +
+                    "; these outputs were minted at epoch " +
+                    std::to_string(catalog->GetCompileEpoch()) +
+                    ": re-subscribe with handles from the current catalog");
             return;
         }
 
@@ -855,6 +871,9 @@ private:
         if (!_host.capture(groupKey.rig, demand, *catalog, capture.get(),
                            &error)) {
             std::lock_guard<std::mutex> lock(_mutex);
+            // Nothing read this frame's live generation, so nothing can say a
+            // standing record still answers it.
+            _DropCoverageLocked(groupKey);
             _NoteStatusLocked(groupKey, RigExecOutputStatus::Failed,
                               "capture: " + error);
             ++_stats.captureFailures;
@@ -884,11 +903,18 @@ private:
         coverageKey.time = groupKey.time;
         coverageKey.generation = capture->captured;
         coverageKey.upstreamRevision = capture->upstreamRevision;
-        // The capture names the generation that stands now, and its answers
-        // already stand: serve them, dispatch nothing.
-        if (_CoverageCovers({coverageKey}, desired)) {
+        // Capture named the generation that stands now, so this frame is
+        // answerable only from that key. Install it before anything can
+        // decline the replacement work: a refusal then lands on its own status
+        // instead of leaving a retired generation's record answering the frame.
+        {
             std::lock_guard<std::mutex> lock(_mutex);
             _RememberCoverageLocked(groupKey, coverageKey);
+        }
+        // The capture names the generation that stands now, and its answers
+        // already stand: serve them, dispatch nothing.
+        if (_AnswersCover(coverageKey, desired)) {
+            std::lock_guard<std::mutex> lock(_mutex);
             _NoteStatusLocked(groupKey, RigExecOutputStatus::Ready,
                               "the coverage record answers this frame");
             ++_stats.coverageHits;
@@ -959,36 +985,28 @@ private:
                 return;
             }
             group->second.inFlight.push_back(job->key);
-            _RememberCoverageLocked(groupKey, coverageKey);
             _NoteStatusLocked(groupKey, RigExecOutputStatus::Pending,
                               "a job for this frame is queued");
         }
     }
 
-    // Every demanded output already stands in one of these records.
-    bool _CoverageCovers(const std::vector<RigExecCoverageKey> &keys,
-                         const std::vector<RigExecOutputHandle> &desired) const
+    // Every demanded output already stands under this generation's record.
+    bool _AnswersCover(const RigExecCoverageKey &key,
+                       const std::vector<RigExecOutputHandle> &desired) const
     {
         if (!_host.frameCache) {
             return false;
         }
-        for (const RigExecCoverageKey &key : keys) {
-            RigExecCoverageRecord record;
-            if (!_host.frameCache->LookupCoverage(key, &record)) {
-                continue;
-            }
-            bool all = true;
-            for (const RigExecOutputHandle &handle : desired) {
-                if (!_RecordAnswer(record, handle)) {
-                    all = false;
-                    break;
-                }
-            }
-            if (all) {
-                return true;
+        RigExecCoverageRecord record;
+        if (!_host.frameCache->LookupCoverage(key, &record)) {
+            return false;
+        }
+        for (const RigExecOutputHandle &handle : desired) {
+            if (!_RecordAnswer(record, handle)) {
+                return false;
             }
         }
-        return false;
+        return true;
     }
 
     void _NoteStatusLocked(const _GroupKey &key, RigExecOutputStatus status,
@@ -1000,6 +1018,24 @@ private:
         }
         group->second.status = status;
         group->second.reason = reason;
+        // A frame whose generation no longer stands has no answer to give: the
+        // coverage key went with the generation it was captured at.
+        if (status == RigExecOutputStatus::Invalidated) {
+            group->second.coverage = RigExecCoverageKey();
+            group->second.hasCoverage = false;
+        }
+    }
+
+    // A frame whose live generation capture could not read has no answer to
+    // give: the record it had was keyed to a generation nothing validated.
+    void _DropCoverageLocked(const _GroupKey &key)
+    {
+        const auto group = _groups.find(key);
+        if (group == _groups.end()) {
+            return;
+        }
+        group->second.coverage = RigExecCoverageKey();
+        group->second.hasCoverage = false;
     }
 
     void _RememberCoverageLocked(const _GroupKey &key,
@@ -1009,14 +1045,11 @@ private:
         if (group == _groups.end()) {
             return;
         }
-        std::vector<RigExecCoverageKey> &captured = group->second.captured;
-        captured.erase(
-            std::remove(captured.begin(), captured.end(), coverageKey),
-            captured.end());
-        captured.insert(captured.begin(), coverageKey);
-        if (captured.size() > kRigExecSubscriptionGenerationWindow) {
-            captured.resize(kRigExecSubscriptionGenerationWindow);
-        }
+        // One key per group, from the generation its last capture named. A
+        // moved generation replaces it rather than joining a list, so nothing
+        // answers a poll from a record the current inputs do not stand for.
+        group->second.coverage = coverageKey;
+        group->second.hasCoverage = true;
     }
 
     // The job body, on a pool worker. The capture, the reservation and the

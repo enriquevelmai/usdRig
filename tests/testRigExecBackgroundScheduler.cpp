@@ -61,6 +61,7 @@
 #include "pxr/base/tf/setenv.h"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -1966,24 +1967,32 @@ public:
     Work(RigExecWarmOutcome outcome = RigExecWarmOutcome::Published)
     {
         return [this, outcome](const RigExecExplicitRequest &request) {
-            ExplicitRun run;
-            run.rig = request.rig;
-            run.timeIsDefault = request.time.IsDefault();
-            run.time = run.timeIsDefault ? 0.0 : request.time.TimeCode();
-            run.programIdentity = request.generation.programIdentity;
-            run.outputs = request.outputs.size();
-            run.reservationBytes = request.reservationBytes;
-            run.fenceToken = request.fenceToken;
-            run.serialActive = RigExecFrozenSerialActive();
-            run.currentAtPublish =
-                _scheduler ? _scheduler->IsExplicitRequestCurrent(request)
-                           : true;
-            std::lock_guard<std::mutex> lock(_mutex);
-            _runs.push_back(run);
-            if (run.currentAtPublish) {
-                return outcome;
+            const bool current = _Record(request);
+            return current ? outcome : RigExecWarmOutcome::DeclinedGeneration;
+        };
+    }
+
+    // A recorded job that waits inside the lane until the test releases it:
+    // the bytes and the in-flight key it carries definitely stand while the
+    // caller reads the books, and the release comes from the caller's own
+    // thread, so a later WaitUntilIdle cannot deadlock however the threads
+    // interleave.
+    RigExecExplicitWork
+    HeldWork(std::mutex &gateMutex, std::condition_variable &gateCv,
+             bool &started, const bool &released,
+             RigExecWarmOutcome outcome = RigExecWarmOutcome::Published)
+    {
+        return [this, &gateMutex, &gateCv, &started, &released,
+                outcome](const RigExecExplicitRequest &request) {
+            const bool current = _Record(request);
+            {
+                std::lock_guard<std::mutex> lock(gateMutex);
+                started = true;
             }
-            return RigExecWarmOutcome::DeclinedGeneration;
+            gateCv.notify_all();
+            std::unique_lock<std::mutex> lock(gateMutex);
+            gateCv.wait(lock, [&released] { return released; });
+            return current ? outcome : RigExecWarmOutcome::DeclinedGeneration;
         };
     }
 
@@ -2001,6 +2010,15 @@ public:
             };
     }
 
+    // Waits until a HeldWork job has reached the lane.
+    static bool Started(std::mutex &gateMutex, std::condition_variable &gateCv,
+                        const bool &started)
+    {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        return gateCv.wait_for(lock, std::chrono::seconds(10),
+                               [&started] { return started; });
+    }
+
     std::vector<ExplicitRun> Runs() const
     {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -2008,6 +2026,24 @@ public:
     }
 
 private:
+    // Records one run and reports whether its request was still current.
+    bool _Record(const RigExecExplicitRequest &request)
+    {
+        ExplicitRun run;
+        run.rig = request.rig;
+        run.timeIsDefault = request.time.IsDefault();
+        run.time = run.timeIsDefault ? 0.0 : request.time.TimeCode();
+        run.programIdentity = request.generation.programIdentity;
+        run.outputs = request.outputs.size();
+        run.reservationBytes = request.reservationBytes;
+        run.fenceToken = request.fenceToken;
+        run.serialActive = RigExecFrozenSerialActive();
+        run.currentAtPublish =
+            _scheduler ? _scheduler->IsExplicitRequestCurrent(request) : true;
+        std::lock_guard<std::mutex> lock(_mutex);
+        _runs.push_back(run);
+        return run.currentAtPublish;
+    }
     mutable std::mutex _mutex;
     std::vector<ExplicitRun> _runs;
     const RigExecBackgroundScheduler *_scheduler;
@@ -2426,6 +2462,10 @@ TestExplicitBalancesUnderACancelRace()
     std::fflush(stdout);
     RigExecBackgroundScheduler scheduler(/*workerCount=*/2);
     ExplicitRecorder recorder;
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool started = false;
+    bool released = false;
     const SdfPath rig("/Asset/Rig");
     const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
     size_t accepted = 0;
@@ -2433,12 +2473,27 @@ TestExplicitBalancesUnderACancelRace()
         RigExecExplicitRequest request = MakeExplicitRequest(
             rig, NumericTime(double(frame)), 1, 0, 0, 0, /*bytes=*/128);
         request.editGeneration = current;
+        // The first job is held inside the lane, so the reservations and the
+        // in-flight keys the loop took out definitely stand while the books
+        // are read below, and the cancel lands on a job that is mid-run.
+        RigExecExplicitWork work =
+            frame == 1 ? recorder.HeldWork(gateMutex, gateCv, started, released)
+                       : recorder.Work();
         accepted +=
-            scheduler.AdmitExplicitOutput(request, recorder.Work()) ? 1 : 0;
+            scheduler.AdmitExplicitOutput(request, std::move(work)) ? 1 : 0;
     }
     CHECK(accepted == 32);
+    CHECK(ExplicitRecorder::Started(gateMutex, gateCv, started));
     CHECK(scheduler.ReservedExplicitBytes() > 0);
     scheduler.CancelGeneration(rig);
+    // The release arrives from this thread, so WaitUntilIdle below cannot
+    // deadlock however the threads interleave. The flag moves under the gate
+    // mutex, which the held job re-reads before sleeping.
+    {
+        std::lock_guard<std::mutex> lock(gateMutex);
+        released = true;
+    }
+    gateCv.notify_all();
     scheduler.WaitUntilIdle();
     const RigExecBackgroundSchedulerStats stats = scheduler.Stats();
     CHECK(stats.queuedDepth == 0);
@@ -2591,8 +2646,13 @@ TestExplicitMidRunCancelKeepsTheBooksBalanced()
         std::unique_lock<std::mutex> lock(gateMutex);
         gateCv.wait(lock, [&] { return started; });
         lock.unlock();
+        // The cancel runs with the gate closed: it takes the scheduler's own
+        // book and must not nest under the gate mutex.
         scheduler.CancelGeneration(rig);
-        released = true;
+        {
+            std::lock_guard<std::mutex> releaseLock(gateMutex);
+            released = true;
+        }
         gateCv.notify_all();
     });
     releaser.join();
@@ -2692,14 +2752,31 @@ TestExplicitWorkRunsUnderTheSerialScopeWithItsRequest()
     std::fflush(stdout);
     RigExecBackgroundScheduler scheduler(/*workerCount=*/1);
     ExplicitRecorder recorder(&scheduler);
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool started = false;
+    bool released = false;
     const SdfPath rig("/Asset/Rig");
     const RigExecFrameGeneration current = scheduler.CurrentGeneration(rig);
     RigExecExplicitRequest request = MakeExplicitRequest(
         rig, NumericTime(-2.5), /*programIdentity=*/7, /*input=*/3,
         /*preview=*/2, /*history=*/1, /*bytes=*/96, /*outputs=*/4);
     request.editGeneration = current;
-    CHECK(scheduler.AdmitExplicitOutput(request, recorder.Work()));
-    CHECK(scheduler.InFlightExplicitKeys(rig).size() == 1);
+    // The job is held in the lane, so its key and its bytes are in the books
+    // for the query below rather than gone before the caller reads them.
+    CHECK(scheduler.AdmitExplicitOutput(
+        request, recorder.HeldWork(gateMutex, gateCv, started, released)));
+    CHECK(ExplicitRecorder::Started(gateMutex, gateCv, started));
+    const std::vector<RigExecExplicitJobKey> running =
+        scheduler.InFlightExplicitKeys(rig);
+    CHECK(running.size() == 1);
+    CHECK(scheduler.ExplicitInFlightCount(rig) == 1);
+    CHECK(scheduler.ReservedExplicitBytes() == 96);
+    {
+        std::lock_guard<std::mutex> lock(gateMutex);
+        released = true;
+    }
+    gateCv.notify_all();
     scheduler.WaitUntilIdle();
     const std::vector<ExplicitRun> runs = recorder.Runs();
     CHECK(runs.size() == 1);

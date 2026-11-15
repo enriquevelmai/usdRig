@@ -180,6 +180,31 @@ def _DrainReady(model, frame, count):
     return rows
 
 
+def _DrainStatus(model, frame, count, status):
+    """Manual mode: run what is queued, then insist every line reports `status`.
+
+    The stand-in for a panel tick that lands on a refusal rather than an
+    answer: the frame stays demanded, the queue drains, and the line says why
+    it has no value.
+    """
+    rows = model.Rows()
+    for _ in range(60):
+        model.Drain()
+        rows = model.Rows()
+        if (len(rows) == count
+                and all(row.status == status for row in rows)):
+            break
+    _Check(len(rows) == count, "expected %d lines, got %r"
+           % (count, _Statuses(rows)))
+    _Check(all(row.status == status for row in rows),
+           "a demanded line did not report %r: %r" % (status,
+                                                      _Statuses(rows)))
+    for row in rows:
+        _Check(row.time == frame,
+               "a line answers %r, not the demanded %r" % (row.time, frame))
+    return rows
+
+
 def main():
     plugin_dir = sys.argv[1] if len(sys.argv) > 1 else None
     rigexec.load_schema_plugin(plugin_dir)
@@ -448,17 +473,22 @@ def main():
     _Check(not _Close(reopened[1][1], REST_POINTS[1][1])
            or not _Close(reopened[1][2], REST_POINTS[1][2]), reopened)
 
-    # -- a recompile: held answers stand, and re-attach asks anew --------
+    # -- a recompile: the retired demand says so, re-attach asks anew ----
     extra = rigexec.Builder.create(stage, "/Rig").new_mover_chain("second")
     extra.add_float_math_mover("again", "add", 1.0, SCALAR_TARGET)
     rig.compile()
     heldRow = _Row(rows, mid)
     heldText = heldRow.ValueText()
-    # The service still holds the program these handles name, so what it
-    # already answered for them stands; a recompile does not move a value
-    # the panel has on screen.
-    rows = _DrainReady(model, 2.5, 1)
-    _Check(_Row(rows, mid).ValueText() == heldText,
+    # These handles name the retired compile. The pump refuses that frame
+    # rather than sampling the new program into the old compile's job, so the
+    # line says its epoch is stale, and the answer the panel already showed
+    # keeps the bytes it had.
+    staleRows = _DrainStatus(model, 2.5, 1, insp.INVALIDATED)
+    stale = _Row(staleRows, mid)
+    _Check("epoch" in stale.reason, _Statuses(staleRows))
+    _Check(stale.ValueText() != heldText,
+           "the retired answer kept reading as the live one")
+    _Check(heldRow.ValueText() == heldText,
            "a held answer moved under the panel")
     # Re-attaching -- what the panel does on Refresh -- closes that service
     # and asks with the new compile's handles, so the chain the recompile
