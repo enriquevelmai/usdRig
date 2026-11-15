@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(rigExec VERSION 0.1.0 LANGUAGES C CXX)
+project(rigExec VERSION 0.2.0 LANGUAGES C CXX)
 
 # RigExec builds against an unchanged installed OpenUSD v26.08
 set(USD_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../usd-install"
