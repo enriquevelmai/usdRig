@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1974,6 +1975,259 @@ TestLaneChargeCoversTheProgramItClones()
     CHECK(arena >= owned);
 }
 
+// Storage below an outer container's element: the inner containers and the
+// strings inside them, which a clone re-owns one allocation at a time even
+// when the outer length does not move.
+template <class Container>
+size_t
+_NestedOwnedSpan(const Container &outer)
+{
+    size_t bytes = _OwnedSpan(outer);
+    for (const auto &inner : outer) {
+        bytes += _OwnedSpan(inner);
+    }
+    return bytes;
+}
+
+size_t
+_OwnedText(const std::string &text)
+{
+    return text.capacity() >= 16 ? text.capacity() + 1 : 0;
+}
+
+// The clone is deep. An op descriptor's own arrays, the reader list a graph
+// map holds per value, a cluster's members, a cone set's words and a group's
+// walk memo are allocations the lane makes while the outer container's length
+// stays fixed. Charging only the outer element size left every one of them
+// uncounted.
+void
+TestLaneChargeWalksTheRecordsItClones()
+{
+    const RigFixture a = StageA();
+    const RigExecBakedProgram *program = a.evaluator->GetBakedProgram();
+    CHECK(program);
+    if (!program) {
+        return;
+    }
+    const RigExecBakedProgramImpl &B = program->GetStepGraph();
+    const RigExecCompiledGraph &graph = B.opGraph;
+    CHECK(!graph.ops.empty());
+
+    size_t records = 0;
+    size_t inner = 0;
+    for (const RigExecCompiledOp &op : graph.ops) {
+        const size_t descriptor =
+            _OwnedSpan(op.descriptor.reads) + _OwnedSpan(op.descriptor.writes) +
+            _OwnedSpan(op.descriptor.predecessors) +
+            _OwnedSpan(op.predecessors) + _OwnedSpan(op.successors);
+        inner += descriptor;
+        records += _OwnedText(op.descriptor.key) + descriptor;
+    }
+    CHECK(inner > 0);
+    // A map's value containers, with the outer key count fixed.
+    for (const auto &entry : graph.readers) {
+        inner += _OwnedSpan(entry.second);
+    }
+    records += inner + graph.readers.size() *
+                           (sizeof(RigExecValueId) +
+                            sizeof(std::vector<uint32_t>) + 4 * sizeof(void *));
+    for (const RigExecOpCluster &cluster : graph.clusters) {
+        records += _OwnedSpan(cluster.members) +
+                   _OwnedSpan(cluster.predecessors) +
+                   _OwnedSpan(cluster.successors);
+    }
+    for (const std::vector<std::string> &cycle : graph.cycles) {
+        records += _OwnedSpan(cycle);
+        for (const std::string &key : cycle) {
+            records += _OwnedText(key);
+        }
+    }
+    records += _OwnedSpan(B.cones.always.words) +
+               _OwnedSpan(B.cones.poseClusters.words) +
+               _OwnedSpan(B.cones.alwaysSteps.words) +
+               _OwnedSpan(B.cones.poseSteps.words);
+    for (const RigExecBakedProgramImpl::GeomChain &chain : B.chains) {
+        for (const RigExecBakedProgramImpl::GeomRevision &revision :
+             chain.revisions) {
+            records += _NestedOwnedSpan(revision.haloGroups);
+            for (const RigExecGroupState<GfVec3f> &group : revision.groups) {
+                records += _OwnedSpan(group.walk.params) +
+                           _OwnedSpan(group.walk.indices) +
+                           _OwnedSpan(group.walk.weights) +
+                           _OwnedSpan(group.walk.in) +
+                           _OwnedSpan(group.walk.out);
+            }
+        }
+    }
+
+    const size_t arena = RigExecEstimateFrozenArenaBytes(*program);
+    CHECK(arena >= records);
+}
+
+// The outer lengths are fixed and only the inner allocations grow: three ops
+// keep their three descriptor keys, the readers map keeps its three keys and
+// the cycle rows stay three, while each one's own list grows. An estimate that
+// charges an outer element's size alone sees no movement at all.
+void
+TestLaneChargeGrowsWithInnerAllocations()
+{
+    RigExecBakedProgramImpl B;
+    for (size_t i = 0; i < 3; ++i) {
+        RigExecCompiledOp op;
+        op.descriptor.key =
+            "an op key long enough to allocate past its inline buffer";
+        B.opGraph.ops.push_back(op);
+        B.opGraph.readers[RigExecValueId(i)];
+        B.opGraph.cycles.emplace_back();
+    }
+    const size_t settled = RigExecEstimateFrozenArenaBytes(B);
+    CHECK(settled > 0);
+
+    size_t grownBytes = 0;
+    for (size_t i = 0; i < B.opGraph.ops.size(); ++i) {
+        RigExecCompiledOp &op = B.opGraph.ops[i];
+        op.descriptor.reads.resize(400, 7);
+        op.descriptor.writes.resize(200, 9);
+        op.descriptor.predecessors.resize(150, 5);
+        op.predecessors.resize(120, 3);
+        op.successors.resize(120, 4);
+        B.opGraph.readers[RigExecValueId(i)].resize(500, 1);
+        B.opGraph.cycles[i].push_back(
+            "a cycle member key long enough to allocate");
+        grownBytes += (400 + 200 + 150 + 120 + 120 + 500) * sizeof(uint32_t);
+    }
+    const size_t grown = RigExecEstimateFrozenArenaBytes(B);
+    CHECK(B.opGraph.ops.size() == 3);
+    CHECK(B.opGraph.readers.size() == 3);
+    CHECK(B.opGraph.cycles.size() == 3);
+    CHECK(grown - settled >= grownBytes);
+
+    // A container of records moves the bound too: the cone set's own word
+    // list grows while nothing else in the program changes.
+    RigExecBakedProgramImpl cones;
+    cones.cones.poseClusters.words.resize(2, ~uint64_t(0));
+    const size_t beforeWords = RigExecEstimateFrozenArenaBytes(cones);
+    cones.cones.poseClusters.words.resize(200, ~uint64_t(0));
+    CHECK(RigExecEstimateFrozenArenaBytes(cones) > beforeWords);
+}
+
+// One job builds two clones of the standing program: the frame's snapshot and
+// the workspace its lane runs on. A host that charges the arena bound once
+// for both underpays the lane it is about to allocate.
+void
+TestJobChargePaysBothClones()
+{
+    const RigFixture a = StageA();
+    const RigExecBakedProgram *program = a.evaluator->GetBakedProgram();
+    CHECK(program);
+    if (!program) {
+        return;
+    }
+    const size_t arena = RigExecEstimateFrozenArenaBytes(*program);
+    const size_t job = RigExecEstimateFrozenJobBytes(*program);
+    CHECK(arena > 0);
+    CHECK(job >= 2 * arena);
+}
+
+// A GPU chain's translation key table and an enabled oracle publication's
+// records hide their members from the walk, yet a clone re-owns every one
+// of them. With the chain count and the oracle's chain rows fixed, growing
+// those private tables must move the bound through the owners' own size
+// accessors.
+void
+TestLaneChargeReachesTheOwnedPrivateTables()
+{
+    RigExecBakedProgramImpl B;
+    B.chains.emplace_back();
+    const size_t settled = RigExecEstimateFrozenArenaBytes(B);
+    CHECK(settled > 0);
+
+    RigExecMoverParameters params;
+    std::vector<RigExecGpuRevisionInput> revisions(24);
+    for (RigExecGpuRevisionInput &in : revisions) {
+        in.op = RigExecRevisionOp::Matrix;
+        in.parameters = &params;
+    }
+    RigExecGpuDeformFrame frame;
+    CHECK(B.chains[0].gpuTranslation.Translate(revisions, 4, &frame));
+    CHECK(B.chains[0].gpuTranslation.RetainedBytes() > 0);
+    const size_t grown = RigExecEstimateFrozenArenaBytes(B);
+    CHECK(B.chains.size() == 1);
+    CHECK(grown - settled >= B.chains[0].gpuTranslation.RetainedBytes());
+
+    RigExecBakedProgramImpl O;
+    RigExecOracleScene scene;
+    std::set<SdfPath> protectedPaths;
+    for (int i = 0; i < 4; ++i) {
+        const SdfPath path(std::string("/Rig/Oracle/prim") + std::to_string(i));
+        RigExecOraclePrim prim;
+        prim.exists = true;
+        prim.path = path;
+        scene.prims[path] = prim;
+        scene.blendShapes.insert(path);
+        if (i < 3) {
+            protectedPaths.insert(path);
+        }
+    }
+    O.oraclePublications.emplace();
+    O.oraclePublications->Begin(1, scene, 2, std::set<SdfPath>{},
+                                protectedPaths);
+    CHECK(O.oraclePublications->ChainCount() == 2);
+    CHECK(O.oraclePublications->ProtectedPathCount() == 3);
+    const size_t settledOracle = RigExecEstimateFrozenArenaBytes(O);
+    CHECK(settledOracle >=
+          3 * (sizeof(SdfPath) + 4 * sizeof(void *))); // the protected set
+
+    // The chain rows stay two while each row's write list grows.
+    RigExecOraclePublicationContext::Writes writes;
+    for (int i = 0; i < 200; ++i) {
+        writes.emplace_back(
+            SdfPath(std::string("/Rig/Oracle/write") + std::to_string(i)),
+            VtValue(float(i)));
+    }
+    CHECK(O.oraclePublications->Finish(0, writes));
+    CHECK(O.oraclePublications->Finish(1, writes));
+    const size_t grownOracle = RigExecEstimateFrozenArenaBytes(O);
+    CHECK(O.oraclePublications->ChainCount() == 2);
+    CHECK(grownOracle - settledOracle >=
+          2 * writes.size() * sizeof(std::pair<SdfPath, VtValue>));
+}
+
+// The freeze-captured bindings hold a copy of the evaluator's joint/solver
+// binding map: a third owned copy, shared by both clones and never charged
+// by an arena clone's walk of its own member alone. Growing a joint's
+// solver list with the map's key count fixed must move the job bound by at
+// least one more full copy of what the arena bound moved.
+void
+TestJobChargePaysTheCopiedBindingMap()
+{
+    RigExecBakedProgramImpl B;
+    for (int j = 0; j < 3; ++j) {
+        B.ownedJointSolverBinding[SdfPath(std::string("/Rig/Joints/j") +
+                                          std::to_string(j))]
+            .push_back({SdfPath("/Rig/Solvers/s0"), 0});
+    }
+    B.jointSolverBinding = &B.ownedJointSolverBinding;
+    const size_t arenaSettled = RigExecEstimateFrozenArenaBytes(B);
+    const size_t jobSettled = RigExecEstimateFrozenJobBytes(B);
+
+    size_t added = 0;
+    for (auto &entry : B.ownedJointSolverBinding) {
+        for (int k = 0; k < 60; ++k) {
+            entry.second.push_back(
+                {SdfPath(std::string("/Rig/Solvers/s") + std::to_string(k)),
+                 k});
+            ++added;
+        }
+    }
+    const size_t arenaGrown = RigExecEstimateFrozenArenaBytes(B);
+    const size_t jobGrown = RigExecEstimateFrozenJobBytes(B);
+    CHECK(B.ownedJointSolverBinding.size() == 3);
+    CHECK(arenaGrown > arenaSettled);
+    CHECK(jobGrown - jobSettled >= 2 * (arenaGrown - arenaSettled) +
+                                       added * sizeof(std::pair<SdfPath, int>));
+}
+
 void
 TestCaptureFailureAndBadGeneration()
 {
@@ -2777,6 +3031,11 @@ main()
     TestBoundsRefuseBeforeAllocating();
     TestCoverageHitAndBudgetRefusalBuildNoArena();
     TestLaneChargeCoversTheProgramItClones();
+    TestLaneChargeWalksTheRecordsItClones();
+    TestLaneChargeGrowsWithInnerAllocations();
+    TestLaneChargeReachesTheOwnedPrivateTables();
+    TestJobChargePaysBothClones();
+    TestJobChargePaysTheCopiedBindingMap();
     TestCaptureFailureAndBadGeneration();
     TestCompletionCallback();
     TestClosingFromCallbackDropsTheRestOfTheBatch();

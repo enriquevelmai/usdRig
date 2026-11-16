@@ -925,6 +925,25 @@ public:
         return out;
     }
 
+    // What one demanded frame charges the coverage budget here: the whole job
+    // a lane owns before it runs. A host sets the cap against this number.
+    size_t CoverageEstimate() const
+    {
+        const rigExec::RigExecBakedProgram *program =
+            _rig->evaluator->GetBakedProgram();
+        return program ? rigExec::RigExecEstimateFrozenJobBytes(*program) : 0;
+    }
+
+    void SetCoverageCap(size_t bytes)
+    {
+        _frameCache->SetByteCap(bytes);
+    }
+
+    size_t CoverageCap() const
+    {
+        return _frameCache->GetByteCap();
+    }
+
 private:
     // The catalog for the rig's standing compiled program, rediscovered
     // whenever the program is rebuilt. Its epoch is the program build count,
@@ -1024,10 +1043,10 @@ private:
         out->captured.historyRevision = 0;
         out->upstreamRevision = 0;
         out->bytes.capture = rigExec::RigExecEstimateCaptureBytes(out->inputs);
-        // The arena this frame would allocate is a clone of the standing
-        // program, so the lane is charged what that clone owns.
-        out->bytes.workspace =
-            rigExec::RigExecEstimateFrozenArenaBytes(*program);
+        // This host builds two clones per job: the frame's snapshot and the
+        // workspace its lane runs on, plus the freeze-captured tables. Charge
+        // the whole job, so a frame the budget refuses allocates neither.
+        out->bytes.workspace = rigExec::RigExecEstimateFrozenJobBytes(*program);
         return true;
     }
 
@@ -4813,5 +4832,16 @@ PYBIND11_MODULE(_rigexec, m)
         .def("close_all", &_Subscriptions::CloseAll,
              "End every subscription this host holds.")
         .def("stats", &_Subscriptions::Stats,
-             "The service's lifecycle counters.");
+             "The service's lifecycle counters.")
+        .def("coverage_estimate", &_Subscriptions::CoverageEstimate,
+             "The bytes one demanded frame charges the coverage budget: the\n"
+             "snapshot clone, the workspace clone its lane runs on, and the\n"
+             "freeze-captured tables both read. Zero when the rig has no\n"
+             "baked program.")
+        .def("set_coverage_cap", &_Subscriptions::SetCoverageCap,
+             py::arg("bytes"),
+             "The byte cap the coverage budget shares with the pose cache.\n"
+             "A frame whose job exceeds it is declined before a lane exists.")
+        .def("coverage_cap", &_Subscriptions::CoverageCap,
+             "The current coverage and pose byte cap.");
 }

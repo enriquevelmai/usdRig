@@ -69,6 +69,7 @@ using RigExecFrameGeneration = uint64_t;
 /// frozenProgram.h defines it.
 struct RigExecFrozenProgram;
 struct RigExecFrozenAvarPatch;
+struct RigExecBakedProgramImpl;
 
 /// Capture live edit values on the owner thread. Applying the captured patch
 /// shares the immutable program and bindings and may run on a warming worker.
@@ -365,11 +366,35 @@ uint64_t RigExecFrozenAvarRegionDigest(const RigExecBakedProgram &program);
 /// The owned storage one frozen execution lane clones from `program`: a lane's
 /// arena is a field-by-field clone of the compiled program, so this is the
 /// program's container storage, counted by element and shared with no one.
-/// Shared immutable storage -- a shared_ptr's target, a VtValue's array,
-/// interned path and token text -- counts only the handle that points at it.
-/// The idle scratch a clone lets go of is still counted: a host takes this
-/// bound before it allocates the arena, not after. Owner thread only.
+/// Nested containers and the record elements inside them are walked to any
+/// depth, so growing an inner list with the outer length fixed grows the
+/// bound. Shared immutable storage -- a shared_ptr's target, a VtValue's array,
+/// interned path and token text -- counts only the handle that points at it,
+/// and a type-erased VtValue payload is charged at its inline footprint. A
+/// class that hides its storage behind private members -- a GPU deform
+/// translation's key table, an oracle publication context's records --
+/// reports its own retained bytes to the walk. The idle scratch a clone lets
+/// go of is still counted: a host takes this bound before it allocates the
+/// arena, not after. Owner thread only.
 size_t RigExecEstimateFrozenArenaBytes(const RigExecBakedProgram &program);
+
+/// The same bound over the step graph a caller already holds -- the field-by-
+/// field clone's source is that graph, so a caller with it in hand (a test
+/// growing one container, a host comparing two compiled programs) needs no
+/// baked program wrapper.
+size_t
+RigExecEstimateFrozenArenaBytes(const RigExecBakedProgramImpl &stepGraph);
+
+/// What one frozen job owns before it runs: the snapshot clone the frame
+/// captures and the workspace clone its lane executes on, plus the
+/// freeze-captured tables both read, including the copy of the evaluator's
+/// joint/solver binding map the freeze captures. A host that builds both
+/// charges this instead of the arena bound; a frame the budget refuses builds
+/// neither. Owner thread only.
+size_t RigExecEstimateFrozenJobBytes(const RigExecBakedProgram &program);
+
+/// The same job bound over the step graph a caller already holds.
+size_t RigExecEstimateFrozenJobBytes(const RigExecBakedProgramImpl &stepGraph);
 
 /// The compiled rig constant digest: the value-sensitive constant region
 /// the compiled rig signature does not cover, captured at compiled rig build and at every

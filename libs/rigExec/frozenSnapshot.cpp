@@ -7,13 +7,17 @@
 #include "bakedOpValues.h"
 #include "pxr/base/tf/getenv.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <deque>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace rigExec {
@@ -565,9 +569,12 @@ namespace {
 // Shared immutable storage -- a shared_ptr's target, a VtValue's array,
 // interned path and token text -- is aliased by the copy rather than
 // re-owned, so it contributes only the stored size of the handle that points
-// at it. Containers are counted by element, and an element's own containers
-// one level down; the idle scratch the clone lets go of is still counted,
-// because the bound is taken before anything is dropped.
+// at it. Containers are counted by element and walked to any depth, so an
+// inner container with the outer length fixed is still charged; the idle
+// scratch the clone lets go of is counted too, because the bound is taken
+// before anything is dropped. A class that hides its storage behind private
+// members -- a GPU deform translation's key table, an oracle publication
+// context's records -- reports its own retained bytes to the walk.
 
 // A red-black node carries its value, a colour and three links; a hash
 // bucket array holds one pointer per bucket.
@@ -608,6 +615,113 @@ size_t _OwnedBytes(const RigExecBakedProgramImpl::GeomRevision &revision);
 size_t _OwnedBytes(const RigExecBakedProgramImpl::WeightObject &object);
 size_t _OwnedBytes(const RigExecBakedProgramImpl::WeightField &field);
 
+size_t _OwnedBytes(const RigExecBakedProgramImpl::NativeXformSource &record);
+size_t _OwnedBytes(const RigExecProviderProgram &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::ProviderRefresh &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::PoseInterpolator &record);
+size_t _OwnedBytes(const RigExecPointFrameArray &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::WindowedOp &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::WalkStep &record);
+size_t _OwnedBytes(const RigExecBakedStep &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::SpaceCheckpoint &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::AutoClavicle &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::SpaceSwitch &record);
+size_t _OwnedBytes(const RigExecBakedComposeGroup &record);
+size_t _OwnedBytes(const RigExecBakedCommit &record);
+size_t _OwnedBytes(const RigExecBakedClustering &record);
+size_t _OwnedBytes(const RigExecWeightRecord &record);
+size_t _OwnedBytes(const RigExecOpWorkspace &record);
+size_t _OwnedBytes(const RigExecOpExecution &record);
+size_t _OwnedBytes(const RigExecWeightPacket &record);
+size_t _OwnedBytes(const RigExecBakedSparseInputs &record);
+size_t _OwnedBytes(const RigExecCrossDomainRead &record);
+size_t _OwnedBytes(const RigExecBakedPropertyChain &record);
+size_t _OwnedBytes(const RigExecBakedPropertyRecord &record);
+size_t _OwnedBytes(const RigExecWeightReferenceContext &record);
+size_t _OwnedBytes(const RigExecGpuDeformTranslation &state);
+size_t _OwnedBytes(const RigExecOraclePublicationContext &context);
+size_t _OwnedBytes(const RigExecOracleScene &scene);
+size_t _OwnedBytes(const RigExecOraclePrim &prim);
+size_t _OwnedBytes(const RigExecOracleAttribute &attribute);
+size_t _OwnedBytes(const RigExecOracleRelationship &relationship);
+size_t _OwnedBytes(const RigExecBakedReaderWalk &record);
+size_t _OwnedBytes(const RigExecProviderExternalInput &record);
+size_t _OwnedBytes(const RigExecProviderOp &record);
+size_t _OwnedBytes(const RigExecOpDescriptor &record);
+size_t _OwnedBytes(const RigExecRevisionLeafDecl &record);
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::ProviderRefresh::Carry &record);
+size_t _OwnedBytes(const RigExecSolverInputs &record);
+size_t _OwnedBytes(const RigExecSolverWorkspace &record);
+size_t _OwnedBytes(const RigExecBakedPointsBinding &record);
+size_t _OwnedBytes(const RigExecTwoBoneIkParams &record);
+size_t _OwnedBytes(const RigExecSplineIkRest &record);
+size_t _OwnedBytes(const RigExecSolverRecord &record);
+size_t _OwnedBytes(const RigExecConstraintRecord &record);
+size_t _OwnedBytes(const RigExecConstraintInputs &record);
+size_t _OwnedBytes(const RigExecConstraintResult &record);
+size_t _OwnedBytes(const RigExecBoundAutoClavicle &record);
+size_t _OwnedBytes(const RigExecTypedValueStore &record);
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::AutoClavicle::FrameRead &record);
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::SpaceSwitch::FrameVersion &record);
+size_t _OwnedBytes(const RigExecConstraintSource &record);
+size_t _OwnedBytes(const RigExecBakedCluster &record);
+template <class Point>
+size_t _OwnedBytes(const RigExecGroupState<Point> &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::GeomChain::Derived &record);
+size_t _OwnedBytes(const RigExecGpuDeformFrame &record);
+size_t _OwnedBytes(const RigExecWeightOracleFacts &record);
+size_t _OwnedBytes(const RigExecWeightPacketWorkspace &record);
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::WeightField::PointInput &record);
+size_t _OwnedBytes(const RigExecWeightFieldWorkspace &record);
+size_t _OwnedBytes(const RigExecBakedPropertyChain::Revision &record);
+size_t _OwnedBytes(const RigExecWeightReferencePrim &record);
+size_t _OwnedBytes(const RigExecBakedWalk &record);
+size_t _OwnedBytes(const RigExecFkChainElement &record);
+size_t _OwnedBytes(const RigExecSplineIkResult &record);
+size_t _OwnedBytes(const RigExecSkeleton2dScratch &record);
+size_t _OwnedBytes(const RigExecPositionConstraintParams &record);
+size_t _OwnedBytes(const RigExecRotationConstraintParams &record);
+size_t _OwnedBytes(const RigExecScaleConstraintParams &record);
+size_t _OwnedBytes(const RigExecParentConstraintParams &record);
+size_t _OwnedBytes(const RigExecAimConstraintParams &record);
+size_t _OwnedBytes(const RigExecAutoClavicleConstants &record);
+size_t _OwnedBytes(const RigExecGraphTypedRead &record);
+size_t _OwnedBytes(const RigExecTypedValueState &record);
+size_t _OwnedBytes(const RigExecGeometryRecord &record);
+size_t _OwnedBytes(const RigExecSceneGeometryDescriptor &record);
+size_t _OwnedBytes(const RigExecRevisionBinding &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::GeomBlendChannel &record);
+size_t _OwnedBytes(const RigExecBlendChannel &record);
+size_t _OwnedBytes(const RigExecMoverParameters &record);
+size_t _OwnedBytes(const RigExecMoverStatus &record);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::GeomChunk &record);
+size_t _OwnedBytes(const RigExecScaledDualQuat &record);
+size_t _OwnedBytes(const RigExecRevisionRangeInputs &record);
+size_t _OwnedBytes(const RigExecResolvedInputs &resolved);
+size_t _OwnedBytes(const RigExecWireBasisCache &cache);
+template <class Point, class Wide>
+size_t _OwnedBytes(const RigExecDeltaMushGroupState<Point, Wide> &record);
+template <class Point>
+size_t _OwnedBytes(const RigExecSparseWalkMemo<Point> &record);
+size_t _OwnedBytes(const RigExecWeightReferenceRelationship &record);
+size_t _OwnedBytes(const RigExecSplineIkJoint &record);
+size_t _OwnedBytes(const RigExecSkeleton2dWorkspace &record);
+size_t _OwnedBytes(const RigExecSceneBoundInput &record);
+size_t _OwnedBytes(const RigExecSceneTypedRead &record);
+size_t _OwnedBytes(const RigExecSceneGeometryBlendChannel &record);
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomBlendChannel::Sample &record);
+size_t _OwnedBytes(const RigExecBlendSampleData &record);
+size_t _OwnedBytes(const RigExecDeltaMushSettings &record);
+size_t _OwnedBytes(const RigExecWrinkleSettings &record);
+size_t _OwnedBytes(const RigExecSurfaceSnapSettings &record);
+size_t _OwnedBytes(const RigExecLatticeSettings &record);
+size_t _OwnedBytes(const RigExecSceneGeometryBlendSample &record);
+
 template <> struct _OwnsStorage<std::string> : std::true_type {};
 template <> struct _OwnsStorage<RigExecCompiledGraph> : std::true_type {};
 template <> struct _OwnsStorage<RigExecCompiledOp> : std::true_type {};
@@ -636,6 +750,173 @@ struct _OwnsStorage<RigExecBakedProgramImpl::WeightObject> : std::true_type {};
 template <>
 struct _OwnsStorage<RigExecBakedProgramImpl::WeightField> : std::true_type {};
 
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::NativeXformSource>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecProviderProgram> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::ProviderRefresh> : std::true_type {
+};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::PoseInterpolator>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecPointFrameArray> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::WindowedOp> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::WalkStep> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedStep> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::SpaceCheckpoint> : std::true_type {
+};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::AutoClavicle> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::SpaceSwitch> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedComposeGroup> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedCommit> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedClustering> : std::true_type {};
+template <> struct _OwnsStorage<RigExecWeightRecord> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpWorkspace> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpExecution> : std::true_type {};
+template <> struct _OwnsStorage<RigExecWeightPacket> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedSparseInputs> : std::true_type {};
+template <> struct _OwnsStorage<RigExecCrossDomainRead> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedPropertyChain> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedPropertyRecord> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecWeightReferenceContext> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecGpuDeformTranslation> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecOraclePublicationContext> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOracleScene> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOraclePrim> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOracleAttribute> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOracleRelationship> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedReaderWalk> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecProviderExternalInput> : std::true_type {};
+template <> struct _OwnsStorage<RigExecProviderOp> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpDescriptor> : std::true_type {};
+template <> struct _OwnsStorage<RigExecRevisionLeafDecl> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::ProviderRefresh::Carry>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecSolverInputs> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSolverWorkspace> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedPointsBinding> : std::true_type {};
+template <> struct _OwnsStorage<RigExecTwoBoneIkParams> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSplineIkRest> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSolverRecord> : std::true_type {};
+template <> struct _OwnsStorage<RigExecConstraintRecord> : std::true_type {};
+template <> struct _OwnsStorage<RigExecConstraintInputs> : std::true_type {};
+template <> struct _OwnsStorage<RigExecConstraintResult> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBoundAutoClavicle> : std::true_type {};
+template <> struct _OwnsStorage<RigExecTypedValueStore> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::AutoClavicle::FrameRead>
+    : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::SpaceSwitch::FrameVersion>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecConstraintSource> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedCluster> : std::true_type {};
+template <class Point>
+struct _OwnsStorage<RigExecGroupState<Point>> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::GeomChain::Derived>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecGpuDeformFrame> : std::true_type {};
+template <> struct _OwnsStorage<RigExecWeightOracleFacts> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecWeightPacketWorkspace> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::WeightField::PointInput>
+    : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecWeightFieldWorkspace> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedPropertyChain::Revision> : std::true_type {};
+template <> struct _OwnsStorage<RigExecWeightReferencePrim> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedWalk> : std::true_type {};
+template <> struct _OwnsStorage<RigExecFkChainElement> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSplineIkResult> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSkeleton2dScratch> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecPositionConstraintParams> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecRotationConstraintParams> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecScaleConstraintParams> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecParentConstraintParams> : std::true_type {};
+template <> struct _OwnsStorage<RigExecAimConstraintParams> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecAutoClavicleConstants> : std::true_type {};
+template <> struct _OwnsStorage<RigExecGraphTypedRead> : std::true_type {};
+template <> struct _OwnsStorage<RigExecTypedValueState> : std::true_type {};
+template <> struct _OwnsStorage<RigExecGeometryRecord> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecSceneGeometryDescriptor> : std::true_type {};
+template <> struct _OwnsStorage<RigExecRevisionBinding> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::GeomBlendChannel>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecBlendChannel> : std::true_type {};
+template <> struct _OwnsStorage<RigExecMoverParameters> : std::true_type {};
+template <> struct _OwnsStorage<RigExecMoverStatus> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::GeomChunk> : std::true_type {};
+template <> struct _OwnsStorage<RigExecScaledDualQuat> : std::true_type {};
+template <> struct _OwnsStorage<RigExecRevisionRangeInputs> : std::true_type {};
+template <> struct _OwnsStorage<RigExecResolvedInputs> : std::true_type {};
+template <> struct _OwnsStorage<RigExecWireBasisCache> : std::true_type {};
+template <class Point, class Wide>
+struct _OwnsStorage<RigExecDeltaMushGroupState<Point, Wide>> : std::true_type {
+};
+template <class Point>
+struct _OwnsStorage<RigExecSparseWalkMemo<Point>> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecWeightReferenceRelationship> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSplineIkJoint> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSkeleton2dWorkspace> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSceneBoundInput> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSceneTypedRead> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecSceneGeometryBlendChannel> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::GeomBlendChannel::Sample>
+    : std::true_type {};
+template <> struct _OwnsStorage<RigExecBlendSampleData> : std::true_type {};
+template <> struct _OwnsStorage<RigExecDeltaMushSettings> : std::true_type {};
+template <> struct _OwnsStorage<RigExecWrinkleSettings> : std::true_type {};
+template <> struct _OwnsStorage<RigExecSurfaceSnapSettings> : std::true_type {};
+template <> struct _OwnsStorage<RigExecLatticeSettings> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecSceneGeometryBlendSample> : std::true_type {};
+
+// Every owning standard container is both measured and walkable, so an
+// element that is itself a container, a pair, or a record with containers is
+// walked rather than just sized: growing an inner list while the outer length
+// stays fixed grows the bound.
+template <class T, class Alloc>
+size_t _OwnedBytes(const std::vector<T, Alloc> &values);
+template <class T, class Alloc>
+size_t _OwnedBytes(const std::deque<T, Alloc> &values);
+template <class Key, class Value, class Compare, class Alloc>
+size_t _OwnedBytes(const std::map<Key, Value, Compare, Alloc> &entries);
+template <class Key, class Compare, class Alloc>
+size_t _OwnedBytes(const std::set<Key, Compare, Alloc> &keys);
+template <class Key, class Value, class Hash, class Equal, class Alloc>
+size_t
+_OwnedBytes(const std::unordered_map<Key, Value, Hash, Equal, Alloc> &entries);
+template <class Key, class Hash, class Equal, class Alloc>
+size_t _OwnedBytes(const std::unordered_set<Key, Hash, Equal, Alloc> &keys);
+template <class T, size_t N> size_t _OwnedBytes(const std::array<T, N> &values);
+template <class A, class B> size_t _OwnedBytes(const std::pair<A, B> &entry);
+template <class T> size_t _OwnedBytes(const std::optional<T> &held);
+
 size_t
 _OwnedBytes(const std::string &text)
 {
@@ -661,6 +942,11 @@ _OwnedBytes(const std::map<Key, Value, Compare, Alloc> &entries)
 {
     size_t bytes =
         entries.size() * (sizeof(std::pair<const Key, Value>) + kTreeLinks);
+    if constexpr (_OwnsStorage<Key>::value) {
+        for (const auto &entry : entries) {
+            bytes += _OwnedBytes(entry.first);
+        }
+    }
     if constexpr (_OwnsStorage<Value>::value) {
         for (const auto &entry : entries) {
             bytes += _OwnedBytes(entry.second);
@@ -673,7 +959,62 @@ template <class Key, class Compare, class Alloc>
 size_t
 _OwnedBytes(const std::set<Key, Compare, Alloc> &keys)
 {
-    return keys.size() * (sizeof(Key) + kTreeLinks);
+    size_t bytes = keys.size() * (sizeof(Key) + kTreeLinks);
+    if constexpr (_OwnsStorage<Key>::value) {
+        for (const Key &key : keys) {
+            bytes += _OwnedBytes(key);
+        }
+    }
+    return bytes;
+}
+
+template <class Key, class Hash, class Equal, class Alloc>
+size_t
+_OwnedBytes(const std::unordered_set<Key, Hash, Equal, Alloc> &keys)
+{
+    size_t bytes = keys.bucket_count() * sizeof(void *) +
+                   keys.size() * (sizeof(Key) + kHashLinks);
+    if constexpr (_OwnsStorage<Key>::value) {
+        for (const Key &key : keys) {
+            bytes += _OwnedBytes(key);
+        }
+    }
+    return bytes;
+}
+
+template <class T, class Alloc>
+size_t
+_OwnedBytes(const std::deque<T, Alloc> &values)
+{
+    size_t bytes = values.size() * sizeof(T);
+    if constexpr (_OwnsStorage<T>::value) {
+        for (const T &value : values) {
+            bytes += _OwnedBytes(value);
+        }
+    }
+    return bytes;
+}
+
+// A std::array has no allocation of its own; its elements can still own one.
+template <class T, size_t N>
+size_t
+_OwnedBytes(const std::array<T, N> &values)
+{
+    if constexpr (_OwnsStorage<T>::value) {
+        size_t bytes = 0;
+        for (const T &value : values) {
+            bytes += _OwnedBytes(value);
+        }
+        return bytes;
+    }
+    return 0;
+}
+
+template <class A, class B>
+size_t
+_OwnedBytes(const std::pair<A, B> &entry)
+{
+    return _OwnedBytes(entry.first) + _OwnedBytes(entry.second);
 }
 
 template <class Key, class Value, class Hash, class Equal, class Alloc>
@@ -683,6 +1024,11 @@ _OwnedBytes(const std::unordered_map<Key, Value, Hash, Equal, Alloc> &entries)
     size_t bytes =
         entries.bucket_count() * sizeof(void *) +
         entries.size() * (sizeof(std::pair<const Key, Value>) + kHashLinks);
+    if constexpr (_OwnsStorage<Key>::value) {
+        for (const auto &entry : entries) {
+            bytes += _OwnedBytes(entry.first);
+        }
+    }
     if constexpr (_OwnsStorage<Value>::value) {
         for (const auto &entry : entries) {
             bytes += _OwnedBytes(entry.second);
@@ -696,6 +1042,43 @@ size_t
 _OwnedBytes(const std::optional<T> &held)
 {
     return held ? _OwnedBytes(*held) : 0;
+}
+
+// A nested container owns its own allocation, so an element that is itself a
+// container, a pair, or a record with containers is walked, not just sized:
+// growing an inner list with the outer length fixed grows the bound.
+template <class T, class A>
+struct _OwnsStorage<std::vector<T, A>> : std::true_type {};
+template <class T, class A>
+struct _OwnsStorage<std::deque<T, A>> : std::true_type {};
+template <class T, size_t N>
+struct _OwnsStorage<std::array<T, N>> : _OwnsStorage<T> {};
+template <class Key, class T, class Compare, class A>
+struct _OwnsStorage<std::map<Key, T, Compare, A>> : std::true_type {};
+template <class Key, class T, class Hash, class Equal, class A>
+struct _OwnsStorage<std::unordered_map<Key, T, Hash, Equal, A>>
+    : std::true_type {};
+template <class Key, class Compare, class A>
+struct _OwnsStorage<std::set<Key, Compare, A>> : std::true_type {};
+template <class Key, class Hash, class Equal, class A>
+struct _OwnsStorage<std::unordered_set<Key, Hash, Equal, A>> : std::true_type {
+};
+template <class T> struct _OwnsStorage<std::optional<T>> : _OwnsStorage<T> {};
+template <class A, class B>
+struct _OwnsStorage<std::pair<A, B>>
+    : std::conditional_t<_OwnsStorage<A>::value || _OwnsStorage<B>::value,
+                         std::true_type, std::false_type> {};
+
+// One entry point for a record's owning members: the member pointers name
+// exactly the fields a copy of the record re-owns. A new owning field on a
+// compiled-rig record belongs in its record's list beside the clone.
+template <class Record, class... Members>
+size_t
+_MembersBytes(const Record &record, Members... members)
+{
+    size_t total = 0;
+    ((total += _OwnedBytes(record.*members)), ...);
+    return total;
 }
 
 size_t
@@ -718,6 +1101,7 @@ _OwnedBytes(const RigExecCompiledOp &op)
     };
     add(op.predecessors);
     add(op.successors);
+    add(op.descriptor);
     return total;
 }
 
@@ -849,6 +1233,7 @@ _OwnedBytes(const RigExecBakedPathLeaves &leaves)
     add(leaves.observedVersions);
     add(leaves.observedRuns);
     add(leaves.mustSample);
+    add(leaves.decl);
     return total;
 }
 
@@ -866,6 +1251,7 @@ _OwnedBytes(const RigExecBakedSourceWatch &watch)
     add(watch.overrideSlotsHeld);
     add(watch.dirtyList);
     add(watch.standing);
+    add(watch.typed);
     return total;
 }
 
@@ -902,6 +1288,10 @@ _OwnedBytes(const RigExecBakedCones &cones)
     add(cones.nativeSourceSteps);
     add(cones.deltaBaseSteps);
     add(cones.constraintArraySteps);
+    add(cones.always);
+    add(cones.poseClusters);
+    add(cones.alwaysSteps);
+    add(cones.poseSteps);
     return total;
 }
 
@@ -956,6 +1346,9 @@ _OwnedBytes(const RigExecBakedProgramImpl::Constraint &constraint)
     add(constraint.matchRiders);
     add(constraint.harmonicsScalars);
     add(constraint.harmonicsPositions);
+    add(constraint.kernelRecord);
+    add(constraint.kernelInputs);
+    add(constraint.kernelResult);
     return total;
 }
 
@@ -988,6 +1381,26 @@ _OwnedBytes(const RigExecBakedProgramImpl::Solver &solver)
     add(solver.outPosition);
     add(solver.fallbackSlots);
     add(solver.controlReads);
+    add(solver.kernelInputs);
+    add(solver.kernelWorkspace);
+    add(solver.ribbonPointsBinding);
+    add(solver.controlRests);
+    add(solver.jointRests);
+    add(solver.restIsLive);
+    add(solver.ikParams);
+    add(solver.twistWeights);
+    add(solver.ribbonRestPoints);
+    add(solver.splineRest);
+    add(solver.splineRestFrames);
+    add(solver.splineRestWeights);
+    add(solver.splineJointRests);
+    add(solver.bone2dOrder);
+    add(solver.bone2dSetup);
+    add(solver.bone2dSpaceSources);
+    add(solver.bone2dTargetCandidates);
+    add(solver.jointGroups);
+    add(solver.jointGroupMembers);
+    add(solver.jointGroupParents);
     return total;
 }
 
@@ -1010,6 +1423,8 @@ _OwnedBytes(const RigExecBakedProgramImpl::GeomChain &chain)
     add(chain.windowDeviceDerivedSteps);
     add(chain.gpuKeyOps);
     add(chain.gpuExtentSample);
+    add(chain.gpuTranslation);
+    add(chain.gpuFrame);
     return total;
 }
 
@@ -1055,6 +1470,17 @@ _OwnedBytes(const RigExecBakedProgramImpl::GeomRevision &revision)
     add(revision.deltasSpare);
     add(revision.layoutLeaves);
     add(revision.leaves);
+    add(revision.kernelRecord);
+    add(revision.sceneGeometry);
+    add(revision.binding);
+    add(revision.lastParameters);
+    add(revision.lastStatus);
+    add(revision.parameters);
+    add(revision.status);
+    add(revision.currentPhasePacket);
+    add(revision.rangeInputs);
+    add(revision.wireBasis);
+    add(revision.revisionInputs);
     return total;
 }
 
@@ -1083,6 +1509,8 @@ _OwnedBytes(const RigExecBakedProgramImpl::WeightObject &object)
     add(object.packetInputRefs);
     add(object.oracleLeaves);
     add(object.pointLeaves);
+    add(object.oracleFacts);
+    add(object.packetWorkspace);
     return total;
 }
 
@@ -1102,7 +1530,879 @@ _OwnedBytes(const RigExecBakedProgramImpl::WeightField &field)
     add(field.values);
     add(field.enteringGather);
     add(field.error);
+    add(field.objects);
+    add(field.scalarReadIndex);
+    add(field.workspace);
     return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::NativeXformSource &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::NativeXformSource::ancestorSlots);
+}
+
+size_t
+_OwnedBytes(const RigExecProviderProgram &record)
+{
+    return _MembersBytes(
+        record, &RigExecProviderProgram::valueKeys,
+        &RigExecProviderProgram::valueIds, &RigExecProviderProgram::sampled,
+        &RigExecProviderProgram::rawInputs,
+        &RigExecProviderProgram::attributeValues,
+        &RigExecProviderProgram::externalInputs,
+        &RigExecProviderProgram::routedInputs, &RigExecProviderProgram::leaves,
+        &RigExecProviderProgram::ops, &RigExecProviderProgram::descriptors,
+        &RigExecProviderProgram::ownerTexts);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::ProviderRefresh &record)
+{
+    return _MembersBytes(record, &RigExecBakedProgramImpl::ProviderRefresh::key,
+                         &RigExecBakedProgramImpl::ProviderRefresh::carries,
+                         &RigExecBakedProgramImpl::ProviderRefresh::blocked);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::PoseInterpolator &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::PoseInterpolator::pathText,
+        &RigExecBakedProgramImpl::PoseInterpolator::extraDriverSlots,
+        &RigExecBakedProgramImpl::PoseInterpolator::extraParentSlots,
+        &RigExecBakedProgramImpl::PoseInterpolator::valueIsFloat,
+        &RigExecBakedProgramImpl::PoseInterpolator::values,
+        &RigExecBakedProgramImpl::PoseInterpolator::primvarSlots,
+        &RigExecBakedProgramImpl::PoseInterpolator::primvarSources,
+        &RigExecBakedProgramImpl::PoseInterpolator::poseSlots,
+        &RigExecBakedProgramImpl::PoseInterpolator::disabledSlots,
+        &RigExecBakedProgramImpl::PoseInterpolator::scratch);
+}
+
+size_t
+_OwnedBytes(const RigExecPointFrameArray &record)
+{
+    return _MembersBytes(record, &RigExecPointFrameArray::frames,
+                         &RigExecPointFrameArray::rests);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::WindowedOp &record)
+{
+    return _MembersBytes(record, &RigExecBakedProgramImpl::WindowedOp::inner);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::WalkStep &record)
+{
+    return _MembersBytes(record,
+                         &RigExecBakedProgramImpl::WalkStep::batchSolvers);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedStep &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedStep::leaves, &RigExecBakedStep::overrideSlots,
+        &RigExecBakedStep::bindingLeaves, &RigExecBakedStep::lines,
+        &RigExecBakedStep::reads, &RigExecBakedStep::writes,
+        &RigExecBakedStep::preds, &RigExecBakedStep::succs,
+        &RigExecBakedStep::semanticPredecessorKeys,
+        &RigExecBakedStep::overrideInputs, &RigExecBakedStep::readerWalks,
+        &RigExecBakedStep::diagnostics, &RigExecBakedStep::counters,
+        &RigExecBakedStep::label);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::SpaceCheckpoint &record)
+{
+    return _MembersBytes(record, &RigExecBakedProgramImpl::SpaceCheckpoint::key,
+                         &RigExecBakedProgramImpl::SpaceCheckpoint::recompose);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::AutoClavicle &record)
+{
+    return _MembersBytes(record,
+                         &RigExecBakedProgramImpl::AutoClavicle::operation,
+                         &RigExecBakedProgramImpl::AutoClavicle::values,
+                         &RigExecBakedProgramImpl::AutoClavicle::frames,
+                         &RigExecBakedProgramImpl::AutoClavicle::scalars);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::SpaceSwitch &record)
+{
+    return _MembersBytes(record,
+                         &RigExecBakedProgramImpl::SpaceSwitch::sourceSlots,
+                         &RigExecBakedProgramImpl::SpaceSwitch::sourceReads,
+                         &RigExecBakedProgramImpl::SpaceSwitch::parentRead,
+                         &RigExecBakedProgramImpl::SpaceSwitch::spaceRead,
+                         &RigExecBakedProgramImpl::SpaceSwitch::labels,
+                         &RigExecBakedProgramImpl::SpaceSwitch::matchValues);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedComposeGroup &record)
+{
+    return _MembersBytes(record, &RigExecBakedComposeGroup::parentSlots);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedCommit &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedCommit::moverPathText, &RigExecBakedCommit::slots,
+        &RigExecBakedCommit::present, &RigExecBakedCommit::frames,
+        &RigExecBakedCommit::closestPos, &RigExecBakedCommit::deltas,
+        &RigExecBakedCommit::deltaOk, &RigExecBakedCommit::staged,
+        &RigExecBakedCommit::outcome, &RigExecBakedCommit::sources,
+        &RigExecBakedCommit::slotReads, &RigExecBakedCommit::slotWrites,
+        &RigExecBakedCommit::slotBaseWrites,
+        &RigExecBakedCommit::descendantReads, &RigExecBakedCommit::closestReads,
+        &RigExecBakedCommit::descendantWrites,
+        &RigExecBakedCommit::descendantBaseWrites,
+        &RigExecBakedCommit::slotCarry, &RigExecBakedCommit::slotBaseCarry,
+        &RigExecBakedCommit::descendantCarry,
+        &RigExecBakedCommit::descendantBaseCarry,
+        &RigExecBakedCommit::sourceReads, &RigExecBakedCommit::targetReads,
+        &RigExecBakedCommit::effectorAncestors, &RigExecBakedCommit::poleReads,
+        &RigExecBakedCommit::poleAncestors, &RigExecBakedCommit::ikChain,
+        &RigExecBakedCommit::ikPrepared, &RigExecBakedCommit::ikRest,
+        &RigExecBakedCommit::ikSolved, &RigExecBakedCommit::sourceAncestors,
+        &RigExecBakedCommit::worldUpAncestors);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedClustering &record)
+{
+    return _MembersBytes(record, &RigExecBakedClustering::clusters,
+                         &RigExecBakedClustering::clusterOf,
+                         &RigExecBakedClustering::topologicalOrder);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightRecord &record)
+{
+    return _MembersBytes(
+        record, &RigExecWeightRecord::name, &RigExecWeightRecord::staticError,
+        &RigExecWeightRecord::phaseError, &RigExecWeightRecord::inputs,
+        &RigExecWeightRecord::indices, &RigExecWeightRecord::values,
+        &RigExecWeightRecord::falloffCurve);
+}
+
+size_t
+_OwnedBytes(const RigExecOpWorkspace &record)
+{
+    return _MembersBytes(
+        record, &RigExecOpWorkspace::seeded,
+        &RigExecOpWorkspace::clusterCandidates, &RigExecOpWorkspace::pending,
+        &RigExecOpWorkspace::ready, &RigExecOpWorkspace::unresolved,
+        &RigExecOpWorkspace::candidateClusters);
+}
+
+size_t
+_OwnedBytes(const RigExecOpExecution &record)
+{
+    return _MembersBytes(
+        record, &RigExecOpExecution::candidates, &RigExecOpExecution::ran,
+        &RigExecOpExecution::completion, &RigExecOpExecution::touched);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightPacket &record)
+{
+    return _MembersBytes(record, &RigExecWeightPacket::values,
+                         &RigExecWeightPacket::indices);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedSparseInputs &record)
+{
+    return _MembersBytes(record, &RigExecBakedSparseInputs::varying,
+                         &RigExecBakedSparseInputs::numberBegin,
+                         &RigExecBakedSparseInputs::numberLeaves,
+                         &RigExecBakedSparseInputs::visited);
+}
+
+size_t
+_OwnedBytes(const RigExecCrossDomainRead &record)
+{
+    return _MembersBytes(record, &RigExecCrossDomainRead::phase,
+                         &RigExecCrossDomainRead::frames,
+                         &RigExecCrossDomainRead::unavailable);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedPropertyChain &record)
+{
+    return _MembersBytes(record, &RigExecBakedPropertyChain::revisions,
+                         &RigExecBakedPropertyChain::records,
+                         &RigExecBakedPropertyChain::linePrefix);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedPropertyRecord &record)
+{
+    return _MembersBytes(record, &RigExecBakedPropertyRecord::hopSlots);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightReferenceContext &record)
+{
+    return _MembersBytes(record, &RigExecWeightReferenceContext::prims,
+                         &RigExecWeightReferenceContext::points,
+                         &RigExecWeightReferenceContext::canonicalPoints,
+                         &RigExecWeightReferenceContext::placements);
+}
+
+size_t
+_OwnedBytes(const RigExecGpuDeformTranslation &state)
+{
+    return state.RetainedBytes();
+}
+
+size_t
+_OwnedBytes(const RigExecOracleAttribute &attribute)
+{
+    return _MembersBytes(attribute, &RigExecOracleAttribute::connections,
+                         &RigExecOracleAttribute::resolvedTime,
+                         &RigExecOracleAttribute::resolvedDefault);
+}
+
+size_t
+_OwnedBytes(const RigExecOracleRelationship &relationship)
+{
+    return _OwnedBytes(relationship.targets);
+}
+
+size_t
+_OwnedBytes(const RigExecOraclePrim &prim)
+{
+    return _MembersBytes(prim, &RigExecOraclePrim::attributes,
+                         &RigExecOraclePrim::relationships);
+}
+
+size_t
+_OwnedBytes(const RigExecOracleScene &scene)
+{
+    // Begin() seals the capture builder's prims, primOrder and blendShapes
+    // into one shared blob the clone aliases; unsealed they are owned and
+    // charged here, and the overlay is always owned.
+    return _MembersBytes(
+        scene, &RigExecOracleScene::prims, &RigExecOracleScene::primOrder,
+        &RigExecOracleScene::overlay, &RigExecOracleScene::blendShapes);
+}
+
+size_t
+_OwnedBytes(const RigExecOraclePublicationContext &context)
+{
+    // A Chain row is its two completion scalars plus its write vector; the
+    // writes' SdfPath and VtValue elements are handles to shared storage.
+    size_t total =
+        context.ChainCount() *
+            (sizeof(RigExecOraclePublicationContext::Writes) +
+             2 * sizeof(uint64_t)) +
+        context.WriteCount() * sizeof(std::pair<SdfPath, VtValue>) +
+        context.ProtectedPathCount() * (sizeof(SdfPath) + kTreeLinks);
+    return total + _OwnedBytes(context.SourceScene());
+}
+
+size_t
+_OwnedBytes(const RigExecBakedReaderWalk &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedReaderWalk::walk, &RigExecBakedReaderWalk::leaves,
+        &RigExecBakedReaderWalk::slots, &RigExecBakedReaderWalk::versions);
+}
+
+size_t
+_OwnedBytes(const RigExecProviderExternalInput &record)
+{
+    return _MembersBytes(record, &RigExecProviderExternalInput::computation);
+}
+
+size_t
+_OwnedBytes(const RigExecProviderOp &record)
+{
+    return _MembersBytes(record, &RigExecProviderOp::inputs,
+                         &RigExecProviderOp::xforms);
+}
+
+size_t
+_OwnedBytes(const RigExecOpDescriptor &record)
+{
+    return _MembersBytes(
+        record, &RigExecOpDescriptor::key, &RigExecOpDescriptor::reads,
+        &RigExecOpDescriptor::writes, &RigExecOpDescriptor::predecessors);
+}
+
+size_t
+_OwnedBytes(const RigExecRevisionLeafDecl &record)
+{
+    return _MembersBytes(record, &RigExecRevisionLeafDecl::keys);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::ProviderRefresh::Carry &record)
+{
+    return _MembersBytes(
+        record,
+        &RigExecBakedProgramImpl::ProviderRefresh::Carry::blockingSlots);
+}
+
+size_t
+_OwnedBytes(const RigExecSolverInputs &record)
+{
+    return _MembersBytes(
+        record, &RigExecSolverInputs::controls, &RigExecSolverInputs::start,
+        &RigExecSolverInputs::root, &RigExecSolverInputs::mid,
+        &RigExecSolverInputs::end, &RigExecSolverInputs::pole,
+        &RigExecSolverInputs::ribbonPoints, &RigExecSolverInputs::space,
+        &RigExecSolverInputs::bone2dChannels,
+        &RigExecSolverInputs::bone2dSelectors,
+        &RigExecSolverInputs::jointGroupSelectors);
+}
+
+size_t
+_OwnedBytes(const RigExecSolverWorkspace &record)
+{
+    return _MembersBytes(record, &RigExecSolverWorkspace::fkElements,
+                         &RigExecSolverWorkspace::spacedFrames,
+                         &RigExecSolverWorkspace::spacedRest,
+                         &RigExecSolverWorkspace::splineResult,
+                         &RigExecSolverWorkspace::bone2d,
+                         &RigExecSolverWorkspace::bone2dExternalPoses,
+                         &RigExecSolverWorkspace::jointGroupSlots,
+                         &RigExecSolverWorkspace::jointGroupActive);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedPointsBinding &record)
+{
+    return _MembersBytes(record, &RigExecBakedPointsBinding::phase,
+                         &RigExecBakedPointsBinding::candidates,
+                         &RigExecBakedPointsBinding::missDiagnostic);
+}
+
+size_t
+_OwnedBytes(const RigExecTwoBoneIkParams &record)
+{
+    return _MembersBytes(record, &RigExecTwoBoneIkParams::limb);
+}
+
+size_t
+_OwnedBytes(const RigExecSplineIkRest &record)
+{
+    return _MembersBytes(
+        record, &RigExecSplineIkRest::rootControl,
+        &RigExecSplineIkRest::midControl, &RigExecSplineIkRest::endControl,
+        &RigExecSplineIkRest::joints, &RigExecSplineIkRest::segmentLengths,
+        &RigExecSplineIkRest::volumeWeights);
+}
+
+size_t
+_OwnedBytes(const RigExecSolverRecord &record)
+{
+    return _MembersBytes(
+        record, &RigExecSolverRecord::controlRests,
+        &RigExecSolverRecord::jointRests, &RigExecSolverRecord::restIsLive,
+        &RigExecSolverRecord::ikParams, &RigExecSolverRecord::twistWeights,
+        &RigExecSolverRecord::ribbonRestPoints,
+        &RigExecSolverRecord::splineRest, &RigExecSolverRecord::splineParams,
+        &RigExecSolverRecord::splineRestFrames,
+        &RigExecSolverRecord::splineRootRest,
+        &RigExecSolverRecord::splineMidRest,
+        &RigExecSolverRecord::splineEndRest,
+        &RigExecSolverRecord::splineRestWeights,
+        &RigExecSolverRecord::splineJointRests,
+        &RigExecSolverRecord::bone2dOrder, &RigExecSolverRecord::bone2dSetup,
+        &RigExecSolverRecord::bone2dSpaceSources,
+        &RigExecSolverRecord::bone2dTargetCandidates,
+        &RigExecSolverRecord::jointGroups,
+        &RigExecSolverRecord::jointGroupMembers,
+        &RigExecSolverRecord::jointGroupParents);
+}
+
+size_t
+_OwnedBytes(const RigExecConstraintRecord &record)
+{
+    return _MembersBytes(
+        record, &RigExecConstraintRecord::position,
+        &RigExecConstraintRecord::rotation, &RigExecConstraintRecord::scale,
+        &RigExecConstraintRecord::parent, &RigExecConstraintRecord::aim,
+        &RigExecConstraintRecord::singleChain);
+}
+
+size_t
+_OwnedBytes(const RigExecConstraintInputs &record)
+{
+    return _MembersBytes(
+        record, &RigExecConstraintInputs::incoming,
+        &RigExecConstraintInputs::sources, &RigExecConstraintInputs::carry,
+        &RigExecConstraintInputs::chain, &RigExecConstraintInputs::effector,
+        &RigExecConstraintInputs::worldUp,
+        &RigExecConstraintInputs::poleObjects);
+}
+
+size_t
+_OwnedBytes(const RigExecConstraintResult &record)
+{
+    return _MembersBytes(record, &RigExecConstraintResult::frame,
+                         &RigExecConstraintResult::chain);
+}
+
+size_t
+_OwnedBytes(const RigExecBoundAutoClavicle &record)
+{
+    return _MembersBytes(record, &RigExecBoundAutoClavicle::constants,
+                         &RigExecBoundAutoClavicle::frames,
+                         &RigExecBoundAutoClavicle::scalars,
+                         &RigExecBoundAutoClavicle::reads,
+                         &RigExecBoundAutoClavicle::unavailable);
+}
+
+size_t
+_OwnedBytes(const RigExecTypedValueStore &record)
+{
+    return _MembersBytes(record, &RigExecTypedValueStore::values);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::AutoClavicle::FrameRead &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::AutoClavicle::FrameRead::computation,
+        &RigExecBakedProgramImpl::AutoClavicle::FrameRead::recompose);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::SpaceSwitch::FrameVersion &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::SpaceSwitch::FrameVersion::recompose);
+}
+
+size_t
+_OwnedBytes(const RigExecConstraintSource &record)
+{
+    return _MembersBytes(record, &RigExecConstraintSource::frame);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedCluster &record)
+{
+    return _MembersBytes(record, &RigExecBakedCluster::members,
+                         &RigExecBakedCluster::preds,
+                         &RigExecBakedCluster::succs);
+}
+
+template <class Point>
+size_t
+_OwnedBytes(const RigExecGroupState<Point> &record)
+{
+    return _MembersBytes(record, &RigExecGroupState<Point>::walk);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomChain::Derived &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::GeomChain::Derived::targetText,
+        &RigExecBakedProgramImpl::GeomChain::Derived::revision);
+}
+
+size_t
+_OwnedBytes(const RigExecGpuDeformFrame &record)
+{
+    return _MembersBytes(record, &RigExecGpuDeformFrame::frame);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightOracleFacts &record)
+{
+    return _MembersBytes(record, &RigExecWeightOracleFacts::samples,
+                         &RigExecWeightOracleFacts::curve,
+                         &RigExecWeightOracleFacts::phaseError,
+                         &RigExecWeightOracleFacts::staticError);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightPacketWorkspace &record)
+{
+    return _MembersBytes(record, &RigExecWeightPacketWorkspace::support,
+                         &RigExecWeightPacketWorkspace::supportOrder,
+                         &RigExecWeightPacketWorkspace::combineField);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::WeightField::PointInput &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::WeightField::PointInput::binding);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightFieldWorkspace &record)
+{
+    return _MembersBytes(record, &RigExecWeightFieldWorkspace::seen,
+                         &RigExecWeightFieldWorkspace::localCurve);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedPropertyChain::Revision &record)
+{
+    return _MembersBytes(record,
+                         &RigExecBakedPropertyChain::Revision::pathPoints,
+                         &RigExecBakedPropertyChain::Revision::path,
+                         &RigExecBakedPropertyChain::Revision::linePrefix);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightReferencePrim &record)
+{
+    return _MembersBytes(record, &RigExecWeightReferencePrim::attributes,
+                         &RigExecWeightReferencePrim::relationships,
+                         &RigExecWeightReferencePrim::weightTargetPhase,
+                         &RigExecWeightReferencePrim::phaseError,
+                         &RigExecWeightReferencePrim::falloff);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedWalk &record)
+{
+    return _MembersBytes(record, &RigExecBakedWalk::hops,
+                         &RigExecBakedWalk::doubleHops);
+}
+
+size_t
+_OwnedBytes(const RigExecFkChainElement &record)
+{
+    return _MembersBytes(record, &RigExecFkChainElement::restPoints,
+                         &RigExecFkChainElement::posePoints,
+                         &RigExecFkChainElement::outRestPoints);
+}
+
+size_t
+_OwnedBytes(const RigExecSplineIkResult &record)
+{
+    return _MembersBytes(record, &RigExecSplineIkResult::joints);
+}
+
+size_t
+_OwnedBytes(const RigExecSkeleton2dScratch &record)
+{
+    return _MembersBytes(
+        record, &RigExecSkeleton2dScratch::solve,
+        &RigExecSkeleton2dScratch::rests,
+        &RigExecSkeleton2dScratch::externalRests,
+        &RigExecSkeleton2dScratch::externalPoses,
+        &RigExecSkeleton2dScratch::heights, &RigExecSkeleton2dScratch::channels,
+        &RigExecSkeleton2dScratch::pose, &RigExecSkeleton2dScratch::deform);
+}
+
+size_t
+_OwnedBytes(const RigExecPositionConstraintParams &record)
+{
+    return _MembersBytes(record, &RigExecPositionConstraintParams::affect);
+}
+
+size_t
+_OwnedBytes(const RigExecRotationConstraintParams &record)
+{
+    return _MembersBytes(record, &RigExecRotationConstraintParams::affect);
+}
+
+size_t
+_OwnedBytes(const RigExecScaleConstraintParams &record)
+{
+    return _MembersBytes(record, &RigExecScaleConstraintParams::affect);
+}
+
+size_t
+_OwnedBytes(const RigExecParentConstraintParams &record)
+{
+    return _MembersBytes(record,
+                         &RigExecParentConstraintParams::translationAxes,
+                         &RigExecParentConstraintParams::rotationAxes);
+}
+
+size_t
+_OwnedBytes(const RigExecAimConstraintParams &record)
+{
+    return _MembersBytes(record, &RigExecAimConstraintParams::worldUpDirection,
+                         &RigExecAimConstraintParams::affectRotation);
+}
+
+size_t
+_OwnedBytes(const RigExecAutoClavicleConstants &record)
+{
+    return _MembersBytes(record, &RigExecAutoClavicleConstants::swings,
+                         &RigExecAutoClavicleConstants::widths,
+                         &RigExecAutoClavicleConstants::gains,
+                         &RigExecAutoClavicleConstants::weights);
+}
+
+size_t
+_OwnedBytes(const RigExecGraphTypedRead &record)
+{
+    return _MembersBytes(record, &RigExecGraphTypedRead::hops,
+                         &RigExecGraphTypedRead::doubleHops,
+                         &RigExecGraphTypedRead::unavailable,
+                         &RigExecGraphTypedRead::elementUnavailable);
+}
+
+size_t
+_OwnedBytes(const RigExecTypedValueState &record)
+{
+    return _MembersBytes(record, &RigExecTypedValueState::error);
+}
+
+size_t
+_OwnedBytes(const RigExecGeometryRecord &record)
+{
+    return _MembersBytes(record, &RigExecGeometryRecord::binding,
+                         &RigExecGeometryRecord::leaves);
+}
+
+size_t
+_OwnedBytes(const RigExecSceneGeometryDescriptor &record)
+{
+    return _MembersBytes(record, &RigExecSceneGeometryDescriptor::record,
+                         &RigExecSceneGeometryDescriptor::inputs,
+                         &RigExecSceneGeometryDescriptor::bound,
+                         &RigExecSceneGeometryDescriptor::typedLeaves,
+                         &RigExecSceneGeometryDescriptor::blendChannels);
+}
+
+size_t
+_OwnedBytes(const RigExecRevisionBinding &record)
+{
+    return _MembersBytes(record, &RigExecRevisionBinding::externalStructure,
+                         &RigExecRevisionBinding::externalCompileSources,
+                         &RigExecRevisionBinding::externalInputs,
+                         &RigExecRevisionBinding::influences,
+                         &RigExecRevisionBinding::shaderDials,
+                         &RigExecRevisionBinding::blendInputs,
+                         &RigExecRevisionBinding::blendSamples,
+                         &RigExecRevisionBinding::phases,
+                         &RigExecRevisionBinding::transformPhase);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomBlendChannel &record)
+{
+    return _MembersBytes(record,
+                         &RigExecBakedProgramImpl::GeomBlendChannel::samples);
+}
+
+size_t
+_OwnedBytes(const RigExecBlendChannel &record)
+{
+    return _MembersBytes(record, &RigExecBlendChannel::samples);
+}
+
+size_t
+_OwnedBytes(const RigExecMoverParameters &record)
+{
+    return _MembersBytes(
+        record, &RigExecMoverParameters::weights,
+        &RigExecMoverParameters::blendDeltas,
+        &RigExecMoverParameters::mushSettings,
+        &RigExecMoverParameters::wrinkleSettings,
+        &RigExecMoverParameters::surfaceSettings,
+        &RigExecMoverParameters::latticeSettings,
+        &RigExecMoverParameters::topologyCounts,
+        &RigExecMoverParameters::topologyIndices,
+        &RigExecMoverParameters::auxPoints, &RigExecMoverParameters::auxPointsB,
+        &RigExecMoverParameters::restPoints,
+        &RigExecMoverParameters::bindCoords, &RigExecMoverParameters::frames,
+        &RigExecMoverParameters::curveKnots, &RigExecMoverParameters::widths,
+        &RigExecMoverParameters::skinTransforms,
+        &RigExecMoverParameters::skinIndices,
+        &RigExecMoverParameters::skinWeights);
+}
+
+size_t
+_OwnedBytes(const RigExecMoverStatus &record)
+{
+    return _MembersBytes(record, &RigExecMoverStatus::firstBadAddress);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomChunk &record)
+{
+    return _MembersBytes(record, &RigExecBakedProgramImpl::GeomChunk::key,
+                         &RigExecBakedProgramImpl::GeomChunk::blendDeltas,
+                         &RigExecBakedProgramImpl::GeomChunk::transforms,
+                         &RigExecBakedProgramImpl::GeomChunk::rows,
+                         &RigExecBakedProgramImpl::GeomChunk::palette);
+}
+
+size_t
+_OwnedBytes(const RigExecScaledDualQuat &record)
+{
+    return _MembersBytes(record, &RigExecScaledDualQuat::rigid);
+}
+
+size_t
+_OwnedBytes(const RigExecRevisionRangeInputs &record)
+{
+    return _MembersBytes(record, &RigExecRevisionRangeInputs::matrixWeights,
+                         &RigExecRevisionRangeInputs::blendWeights,
+                         &RigExecRevisionRangeInputs::wireBasis);
+}
+
+// The property-chain overlay a lane clones re-owns its map nodes; a chained
+// base reports the effective count, which is what the clone materialises.
+// The VtValue payloads are type-erased and charged at their inline size.
+size_t
+_OwnedBytes(const RigExecResolvedInputs &resolved)
+{
+    return resolved.GetSize() *
+           (sizeof(std::pair<const SdfPath, VtValue>) + kHashLinks);
+}
+
+// A cloned wire-basis cache owns its nodes; the bases stay shared.
+size_t
+_OwnedBytes(const RigExecWireBasisCache &cache)
+{
+    return cache.Size() *
+           (sizeof(uint64_t) + sizeof(std::shared_ptr<void>) + kHashLinks);
+}
+
+template <class Point, class Wide>
+size_t
+_OwnedBytes(const RigExecDeltaMushGroupState<Point, Wide> &record)
+{
+    return _MembersBytes(
+        record, &RigExecDeltaMushGroupState<Point, Wide>::in,
+        &RigExecDeltaMushGroupState<Point, Wide>::smoothPosed,
+        &RigExecDeltaMushGroupState<Point, Wide>::current,
+        &RigExecDeltaMushGroupState<Point, Wide>::next,
+        &RigExecDeltaMushGroupState<Point, Wide>::posedNormals);
+}
+
+template <class Point>
+size_t
+_OwnedBytes(const RigExecSparseWalkMemo<Point> &record)
+{
+    return _MembersBytes(record, &RigExecSparseWalkMemo<Point>::params,
+                         &RigExecSparseWalkMemo<Point>::indices,
+                         &RigExecSparseWalkMemo<Point>::weights,
+                         &RigExecSparseWalkMemo<Point>::in,
+                         &RigExecSparseWalkMemo<Point>::out);
+}
+
+size_t
+_OwnedBytes(const RigExecWeightReferenceRelationship &record)
+{
+    return _MembersBytes(record, &RigExecWeightReferenceRelationship::phase,
+                         &RigExecWeightReferenceRelationship::phaseError);
+}
+
+size_t
+_OwnedBytes(const RigExecSplineIkJoint &record)
+{
+    return _MembersBytes(record, &RigExecSplineIkJoint::frame);
+}
+
+size_t
+_OwnedBytes(const RigExecSkeleton2dWorkspace &record)
+{
+    return _MembersBytes(
+        record, &RigExecSkeleton2dWorkspace::pose,
+        &RigExecSkeleton2dWorkspace::localAngle,
+        &RigExecSkeleton2dWorkspace::scale,
+        &RigExecSkeleton2dWorkspace::baseAngle,
+        &RigExecSkeleton2dWorkspace::restLocalX,
+        &RigExecSkeleton2dWorkspace::restLocalY,
+        &RigExecSkeleton2dWorkspace::localX,
+        &RigExecSkeleton2dWorkspace::localY,
+        &RigExecSkeleton2dWorkspace::spaceA,
+        &RigExecSkeleton2dWorkspace::spaceB,
+        &RigExecSkeleton2dWorkspace::spaceBlend,
+        &RigExecSkeleton2dWorkspace::tipX, &RigExecSkeleton2dWorkspace::tipY,
+        &RigExecSkeleton2dWorkspace::external,
+        &RigExecSkeleton2dWorkspace::chain,
+        &RigExecSkeleton2dWorkspace::countedChildren,
+        &RigExecSkeleton2dWorkspace::dirty,
+        &RigExecSkeleton2dWorkspace::effSetup, &RigExecSkeleton2dWorkspace::eff,
+        &RigExecSkeleton2dWorkspace::active,
+        &RigExecSkeleton2dWorkspace::ctrlDone,
+        &RigExecSkeleton2dWorkspace::groupSlot);
+}
+
+size_t
+_OwnedBytes(const RigExecSceneBoundInput &record)
+{
+    return _MembersBytes(record, &RigExecSceneBoundInput::values,
+                         &RigExecSceneBoundInput::available,
+                         &RigExecSceneBoundInput::blocked,
+                         &RigExecSceneBoundInput::computed);
+}
+
+size_t
+_OwnedBytes(const RigExecSceneTypedRead &record)
+{
+    return _MembersBytes(record, &RigExecSceneTypedRead::hops,
+                         &RigExecSceneTypedRead::doubleHops);
+}
+
+size_t
+_OwnedBytes(const RigExecSceneGeometryBlendChannel &record)
+{
+    return _MembersBytes(record, &RigExecSceneGeometryBlendChannel::samples);
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomBlendChannel::Sample &record)
+{
+    return _MembersBytes(
+        record, &RigExecBakedProgramImpl::GeomBlendChannel::Sample::phase,
+        &RigExecBakedProgramImpl::GeomBlendChannel::Sample::pointBinding,
+        &RigExecBakedProgramImpl::GeomBlendChannel::Sample::lastPoints);
+}
+
+size_t
+_OwnedBytes(const RigExecBlendSampleData &record)
+{
+    return _MembersBytes(record, &RigExecBlendSampleData::points);
+}
+
+size_t
+_OwnedBytes(const RigExecDeltaMushSettings &record)
+{
+    return _MembersBytes(record, &RigExecDeltaMushSettings::smoothWeights,
+                         &RigExecDeltaMushSettings::edges);
+}
+
+size_t
+_OwnedBytes(const RigExecWrinkleSettings &record)
+{
+    return _MembersBytes(record, &RigExecWrinkleSettings::pinPoints);
+}
+
+size_t
+_OwnedBytes(const RigExecSurfaceSnapSettings &record)
+{
+    return _MembersBytes(record, &RigExecSurfaceSnapSettings::mask,
+                         &RigExecSurfaceSnapSettings::triangles);
+}
+
+size_t
+_OwnedBytes(const RigExecLatticeSettings &record)
+{
+    return _MembersBytes(record, &RigExecLatticeSettings::mask);
+}
+
+size_t
+_OwnedBytes(const RigExecSceneGeometryBlendSample &record)
+{
+    return _MembersBytes(record,
+                         &RigExecSceneGeometryBlendSample::additionalPoints);
 }
 
 size_t
@@ -1413,7 +2713,40 @@ _ProgramStorageBytes(const RigExecBakedProgramImpl &src)
     add(src.readerWalkChanged);
     add(src.avarHeadReads);
     add(src.verifyCloneKeys);
+    add(src.opWorkspace);
+    add(src.resolvedInputs);
     return total;
+}
+
+// The freeze-captured tables one snapshot owns, sized by the program counts
+// that fill them: a copy of the evaluator's joint/solver binding map, one
+// head path and typed fallback per patchable binding, four operator-array
+// keys per constraintArrays entry, one flag per chain, derived target,
+// solver and revision input, and the mover and weight-object sample keys.
+size_t
+_FrozenTableBytes(const RigExecBakedProgramImpl &B)
+{
+    const size_t heads = B.leafRefs.size();
+    const size_t revisions = B.revisionIndex.size();
+    size_t bindingEntries = 0;
+    size_t bindingPairs = 0;
+    if (B.jointSolverBinding) {
+        bindingEntries = B.jointSolverBinding->size();
+        for (const auto &entry : *B.jointSolverBinding) {
+            bindingPairs += entry.second.size();
+        }
+    }
+    return heads * (sizeof(SdfPath) + sizeof(VtValue)) +
+           4 * B.constraintArrays.size() * sizeof(SdfPath) +
+           (B.chains.size() + B.derivedIndex.size() + B.solvers.size() +
+            3 * revisions) *
+               sizeof(char) +
+           (revisions + 4 * B.weightObjects.size()) * sizeof(SdfPath) +
+           bindingEntries *
+               (sizeof(std::pair<const SdfPath,
+                                 std::vector<std::pair<SdfPath, int>>>) +
+                kTreeLinks) +
+           bindingPairs * sizeof(std::pair<SdfPath, int>);
 }
 
 } // namespace
@@ -1721,7 +3054,36 @@ RigExecFrozenAvarRegionDigest(const RigExecBakedProgram &program)
 size_t
 RigExecEstimateFrozenArenaBytes(const RigExecBakedProgram &live)
 {
-    return frozenDetail::_ProgramStorageBytes(live.GetStepGraph());
+    return RigExecEstimateFrozenArenaBytes(live.GetStepGraph());
+}
+
+size_t
+RigExecEstimateFrozenArenaBytes(const RigExecBakedProgramImpl &stepGraph)
+{
+    return frozenDetail::_ProgramStorageBytes(stepGraph);
+}
+
+// A job builds two clones of the standing program -- the frame's snapshot and
+// the workspace the lane runs on -- plus one set of freeze-captured tables
+// both read, including the copy of the evaluator's joint/solver binding map
+// the freeze captures. An aliased immutable target is charged once per clone
+// that re-owns a handle to it, which the arena bound already accounts for.
+size_t
+RigExecEstimateFrozenJobBytes(const RigExecBakedProgram &live)
+{
+    return RigExecEstimateFrozenJobBytes(live.GetStepGraph());
+}
+
+size_t
+RigExecEstimateFrozenJobBytes(const RigExecBakedProgramImpl &stepGraph)
+{
+    const size_t lane = frozenDetail::_ProgramStorageBytes(stepGraph);
+    const size_t tables = frozenDetail::_FrozenTableBytes(stepGraph);
+    const size_t limit = (std::numeric_limits<size_t>::max)();
+    if (lane > limit / 2 || tables > limit - lane * 2) {
+        return limit;
+    }
+    return lane * 2 + tables;
 }
 
 } // namespace rigExec

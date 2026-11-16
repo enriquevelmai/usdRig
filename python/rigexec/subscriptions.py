@@ -376,6 +376,22 @@ class SubscriptionService:
         pinned for live clients."""
         return self._native.stats()
 
+    def coverage_estimate(self):
+        """The bytes one demanded frame charges the coverage budget: the whole
+        job this host builds for it -- the snapshot clone, the workspace clone
+        its lane runs on, and the freeze-captured tables both read. Zero while
+        the rig has no baked program."""
+        return self._native.coverage_estimate()
+
+    def set_coverage_cap(self, cap):
+        """Set the byte cap the coverage budget shares with the pose cache. A
+        frame whose job exceeds it is declined before a lane exists."""
+        self._native.set_coverage_cap(int(cap))
+
+    def coverage_cap(self):
+        """The current coverage and pose byte cap."""
+        return self._native.coverage_cap()
+
     def __enter__(self):
         return self
 

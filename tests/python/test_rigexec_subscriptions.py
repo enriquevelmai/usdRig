@@ -17,7 +17,10 @@ own numbers:
     it was built from stale -- for a subscription already open too;
   * two clients on one frame get one job, and a subscription for an already
     answered frame captures the frame and takes a coverage hit instead of
-    pulling the evaluator.
+    pulling the evaluator;
+  * the coverage budget charges the whole job -- the snapshot clone, the
+    workspace clone its lane runs on, and the freeze-captured tables -- and
+    refuses a frame that exceeds it before any lane exists.
 
 The host drives everything with ``pump()`` and ``poll()`` -- no Qt, no timer,
 and with ``workers=0`` not a thread. The last section runs a real pool.
@@ -559,6 +562,45 @@ def main():
     assert _close(now.value.point(1)[2], moved[1][2]), (now.value.points, moved)
     assert tuple(retained.doubles) == snapshot, "a retained payload moved"
     resubscribed.close()
+
+    # -- the budget pays for the whole job before this host builds a lane --
+    # A demanded frame that misses coverage is charged what the job will own:
+    # the snapshot clone, the workspace clone its lane runs on, and the
+    # freeze-captured tables both read. Charging only one clone let a frame
+    # in that the cache could not actually hold.
+    estimate = subs.coverage_estimate()
+    assert estimate > 0, estimate
+    standing_cap = subs.coverage_cap()
+    before = subs.stats()
+    subs.set_coverage_cap(estimate - 1)
+    assert subs.coverage_cap() == estimate - 1, subs.coverage_cap()
+    tight = subs.subscribe([fresh_bindings[scalar.semantic_key]], [41.0])
+    assert tight.ok, (tight.status, tight.reason)
+    _drain(subs)
+    stats = subs.stats()
+    assert stats["declined_coverage_budget"] >= \
+        before["declined_coverage_budget"] + 1, stats
+    # The refusals came before a lane existed: the pool saw no job at all,
+    # so no snapshot and no workspace were allocated for this frame, and
+    # every retry re-declined at the same gate.
+    assert stats["dispatches"] == before["dispatches"], stats
+    declined_packets = tight.poll()
+    assert declined_packets, "the refused frame answered nothing"
+    for packet in declined_packets:
+        assert packet.status == subscriptions.PENDING, \
+            (packet.status, packet.reason)
+        assert "budget" in (packet.reason or ""), packet.reason
+
+    # Room for the whole job plus the frame's own sampled bytes admits the
+    # same frame: the charge is the estimate, not a fraction of it.
+    subs.set_coverage_cap(estimate + (1 << 20))
+    subs.pump()
+    _drain(subs)
+    admitted = tight.poll()
+    assert admitted and all(p.status == subscriptions.READY for p in admitted), \
+        [(p.status, p.reason) for p in admitted]
+    subs.set_coverage_cap(standing_cap)
+    tight.close()
 
     # -- the service owns its pool and cache -------------------------------
     subs.close_all()

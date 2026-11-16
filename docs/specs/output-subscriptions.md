@@ -385,7 +385,8 @@ stays `Invalidated` with the re-subscribe reason until it closes.
 | `RigExecSubscriptionHost` | What the service needs from the host: the pool, the cache, a catalog hook, a capture hook that preflights the frame, a lane hook that builds the frame's arena, and the lane's step runner. |
 | `RigExecSubscriptionCapture` | One exact frame's captured job: the sampled vector, the frozen owners, the captured generation, the upstream revision half of the coverage key, and the byte estimate admission is bounded by. The capture hook fills everything but the frozen owners; the lane hook fills those once the frame is owed work. `BindContext` points its raw owners at the addresses the capture stays at, so a worker cannot read a moved pointer. |
 | `RigExecEstimateCaptureBytes` | The sampled vector's own container and element sizes — not what a `VtValue` points at — which is what a capture charges the coverage budget. A host whose samples carry large buffers adds its own measure beside it. |
-| `RigExecEstimateFrozenArenaBytes` | What one lane's arena owns: the arena is a clone of the compiled program, so this is that program's container storage, counted per element with shared storage counted once. A host charges this to the `Workspace` domain before it allocates the arena. |
+| `RigExecEstimateFrozenArenaBytes` | What one lane's arena owns: the arena is a clone of the compiled program, so this is that program's container storage, counted per element with shared storage counted once. The walk is recursive: a container inside a container, a map or set's key and value storage, and the records inside them are each charged for their own allocations, so growing an inner list while the outer length stays fixed grows the bound. A `shared_ptr` target, a `VtValue`'s array and interned path or token text count only at the handle; a type-erased `VtValue` payload is charged at its inline footprint; a class that hides its storage behind private members -- a GPU deform translation's key table, an oracle publication context's records -- reports its own retained bytes to the walk. A host charges this to the `Workspace` domain before it allocates the arena. |
+| `RigExecEstimateFrozenJobBytes` | What one job owns before it runs: the snapshot clone the frame captures, the workspace clone its lane executes on, and the freeze-captured tables both read. A host that builds both -- the production Python host does -- charges this instead of the arena bound, so a frame the budget refuses allocates neither. The tables include the copy of the evaluator's joint/solver binding map the freeze captures. |
 | `Stats` | `subscriptions`, `framesDemanded`, `demandsInFlight`, `coverageHits`, `dispatches`, `redispatches`, `declinedCoverageBudget`, `declinedAdmission`, `captureFailures`, `retiredInFlight`, `pinnedBytes`, `pinnedPayloads`, `callbacksQueued`. The two declines name which bound refused. |
 
 A refusal never moves demand, a reservation or a lease, and the receipt's
@@ -513,10 +514,11 @@ produced it, so a coverage hit never implies the ancestors exist.
   (what the run captured), `Workspace` (the arena its payloads came from),
   `Payload` (the packets) and `Pinned` (payload bytes a live lease holds). A
   pin moves a payload's bytes out of `Payload` into `Pinned`, so the same
-  bytes are never counted twice. `Workspace` is charged at what the arena owns:
-  a lane clones the compiled program, and `RigExecEstimateFrozenArenaBytes`
-  states that program's container storage, counting a shared buffer once for
-  the handle that aliases it rather than once per lane.
+  bytes are never counted twice. `Workspace` is charged at what the job owns:
+  a frame captures a snapshot clone and its lane runs on a second clone of the
+  compiled program, and `RigExecEstimateFrozenJobBytes` states both plus the
+  freeze-captured tables, while `RigExecEstimateFrozenArenaBytes` states one
+  clone for a host that keeps its lane elsewhere.
 - **The bound is at admission, not at eviction.** Coverage shares the cache's
   per-rig byte cap with the poses and is never read or dropped by the pose
   store's LRU pass. `TryReserveCoverage` charges the budget before anything
