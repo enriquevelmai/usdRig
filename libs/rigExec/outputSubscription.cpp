@@ -353,28 +353,35 @@ public:
     {
         _DispatchDue();
         std::vector<RigExecSubscriptionEvent> events;
-        RigExecSubscriptionCallback callback;
         {
             std::lock_guard<std::mutex> lock(_mutex);
             events.swap(_events);
-            callback = _callback;
-            if (callback) {
-                for (const RigExecSubscriptionEvent &event : events) {
-                    if (_clients.count(event.subscription)) {
-                        _delivered.push_back(event);
-                    }
-                }
+            if (!_callback || _stopping) {
+                return 0;
             }
         }
-        if (!callback) {
-            return 0;
+        size_t delivered = 0;
+        for (const RigExecSubscriptionEvent &event : events) {
+            // A callback may close its own subscription or every client, so
+            // liveness and the current callback are re-read per event; the
+            // callback itself always runs with the state lock closed.
+            RigExecSubscriptionCallback active;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                if (_stopping) {
+                    break;
+                }
+                if (_clients.count(event.subscription)) {
+                    active = _callback;
+                }
+            }
+            if (!active) {
+                continue;
+            }
+            active(event);
+            ++delivered;
         }
-        std::vector<RigExecSubscriptionEvent> delivered;
-        delivered.swap(_delivered);
-        for (const RigExecSubscriptionEvent &event : delivered) {
-            callback(event);
-        }
-        return delivered.size();
+        return delivered;
     }
 
     void SetCallback(RigExecSubscriptionCallback callback)
@@ -1360,7 +1367,6 @@ private:
     std::map<_PinKey, Pin> _pins;
     std::vector<RigExecCoverageLease> _stagedPins;
     std::vector<RigExecSubscriptionEvent> _events;
-    std::vector<RigExecSubscriptionEvent> _delivered;
     RigExecSubscriptionCallback _callback;
     RigExecSubscriptionStats _stats;
     uint64_t _nextId = 0;

@@ -463,8 +463,8 @@ subscription id and the exact frames the request demands:
   that payload for as long as the subscription lives; the pin is shared between
   clients that ask for the same output, and closing releases it.
 - **Callbacks are queued, never run on a worker.** A completion lands at the
-  owner's `PumpCallbacks`, and an event for a client that closed first is
-  dropped.
+  owner's `PumpCallbacks`, and an event whose client closed before its turn is
+  dropped — including one the same pump's earlier callback closed.
 
 ### What each status means where it comes from
 

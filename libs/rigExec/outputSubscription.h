@@ -229,7 +229,7 @@ struct RigExecSubscriptionHost {
 
 /// One subscription's completion, reported to the owner-thread callback. The
 /// service queues it and never runs the callback on a worker, and an event for
-/// a client that closed before the pump is dropped.
+/// a client that closed before its turn is dropped.
 struct RigExecSubscriptionEvent {
     uint64_t subscription = 0;
     SdfPath rig;

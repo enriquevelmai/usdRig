@@ -1425,7 +1425,10 @@ TestProgramRebuildAtTheStandingEpochRefusesTheOldCatalog()
 
     auto sub = service.Subscribe(a.root, RequestAt(TimeOf(12.0), {a.scalar}));
     CHECK(sub.IsValid());
+    // The pool has a live lane here, so the lane may hold the job the subscribe
+    // admitted: wait for it rather than race the publish.
     h.scheduler->DrainQueueForTesting();
+    h.scheduler->WaitUntilIdle();
     CHECK(AllReady(service.PollResults(sub)));
     CHECK(h.captures == 1);
     CHECK(h.laneRuns == 1);
@@ -1740,6 +1743,91 @@ TestCompletionCallback()
     service.Close(gone);
     CHECK(service.PumpCallbacks() == 0);
     CHECK(seen.size() == 1);
+}
+
+// Two frames complete for one client before the pump, and the callback for
+// whichever lands first closes that subscription. The batch's other event has
+// no live client by the time its turn comes, so it is dropped and the pump
+// counts only the invocation that happened.
+void
+TestClosingFromCallbackDropsTheRestOfTheBatch()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    RigExecOutputRequest owed;
+    owed.demands.push_back(RigExecOutputTimeDemand{TimeOf(12.0), {a.scalar}});
+    owed.demands.push_back(RigExecOutputTimeDemand{TimeOf(13.0), {a.points}});
+    auto sub = service.Subscribe(a.root, owed);
+    CHECK(sub.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 2);
+    CHECK(service.Stats().callbacksQueued == 2);
+
+    std::vector<RigExecSubscriptionEvent> seen;
+    service.SetCompletionCallback([&](const RigExecSubscriptionEvent &event) {
+        seen.push_back(event);
+        service.Close(sub);
+    });
+    CHECK(service.PumpCallbacks() == 1);
+    CHECK(seen.size() == 1);
+    CHECK(seen.front().subscription == sub.Id());
+
+    // Nothing survived the close: no second invocation, nothing queued, and
+    // the closed client answers nothing.
+    CHECK(service.PumpCallbacks() == 0);
+    CHECK(seen.size() == 1);
+    CHECK(service.Stats().callbacksQueued == 0);
+    CHECK(service.PollResults(sub).empty());
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+}
+
+// The same close-by-callback, with CloseAll: the other client's events in the
+// same batch lose their client too, and the pump reports one delivery.
+void
+TestCloseAllFromCallbackDropsOtherClients()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+
+    RigExecOutputRequest left;
+    left.demands.push_back(RigExecOutputTimeDemand{TimeOf(12.0), {a.scalar}});
+    left.demands.push_back(RigExecOutputTimeDemand{TimeOf(13.0), {a.points}});
+    RigExecOutputRequest right;
+    right.demands.push_back(
+        RigExecOutputTimeDemand{TimeOf(20.0), {a.transform}});
+    right.demands.push_back(RigExecOutputTimeDemand{TimeOf(21.0), {a.scalar}});
+    auto first = service.Subscribe(a.root, left);
+    auto second = service.Subscribe(a.root, right);
+    CHECK(first.IsValid() && second.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.laneRuns == 4);
+    CHECK(service.Stats().callbacksQueued == 4);
+
+    std::vector<RigExecSubscriptionEvent> seen;
+    service.SetCompletionCallback([&](const RigExecSubscriptionEvent &event) {
+        seen.push_back(event);
+        service.CloseAll();
+    });
+    CHECK(service.PumpCallbacks() == 1);
+    CHECK(seen.size() == 1);
+    const uint64_t winner = seen.front().subscription;
+    CHECK(winner == first.Id() || winner == second.Id());
+    CHECK(service.Stats().subscriptions == 0);
+    CHECK(service.Stats().callbacksQueued == 0);
+
+    CHECK(service.PumpCallbacks() == 0);
+    CHECK(seen.size() == 1);
+    for (const RigExecSubscriptionEvent &event : seen) {
+        CHECK(event.subscription == winner);
+    }
+    CHECK(service.PollResults(first).empty());
+    CHECK(service.PollResults(second).empty());
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
 }
 
 // An edit at a frame whose answers already stand moves the generation, not the
@@ -2391,6 +2479,8 @@ main()
     TestBoundsRefuseBeforeAllocating();
     TestCaptureFailureAndBadGeneration();
     TestCompletionCallback();
+    TestClosingFromCallbackDropsTheRestOfTheBatch();
+    TestCloseAllFromCallbackDropsOtherClients();
     TestEstimateAndStatusText();
 
     if (failures) {
