@@ -5,10 +5,12 @@ Copies a complete OpenUSD install, the RigExec ``cmake --install`` prefix,
 and the CPython home the USD build was compiled against into one directory
 with the ``usdRigView`` launcher at its head. Nothing in the output refers
 to the build machine: the launcher derives every path from its own
-location at run time (see packaging/launcher/usdRigView.cpp).
+location at run time (see packaging/launcher/usdRigView.cpp), and on macOS
+every Mach-O install name is rewritten to a bundle-relative
+``@loader_path`` name (see relocate_macos_bundle); assembly fails if any
+non-system absolute dependency remains.
 
 Layout (Windows/Linux)::
-
     <output>/
       usdRigView[.exe]          launcher
       bundle-manifest.json
@@ -39,10 +41,11 @@ import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PLATFORMS = ("windows", "macos", "linux")
 IMAGING_NAMES = ("rigExecImaging.dll", "librigExecImaging.dylib",
@@ -71,6 +74,26 @@ def python_executable(python_home: Path, platform: str) -> Path:
         if candidate.is_file():
             return candidate
     return python_home / "bin" / "python3"
+
+
+def resolve_python_home(python_home: Path, platform: str) -> Path:
+    if platform != "macos":
+        return python_home
+    try:
+        real = python_executable(python_home, platform).resolve()
+    except OSError:
+        return python_home
+    parts = real.parts
+    if "Python.framework" not in parts:
+        return python_home
+    framework = parts.index("Python.framework")
+    try:
+        versions = parts.index("Versions", framework)
+    except ValueError:
+        return python_home
+    if versions + 1 >= len(parts):
+        return python_home
+    return Path(*parts[:versions + 2])
 
 
 def validate(args) -> list[str]:
@@ -179,6 +202,185 @@ def make_executable(path: Path) -> None:
         target.chmod(target.stat().st_mode | 0o755)
 
 
+_SYSTEM_DEP_PREFIXES = ("/usr/lib/", "/System/")
+
+
+# usdview does not load these optional Qt SQL drivers.
+_OPTIONAL_DEP_BASENAMES = frozenset(
+    {"libiodbc.2.dylib", "libpq.5.dylib", "libmimerapi.dylib"})
+_MACHO_MAGICS = frozenset({
+    b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"})
+
+
+def _is_macho(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) in _MACHO_MAGICS
+    except OSError:
+        return False
+
+
+def _otool_names(flag: str, path: Path) -> list[str]:
+    proc = subprocess.run(["otool", flag, str(path)],
+                          capture_output=True, text=True, check=True)
+    names = []
+    for line in proc.stdout.splitlines():
+        if flag == "-L":
+            if not line[:1].isspace():
+                continue
+            name = line.strip().split(" (")[0]
+        else:
+            stripped = line.strip()
+            if not stripped or stripped.endswith(":") or "(" in stripped:
+                continue
+            name = stripped
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _is_system_dep(name: str) -> bool:
+    return name.startswith(_SYSTEM_DEP_PREFIXES)
+
+
+def _is_optional_dep(name: str, source: Path) -> bool:
+    return (source.parent.name == "sqldrivers" and
+            source.parent.parent.name == "plugins" and
+            PurePosixPath(name).name in _OPTIONAL_DEP_BASENAMES)
+
+
+def _dylib_index(app_dir: Path) -> dict[str, Path]:
+    # Prefer libraries over executables and the framework root Python over
+    # its nested Python.app host when both use the same basename.
+    index: dict[str, Path] = {}
+    rank: dict[str, tuple[int, int]] = {}
+    for path in sorted(app_dir.rglob("*")):
+        if path.is_symlink() or not path.is_file() or not _is_macho(path):
+            continue
+        key = (0 if path.suffix in (".dylib", ".so") else 1,
+               len(path.parts))
+        if path.name not in rank or key < rank[path.name]:
+            rank[path.name] = key
+            index[path.name] = path
+    return index
+
+
+def _resolve_dep(name: str, index: dict[str, Path]) -> Path | None:
+    parts = PurePosixPath(name).parts
+    if PurePosixPath(name).name == "Python" and "Versions" in parts:
+        lib = index.get(
+            f"libpython{parts[parts.index('Versions') + 1]}.dylib")
+        if lib is not None:
+            return lib
+    return index.get(PurePosixPath(name).name)
+
+
+def _loader_path_name(source: Path, target: Path) -> str:
+    rel = os.path.relpath(target.parent, source.parent)
+    if rel == ".":
+        return f"@loader_path/{target.name}"
+    return f"@loader_path/{rel}/{target.name}"
+
+
+def _patch_macho(path: Path, new_id: str | None,
+                 changes: list[tuple[str, str]]) -> str | None:
+    args = ["install_name_tool"]
+    if new_id is not None:
+        args += ["-id", new_id]
+    for old, new in changes:
+        args += ["-change", old, new]
+    args.append(str(path))
+    mode = path.stat().st_mode
+    try:
+        if not mode & 0o200:
+            path.chmod(mode | 0o200)
+        proc = subprocess.run(args, capture_output=True, text=True)
+    finally:
+        if not mode & 0o200:
+            path.chmod(mode)
+    if proc.returncode != 0:
+        return proc.stderr.strip() or "install_name_tool failed"
+    return None
+
+
+def relocate_macos_bundle(app_dir: Path) -> tuple[list[str], list[str]]:
+    problems: list[str] = []
+    warnings: list[str] = []
+    index = _dylib_index(app_dir)
+    for path in sorted(app_dir.rglob("*")):
+        if path.is_symlink() or not path.is_file() or not _is_macho(path):
+            continue
+        rel = path.relative_to(app_dir)
+        ids = _otool_names("-D", path)
+        deps = _otool_names("-L", path)
+        new_id = None
+        changes: list[tuple[str, str]] = []
+        for ident in ids:
+            if not ident.startswith("/") or _is_system_dep(ident):
+                continue
+            target = _resolve_dep(ident, index)
+            if target is not None:
+                new_id = f"@rpath/{target.name}"
+            elif _is_optional_dep(ident, path):
+                warnings.append(f"optional dependency {ident} in {rel}")
+            else:
+                problems.append(
+                    f"non-relocatable install name {ident} in {rel}")
+        for dep in deps:
+            if dep in ids or not dep.startswith("/") or _is_system_dep(dep):
+                continue
+            target = _resolve_dep(dep, index)
+            if target is not None:
+                changes.append((dep, _loader_path_name(path, target)))
+            elif _is_optional_dep(dep, path):
+                warnings.append(f"optional dependency {dep} in {rel}")
+            else:
+                problems.append(
+                    f"non-relocatable dependency {dep} in {rel}")
+        if new_id is not None or changes:
+            error = _patch_macho(path, new_id, changes)
+            if error:
+                problems.append(f"cannot patch {rel}: {error}")
+    return problems, warnings
+
+
+def check_macos_python_stub(app_dir: Path) -> list[str]:
+    python_dir = app_dir / "python"
+    exe = python_executable(python_dir, "macos")
+    try:
+        data = exe.read_bytes()
+    except OSError:
+        return []
+    if b"Resources/Python.app/Contents/MacOS/Python" not in data:
+        return []
+    targets = (python_dir / "Resources" / "Python.app" / "Contents" /
+               "MacOS" / "Python",
+               python_dir / "lib" / "Resources" / "Python.app" /
+               "Contents" / "MacOS" / "Python")
+    if any(target.is_file() for target in targets):
+        return []
+    return [f"bundled Python stub spawns Resources/Python.app, but no "
+            f"Python.app is bundled under {python_dir}"]
+
+
+def find_unrelocated_macos_deps(app_dir: Path) -> list[str]:
+    problems = []
+    for path in sorted(app_dir.rglob("*")):
+        if path.is_symlink() or not path.is_file() or not _is_macho(path):
+            continue
+        rel = path.relative_to(app_dir)
+        for name in _otool_names("-D", path) + _otool_names("-L", path):
+            if not name.startswith("/") or _is_system_dep(name):
+                continue
+            if _is_optional_dep(name, path):
+                continue
+            problems.append(
+                f"non-relocatable dependency {name} in {rel}")
+    return problems
+
+
 def info_plist(version: str) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
@@ -278,7 +480,12 @@ def assemble(args) -> Path:
               preserve_symlinks=keep_links)
     copy_tree(Path(args.rig_install), app_dir / "rig", args.trim_dev,
               preserve_symlinks=keep_links)
-    copy_tree(Path(args.python_home), app_dir / "python", args.trim_dev,
+    python_src = resolve_python_home(Path(args.python_home), platform)
+    if python_src != Path(args.python_home):
+        print(f"assemble_bundle: note: python home resolves to "
+              f"{python_src}; bundling that prefix instead of the "
+              f"shim tree {args.python_home}", file=sys.stderr)
+    copy_tree(python_src, app_dir / "python", args.trim_dev,
               preserve_symlinks=keep_links)
     make_executable(python_executable(app_dir / "python", platform))
 
@@ -307,6 +514,20 @@ def assemble(args) -> Path:
         if candidate.is_file():
             examples_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(candidate, examples_dir / name)
+
+    if platform == "macos":
+        problems = check_macos_python_stub(app_dir)
+        relocated, warnings = relocate_macos_bundle(app_dir)
+        problems += relocated
+        for warning in warnings:
+            print(f"assemble_bundle: warning: {warning}", file=sys.stderr)
+        problems += find_unrelocated_macos_deps(app_dir)
+        if problems:
+            details = "\n".join(f"  {problem}" for problem in problems)
+            raise SystemExit(
+                "assemble_bundle: bundle is not relocatable; it would "
+                "only run on a machine with the build machine's "
+                f"libraries installed:\n{details}")
 
     for name in LEGAL_NAMES:
         candidate = source / name

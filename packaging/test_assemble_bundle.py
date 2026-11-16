@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -82,8 +83,56 @@ def make_trees(base: Path, platform: str) -> dict:
             "source": source, "build": build}
 
 
-def assemble(base: Path, platform: str, launcher: Path, archive=True):
+FRAMEWORK_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.11/Python"
+
+
+def build_framework_python(python_home: Path, extra_dep: bool = False,
+                           stub: bool = False, missing_name="libmissing.dylib"):
+    cc = shutil.which("clang") or shutil.which("cc")
+    (python_home / "bin").mkdir(parents=True, exist_ok=True)
+    (python_home / "lib" / "python3.11").mkdir(parents=True,
+                                               exist_ok=True)
+    touch(python_home / "lib" / "python3.11" / "os.py")
+    lib_src = python_home / "answer.c"
+    lib_src.write_text("int usdrig_answer(void) { return 42; }\n",
+                       encoding="utf-8")
+    lib = python_home / "lib" / "libpython3.11.dylib"
+
+
+    # Exercise both slices because python.org distributes universal binaries.
+    fat = ["-arch", "arm64", "-arch", "x86_64"]
+    subprocess.run([cc, "-dynamiclib", "-install_name", FRAMEWORK_PYTHON,
+                    "-o", str(lib), str(lib_src)] + fat, check=True)
+    main_src = python_home / "main.c"
+    stub_decl = ('__attribute__((used)) static const char stub_path[] = '
+                 '"Resources/Python.app/Contents/MacOS/Python";\n'
+                 if stub else "")
+    main_src.write_text(
+        '#include <stdio.h>\n'
+        "int usdrig_answer(void);\n" + stub_decl +
+        'int main(void) { printf("%d\\n", usdrig_answer()); return 0; }\n',
+        encoding="utf-8")
+    link = [str(lib)]
+    if extra_dep:
+        dep_src = python_home / "dep.c"
+        dep_src.write_text("int usdrig_dep(void) { return 1; }\n",
+                           encoding="utf-8")
+
+        dep = python_home.parent / missing_name
+        subprocess.run([cc, "-dynamiclib", "-install_name",
+                        f"/opt/homebrew/lib/{missing_name}",
+                        "-o", str(dep), str(dep_src)] + fat, check=True)
+        link.append(str(dep))
+    subprocess.run([cc, str(main_src), "-o",
+                    str(python_home / "bin" / "python3")] + link + fat,
+                   check=True)
+
+
+def assemble(base: Path, platform: str, launcher: Path, archive=True,
+             customize=None):
     trees = make_trees(base, platform)
+    if customize is not None:
+        customize(trees)
     output = base / f"bundle-{platform}"
     cmd = [sys.executable, str(ASSEMBLE),
            "--usd-install", str(trees["usd"]),
@@ -200,6 +249,110 @@ class AssembleBundleTest(unittest.TestCase):
         self.assertEqual(copied_python.read_text(encoding="utf-8"),
                          "interpreter\n")
 
+    @unittest.skipUnless(
+        sys.platform == "darwin" and (shutil.which("clang") or
+                                      shutil.which("cc")) and
+        shutil.which("otool") and shutil.which("install_name_tool"),
+        "macOS Mach-O relocation needs clang, otool, install_name_tool")
+    def test_macos_bundle_relocates_framework_python(self):
+        def customize(trees):
+            build_framework_python(trees["python"])
+
+        proc, output, _ = assemble(self.base, "macos", self._launcher(),
+                                   archive=False, customize=customize)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        python = (output / "usdRigView.app" / "Contents" / "Resources" /
+                  "app" / "python" / "bin" / "python3")
+        deps = subprocess.run(["otool", "-L", str(python)],
+                              capture_output=True, text=True).stdout
+        self.assertNotIn("/Library/Frameworks/Python.framework", deps)
+        self.assertIn("@loader_path/../lib/libpython3.11.dylib", deps)
+        run = subprocess.run([str(python)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), "42")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and (shutil.which("clang") or
+                                      shutil.which("cc")) and
+        shutil.which("otool") and shutil.which("install_name_tool"),
+        "macOS Mach-O relocation needs clang, otool, install_name_tool")
+    def test_macos_framework_shim_home_bundles_python_app(self):
+        def customize(trees):
+            framework = (self.base / "Python.framework" / "Versions" /
+                         "3.11")
+            build_framework_python(framework, stub=True)
+            library = framework / "lib" / "libpython3.11.dylib"
+            library.rename(framework / "Python")
+            library.symlink_to("../Python")
+            app_exe = (framework / "Resources" / "Python.app" /
+                       "Contents" / "MacOS" / "Python")
+            app_exe.parent.mkdir(parents=True)
+            shutil.copy2(framework / "bin" / "python3", app_exe)
+            shim = trees["python"]
+            (shim / "bin" / "python3").unlink()
+            (shim / "bin" / "python3").symlink_to(
+                framework / "bin" / "python3")
+
+        proc, output, _ = assemble(self.base, "macos", self._launcher(),
+                                   archive=False, customize=customize)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        app_python = (output / "usdRigView.app" / "Contents" /
+                      "Resources" / "app" / "python")
+        self.assertTrue((app_python / "Python").is_file())
+        self.assertTrue((app_python / "Resources" / "Python.app" /
+                         "Contents" / "MacOS" / "Python").is_file())
+        deps = subprocess.run(["otool", "-L",
+                               str(app_python / "bin" / "python3")],
+                              capture_output=True, text=True).stdout
+        self.assertIn("@loader_path/../Python", deps)
+        self.assertNotIn("Python.app", deps)
+        run = subprocess.run([str(app_python / "bin" / "python3")],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), "42")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and (shutil.which("clang") or
+                                      shutil.which("cc")) and
+        shutil.which("otool") and shutil.which("install_name_tool"),
+        "macOS Mach-O relocation needs clang, otool, install_name_tool")
+    def test_macos_bundle_rejects_missing_python_app_stub_target(self):
+        def customize(trees):
+            build_framework_python(trees["python"], stub=True)
+
+        proc, _, _ = assemble(self.base, "macos", self._launcher(),
+                              archive=False, customize=customize)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Python.app", proc.stderr)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and (shutil.which("clang") or
+                                      shutil.which("cc")) and
+        shutil.which("otool") and shutil.which("install_name_tool"),
+        "macOS Mach-O relocation needs clang, otool, install_name_tool")
+    def test_macos_bundle_rejects_unbundled_absolute_dep(self):
+        def customize(trees):
+            build_framework_python(trees["python"], extra_dep=True)
+
+        proc, _, _ = assemble(self.base, "macos", self._launcher(),
+                              archive=False, customize=customize)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("libmissing.dylib", proc.stderr)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and shutil.which("clang") and
+        shutil.which("otool") and shutil.which("install_name_tool"),
+        "macOS Mach-O relocation tools required")
+    def test_optional_sql_dependency_is_required_outside_qt_plugin(self):
+        def customize(trees):
+            build_framework_python(trees["python"], extra_dep=True,
+                                   missing_name="libpq.5.dylib")
+
+        proc, _, _ = assemble(self.base, "macos", self._launcher(),
+                             archive=False, customize=customize)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("libpq.5.dylib", proc.stderr)
+
     def test_missing_inputs_report_every_problem(self):
         empty = self.base / "empty"
         empty.mkdir()
@@ -242,6 +395,26 @@ class AssembleBundleTest(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(broken.returncode, 2)
         self.assertIn("imaging library", broken.stderr)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and (shutil.which("clang") or
+                                      shutil.which("cc")),
+        "launcher Mach-O check needs a macOS host with clang")
+    def test_real_launcher_check_rejects_absolute_python_dep(self):
+        if not self.launcher:
+            self.skipTest("no usdRigView binary passed")
+        proc, output, _ = assemble(self.base, HOST_PLATFORM, self.launcher,
+                                   archive=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        app = (output / "usdRigView.app" / "Contents" / "Resources" /
+               "app")
+        exe = (output / "usdRigView.app" / "Contents" / "MacOS" /
+               "usdRigView")
+        build_framework_python(app / "python")
+        broken = subprocess.run([str(exe), "--usdRig-check"],
+                                capture_output=True, text=True)
+        self.assertEqual(broken.returncode, 2, broken.stdout)
+        self.assertIn("Python.framework", broken.stderr)
 
 
 if __name__ == "__main__":

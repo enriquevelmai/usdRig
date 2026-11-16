@@ -222,6 +222,12 @@ jobs:
           cmake --build build --parallel ${{ matrix.jobs }}
           cmake --install build --prefix "$GITHUB_WORKSPACE/usdrig-install"
 
+      - name: Test macOS bundle relocation and launcher checks
+        if: runner.os == 'macOS'
+        run: |
+          python3 packaging/test_assemble_bundle.py "$PWD/build/usdRigView"
+          python3 packaging/test_sign_macos.py
+
       # ---- Windows: assemble, smoke, sign, zip -------------------------
       - name: Assemble bundle (Windows)
         if: runner.os == 'Windows'
@@ -372,6 +378,37 @@ jobs:
           "$bundle/usdRigView.app/Contents/Resources/app/python/bin/python3" \
             -c "from pxr import Usd; import rigExecUsdview, rigexec; s = Usd.Stage.Open('$bundle/usdRigView.app/Contents/Resources/app/examples/rigexec_flat.usda'); assert s is not None; print('signed bundle smoke OK')"
           tar -C dist -czf "$bundle.tar.gz" "$(basename "$bundle")"
+
+      - name: Verify extracted macOS bundle without host Python
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          VERSION_NUM: ${{ needs.gate.outputs.version-num }}
+        run: |
+          # Test the archive users receive, at a different path containing spaces.
+          probe="$RUNNER_TEMP/relocated bundle"
+          mkdir -p "$probe"
+          tar -xzf "dist/usdRig-$VERSION_NUM-macos-arm64.tar.gz" -C "$probe"
+          exe="$probe/usdRig-$VERSION_NUM-macos-arm64/usdRigView.app/Contents/MacOS/usdRigView"
+          framework=/Library/Frameworks/Python.framework
+          hidden="$RUNNER_TEMP/host-Python.framework"
+          restore_python() {
+            if [ -d "$hidden" ]; then
+              sudo mv "$hidden" "$framework"
+            fi
+          }
+          trap restore_python EXIT
+          if [ -d "$framework" ]; then
+            sudo mv "$framework" "$hidden"
+          fi
+          env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            "$exe" --usdRig-check
+          env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            QT_QPA_PLATFORM=offscreen "$exe" --help
+          stage="$probe/usdRig-$VERSION_NUM-macos-arm64/usdRigView.app/Contents/Resources/app/examples/rigexec_flat.usda"
+          env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            QT_QPA_PLATFORM=offscreen "$exe" "$stage" \
+            --norender --quitAfterStartup
 
       # ---- Linux: assemble, smoke, tar ---------------------------------
       - name: Assemble, smoke and tar bundle (Linux)

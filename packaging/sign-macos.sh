@@ -61,6 +61,8 @@ sign_entitled() {
 needs_entitlements() {
     case "$1" in
         */app/python/bin/python*) return 0 ;;
+        */app/python/Python) return 0 ;;
+        */app/python/Resources/Python.app/Contents/MacOS/Python) return 0 ;;
         */Python.framework/Versions/*/Python) return 0 ;;
         *.app) return 0 ;;
         *) return 1 ;;

@@ -35,6 +35,23 @@ path, then runs `app/usd/bin/usdview` with the bundled Python.
 `usdRigView --usdRig-check` verifies the bundle without starting the
 viewer; `--usdRig-print-env` shows the computed environment.
 
+On macOS, assembly rewrites every Mach-O install name that points at a
+build-machine location (a copied CPython framework prefix records
+`/Library/Frameworks/Python.framework/...` in the interpreter, libpython,
+and every pxr module built against it) to a bundle-relative
+`@loader_path` name, and fails if a non-system absolute dependency
+remains — such a bundle aborts in dyld on any machine without the build
+machine's Python, yet passes a file-existence check on the build machine
+itself. `--usdRig-check` parses the same load commands, so a broken
+bundle is named before launch instead of dying silently. The only
+exceptions are Qt's ODBC/PostgreSQL/Mimer SQL-driver plug-ins, which
+usdview never loads. A setup-python `pythonLocation` on macOS is a
+symlink shim into a python.org framework install, so assembly bundles
+the resolved framework prefix (`Python.framework/Versions/<x.y>`)
+instead of the shim tree; copying the shim alone loses
+`Resources/Python.app`, which the framework interpreter stub spawns at
+run time, and assembly fails if that spawn target is not bundled.
+
 ## Cutting a release
 
 1. Bump `project(rigExec VERSION ...)` in `CMakeLists.txt` to match.

@@ -17,10 +17,13 @@
 // opened, matching bin/launch_usdview.bat / bin/usdview.sh.
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -105,9 +108,175 @@ ImagingFileName()
 #endif
 }
 
-// First existing USD Python package directory, in the layouts the three
-// platform installers produce (Lib/site-packages, lib/python3.x/
-// site-packages, lib/python).
+#if defined(__APPLE__)
+
+uint32_t
+ReadLE32(const uint8_t *p)
+{
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint32_t
+ReadBE32(const uint8_t *p)
+{
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+bool
+ReadAt(std::ifstream &in, uint64_t offset, uint8_t *dst, size_t size)
+{
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(offset));
+    in.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(size));
+    return static_cast<size_t>(in.gcount()) == size;
+}
+
+void
+CollectSliceDeps(std::ifstream &in, uint64_t slice, bool is64,
+                 std::vector<std::string> &names)
+{
+    uint8_t header[32];
+    const size_t headerSize = is64 ? 32 : 28;
+    if (!ReadAt(in, slice, header, headerSize)) {
+        return;
+    }
+    const uint32_t ncmds = ReadLE32(header + 16);
+    const uint32_t sizeofcmds = ReadLE32(header + 20);
+    if (ncmds > 512 || sizeofcmds > (1u << 20)) {
+        return;
+    }
+    std::vector<uint8_t> cmds(sizeofcmds);
+    if (sizeofcmds &&
+        !ReadAt(in, slice + headerSize, cmds.data(), cmds.size())) {
+        return;
+    }
+    size_t off = 0;
+    for (uint32_t i = 0; i < ncmds && off + 8 <= cmds.size(); ++i) {
+        const uint32_t cmd = ReadLE32(cmds.data() + off);
+        const uint32_t cmdsize = ReadLE32(cmds.data() + off + 4);
+        if (cmdsize < 8 || off + cmdsize > cmds.size()) {
+            break;
+        }
+        const bool isDylib = cmd == 0xc || cmd == 0xd || cmd == 0x8000001fu ||
+                             cmd == 0x20 || cmd == 0x80000023u ||
+                             cmd == 0x80000018u;
+        if (isDylib && cmdsize > 12) {
+            const uint32_t nameOff = ReadLE32(cmds.data() + off + 8);
+            if (nameOff < cmdsize) {
+                const char *begin =
+                    reinterpret_cast<const char *>(cmds.data() + off + nameOff);
+                const size_t maxLen = cmdsize - nameOff;
+                size_t len = 0;
+                while (len < maxLen && begin[len] != '\0') {
+                    ++len;
+                }
+                names.emplace_back(begin, len);
+            }
+        }
+        off += cmdsize;
+    }
+}
+
+std::vector<std::string>
+MachODepNames(const fs::path &path)
+{
+    std::vector<std::string> names;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return names;
+    }
+    uint8_t magic[4];
+    if (!ReadAt(in, 0, magic, sizeof(magic))) {
+        return names;
+    }
+    if (magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba &&
+        magic[3] == 0xbe) {
+        uint8_t nfatRaw[4];
+        if (!ReadAt(in, 4, nfatRaw, sizeof(nfatRaw))) {
+            return names;
+        }
+        const uint32_t nfat = ReadBE32(nfatRaw);
+        if (nfat > 8) {
+            return names;
+        }
+        for (uint32_t i = 0; i < nfat; ++i) {
+            uint8_t arch[20];
+            if (!ReadAt(in, 8 + static_cast<uint64_t>(i) * 20, arch,
+                        sizeof(arch))) {
+                break;
+            }
+            const uint64_t slice = ReadBE32(arch + 8);
+            uint8_t sliceMagic[4];
+            if (!ReadAt(in, slice, sliceMagic, sizeof(sliceMagic))) {
+                continue;
+            }
+            const bool is64 = sliceMagic[0] == 0xcf && sliceMagic[1] == 0xfa;
+            const bool is32 = sliceMagic[0] == 0xce && sliceMagic[1] == 0xfa;
+            if (is64 || is32) {
+                CollectSliceDeps(in, slice, is64, names);
+            }
+        }
+        return names;
+    }
+    const bool is64 = magic[0] == 0xcf && magic[1] == 0xfa;
+    const bool is32 = magic[0] == 0xce && magic[1] == 0xfa;
+    if (is64 || is32) {
+        CollectSliceDeps(in, 0, is64, names);
+    }
+    return names;
+}
+
+bool
+IsSystemDep(const std::string &name)
+{
+    return name.rfind("/usr/lib/", 0) == 0 || name.rfind("/System/", 0) == 0;
+}
+
+bool
+IsOptionalDep(const std::string &name, const fs::path &source)
+{
+
+    if (source.parent_path().filename() != "sqldrivers" ||
+        source.parent_path().parent_path().filename() != "plugins") {
+        return false;
+    }
+    const std::string base = fs::path(name).filename().string();
+    return base == "libiodbc.2.dylib" || base == "libpq.5.dylib" ||
+           base == "libmimerapi.dylib";
+}
+
+void
+FindAbsoluteDeps(const fs::path &app, std::vector<std::string> &problems)
+{
+    std::error_code ec;
+    std::set<std::string> reported;
+    for (const fs::directory_entry &entry :
+         fs::recursive_directory_iterator(app, ec)) {
+        if (ec || entry.is_symlink(ec) || !entry.is_regular_file(ec)) {
+            continue;
+        }
+        for (const std::string &name : MachODepNames(entry.path())) {
+            if (name.empty() || name.front() != '/' || IsSystemDep(name) ||
+                IsOptionalDep(name, entry.path())) {
+                continue;
+            }
+            const std::string rel =
+                entry.path().lexically_relative(app).string();
+            const std::string problem =
+                "non-relocatable dependency " + name + " in " + rel;
+            if (reported.insert(problem).second) {
+                problems.push_back(problem);
+            }
+        }
+    }
+}
+
+#endif
+
 fs::path
 FindUsdSitePackages(const fs::path &usd)
 {
@@ -214,6 +383,11 @@ LocateBundle()
                                       ": " + item.path.string());
         }
     }
+#if defined(__APPLE__)
+    if (IsDir(bundle.app)) {
+        FindAbsoluteDeps(bundle.app, bundle.problems);
+    }
+#endif
     return bundle;
 }
 
@@ -370,9 +544,11 @@ ReportProblems(const Bundle &bundle)
     for (const std::string &problem : bundle.problems) {
         std::fprintf(stderr, "usdRigView: %s\n", problem.c_str());
     }
-    std::fprintf(
-        stderr, "usdRigView: this download is incomplete; re-extract the whole "
-                "archive and keep usdRigView beside its app folder.\n");
+    std::fprintf(stderr,
+                 "usdRigView: this bundle cannot run as packaged; re-extract "
+                 "the whole archive and keep usdRigView beside its app "
+                 "folder, and report non-relocatable dependencies to the "
+                 "publisher (re-extracting cannot fix those).\n");
     return 2;
 }
 
