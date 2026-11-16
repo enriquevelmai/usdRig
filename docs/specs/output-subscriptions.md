@@ -100,7 +100,9 @@ nothing here claims their implementation or measures against them.
   computes and overflow-checks the size before any allocation, and
   `RigExecValidatePayload` requires the bytes to be exactly
   `elementCount * elementBytes` — never short, never with trailing bytes — and
-  a declared layout. `RigExecPayloadView` reads one element at a time with
+  a declared layout. A zero-element payload is valid with no lease at all:
+  `RigExecPackPayload` leaves its buffer null, and a host copies empty bytes
+  for it. `RigExecPayloadView` reads one element at a time with
   `memcpy` and bounds-checks against the declared element count: the byte lease
   carries no alignment guarantee, so nothing reinterprets it as a `double`
   array. A partial packet is never a full `RigPose`.

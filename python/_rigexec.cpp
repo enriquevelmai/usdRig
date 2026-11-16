@@ -1146,11 +1146,13 @@ private:
         out["payload_error"] = error;
         // An immutable copy of the answer's bytes: the coverage record's own
         // buffer is never handed out, and the package reads this copy back as
-        // a read-only array.
-        out["bytes"] = readable ? py::bytes(reinterpret_cast<const char *>(
-                                                packet.payload.bytes->data()),
-                                            packet.payload.bytes->size())
-                                : py::bytes();
+        // a read-only array. A zero-element payload has no buffer at all --
+        // RigExecPackPayload leaves its lease null -- so the copy is empty.
+        out["bytes"] = (readable && packet.payload.bytes)
+                           ? py::bytes(reinterpret_cast<const char *>(
+                                           packet.payload.bytes->data()),
+                                       packet.payload.bytes->size())
+                           : py::bytes();
         py::dict generation;
         generation["program_identity"] = packet.programIdentity;
         generation["input_revision"] = packet.inputRevision;

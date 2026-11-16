@@ -37,8 +37,8 @@ import execStackUI  # noqa: E402
 import outputInspectorModel as insp  # noqa: E402
 import rigexec  # noqa: E402
 from test_output_inspector_model import (  # noqa: E402
-    BODY_PATH, DATA_PATH, POINTS_TARGET, SCALAR_TARGET, SHOWN_FRAME,
-    TZ_SAMPLES, _author_rig)
+    BODY_PATH, DATA_PATH, EMPTY_PATH, POINTS_TARGET, SCALAR_TARGET,
+    SHOWN_FRAME, TZ_SAMPLES, _author_empty_rig, _author_rig)
 
 STATUS_WORDS = set(insp.STATUS_LABELS.values())
 
@@ -287,6 +287,12 @@ def main():
            and atFrame != shownValue, (atFrame, shownValue))
     first = rows[0].packet.value.point(0)
     _Check(_Close(first[2], atFrame), (first, atFrame))
+    # The painted line spells the payload's count beside its first point.
+    painted = _Lines(panel)[0][6]
+    _Check(painted == rows[0].ValueText(), (painted, rows[0].ValueText()))
+    _Check(painted == "%d pts, first (%.4f, %.4f, %.4f)"
+           % (rows[0].packet.value.elements, first[0], first[1], first[2]),
+           painted)
 
     # -- the shown frame: read from the viewer, never written to it ------
     data.ShowFrame(7.0)
@@ -393,6 +399,30 @@ def main():
            "a replaced stage left lines on screen")
     _Check(panel._outputBox.count() == 0, panel._outputBox.count())
     _Check("No RigExecRoot" in panel._status.text(), panel._status.text())
+
+    # -- a payload with no points paints a count, not an aborted repaint ---
+    emptyStage, _emptyRig = _author_empty_rig(rigexec)
+    emptyAuthored = emptyStage.GetSessionLayer().ExportToString()
+    api.SetStage(emptyStage)
+    panel.Rebuild()
+    _Check(panel._inspector.attached, panel._status.text())
+    panel._InspectPath(EMPTY_PATH)
+    emptyRows = _TickUntilAnswered(panel)
+    _Check(emptyRows and all(row.kind == "points" and row.ready
+                             for row in emptyRows),
+           [(row.kind, row.status, row.reason) for row in emptyRows])
+    _Check(all(row.packet.value.elements == 0 for row in emptyRows),
+           [row.ValueText() for row in emptyRows])
+    emptyLines = _Lines(panel)
+    _Check(len(emptyLines) == len(emptyRows), (emptyLines, len(emptyRows)))
+    for line, row in zip(emptyLines, emptyRows):
+        # The value column answers with the count: a zero-point payload has
+        # no first point to sample, and the repaint has to finish anyway.
+        _Check(line[6] == row.ValueText(), ("the value column", line))
+        _Check(line[6] == "0 pts", line)
+        _Check(line[4] == insp.StatusLabel(insp.READY), line)
+    _Check(emptyStage.GetSessionLayer().ExportToString() == emptyAuthored,
+           "inspecting an empty payload authored into the stage")
 
     # -- closing the panel closes every demand it holds ------------------
     api.SetStage(stage)

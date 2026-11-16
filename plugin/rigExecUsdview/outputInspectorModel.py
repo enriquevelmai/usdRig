@@ -146,7 +146,8 @@ class Row(object):
 
     def ValueText(self):
         """The answer in one line: a number, a matrix's translation, or a
-        point count with its first point. Anything else says why instead."""
+        point count with its first point -- a payload with no points has no
+        first point to show. Anything else says why instead."""
         if self.status != READY:
             return self.reason or StatusLabel(self.status)
         if self.payload_error:
@@ -165,6 +166,10 @@ class Row(object):
             matrix = value.matrix
             return "t (%.4f, %.4f, %.4f)" % (matrix[12], matrix[13],
                                              matrix[14])
+        # A Ready point payload may hold zero elements: the service packs a
+        # zero-length lease rather than refusing the answer.
+        if not value.elements:
+            return "0 pts"
         first = value.point(0)
         return "%d pts, first (%.4f, %.4f, %.4f)" % (value.elements,
                                                      first[0], first[1],

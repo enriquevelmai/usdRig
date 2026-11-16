@@ -44,6 +44,8 @@ import outputInspectorModel as insp  # noqa: E402
 
 BODY_PATH = "/Model/Geom/Body"
 POINTS_TARGET = BODY_PATH + ".points"
+EMPTY_PATH = "/Model/Geom/Empty"
+EMPTY_TARGET = EMPTY_PATH + ".points"
 DATA_PATH = "/Model/Data"
 SCALAR_TARGET = DATA_PATH + ".amount"
 CONTROL_A = "/Rig/Controls/Ctrl"
@@ -126,6 +128,28 @@ def _author_rig(rigexec):
     rig = rigexec.Rig(stage, "/Rig")
     rig.compile()
     return stage, rig, tz, ty, str(lift.path), str(move.path)
+
+
+def _author_empty_rig(rigexec):
+    """One matrix mover over a Points prim authored with no points at all.
+
+    A rig that publishes zero points is a valid answer rather than a failure:
+    the extraction packs a zero-length lease for it.
+    """
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Points.Define(stage, EMPTY_PATH).CreatePointsAttr().Set([])
+
+    builder = rigexec.Builder.create(stage, "/Rig")
+    ctrl = builder.add_control("Ctrl")
+    tz = stage.GetPrimAtPath(ctrl.path).GetAttribute("avars:tz")
+    _Check(tz.IsValid(), "the control has no avar attrs")
+    tz.Set(DEFAULT_TZ)
+    chain = builder.new_mover_chain("chain")
+    chain.add_matrix_mover("move", ctrl.path, None, EMPTY_TARGET)
+
+    rig = rigexec.Rig(stage, "/Rig")
+    rig.compile()
+    return stage, rig
 
 
 def _Sample(attr, frame):
@@ -376,6 +400,11 @@ def main():
         _Check(_Close(finals[index][1], REST_POINTS[index][1] + ty)
                and _Close(finals[index][2], REST_POINTS[index][2] + tz),
                (SHOWN_FRAME, index, finals[index]))
+    # A payload with points in it is spelled as its count and its first point.
+    _Check(_Row(rows, final).ValueText()
+           == "%d pts, first (%.4f, %.4f, %.4f)"
+           % (len(finals), finals[0][0], finals[0][1], finals[0][2]),
+           _Row(rows, final).ValueText())
     # Reading the shown frame demanded it; it did not move it.
     _Check(host.frame == SHOWN_FRAME, "reading the frame moved the frame")
     _Check(host.reached == [], host.reached)
@@ -554,6 +583,36 @@ def main():
     # -- nothing above authored a stage opinion ---------------------------
     _Check(stage.GetSessionLayer().ExportToString() == authored,
            "the inspector authored into the stage")
+
+    # -- a payload with no points is an answer, not a missing value -------
+    emptyStage, emptyRig = _author_empty_rig(rigexec)
+    emptyAuthored = emptyStage.GetSessionLayer().ExportToString()
+    emptyModel = insp.OutputInspectorModel(workers=0)
+    emptyBindings = emptyModel.Attach(emptyRig)
+    emptyPoints = [binding for binding in emptyBindings
+                   if binding.kind == "points"]
+    _Check(len(emptyPoints) >= 1, [binding.kind for binding in emptyBindings])
+    _Check(emptyModel.Select(emptyPoints) == [b.semantic_key
+                                              for b in emptyPoints],
+           emptyModel.Selected())
+    emptyRows = _DrainReady(emptyModel, None, len(emptyPoints))
+    for row in emptyRows:
+        value = row.packet.value
+        _Check(value is not None and value.elements == 0,
+               (row.phase, row.ValueText()))
+        _Check(not row.payload_error, row.payload_error)
+        # The line says zero without reaching for a first point the payload
+        # does not have, and it still reads as a value rather than a status.
+        _Check(row.ValueText() == "0 pts", row.ValueText())
+        _Check(row.ValueText() not in insp.STATUS_LABELS.values(),
+               row.ValueText())
+        _Check(row.label == "value" and row.status == insp.READY,
+               (row.status, row.label))
+    _Check(not emptyModel.HasWork(), "an empty payload still owed work")
+    # Reading it authored nothing, exactly as reading a payload with points.
+    _Check(emptyStage.GetSessionLayer().ExportToString() == emptyAuthored,
+           "inspecting an empty payload authored into the stage")
+    emptyModel.Close()
 
     # Display fallbacks the view relies on: an unknown disposition still
     # paints, and a real frame still reads as one.

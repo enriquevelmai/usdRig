@@ -20,7 +20,9 @@ own numbers:
     pulling the evaluator;
   * the coverage budget charges the whole job -- the snapshot clone, the
     workspace clone its lane runs on, and the freeze-captured tables -- and
-    refuses a frame that exceeds it before any lane exists.
+    refuses a frame that exceeds it before any lane exists;
+  * a payload the rig published with zero elements is a Ready answer with an
+    empty lease, not a missing buffer and not a failure.
 
 The host drives everything with ``pump()`` and ``poll()`` -- no Qt, no timer,
 and with ``workers=0`` not a thread. The last section runs a real pool.
@@ -40,6 +42,8 @@ _DLL_DIR_HANDLES = []
 
 POINTS_TARGET = "/Model/Geom/Body.points"
 SCALAR_TARGET = "/Model/Data.amount"
+EMPTY_PATH = "/Model/Geom/Empty"
+EMPTY_TARGET = EMPTY_PATH + ".points"
 CONTROL_PATH = "/Rig/Controls/Ctrl"
 REST_POINTS = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 2.0, 0.0)]
 
@@ -133,6 +137,28 @@ def _author_rig(Usd, Sdf, rigexec):
     rig = rigexec.Rig(stage, "/Rig")
     rig.compile()
     return stage, rig, ctrl.path, tz
+
+
+def _author_empty_rig(Usd, rigexec):
+    """One control-driven mover over a Points prim authored with no points.
+
+    Zero elements is a payload the extraction packs on purpose: a zero-length
+    lease rather than a buffer.
+    """
+    from pxr import UsdGeom
+    stage = Usd.Stage.CreateInMemory()
+    empty = UsdGeom.Points.Define(stage, EMPTY_PATH)
+    empty.CreatePointsAttr().Set([])
+
+    builder = rigexec.Builder.create(stage, "/Rig")
+    ctrl = builder.add_control("Ctrl")
+    stage.GetPrimAtPath(ctrl.path).GetAttribute("avars:tz").Set(1.5)
+    chain = builder.new_mover_chain("chain")
+    chain.add_matrix_mover("move", ctrl.path, None, EMPTY_TARGET)
+
+    rig = rigexec.Rig(stage, "/Rig")
+    rig.compile()
+    return stage, rig
 
 
 def _expected_tz(Usd, attr, time):
@@ -601,6 +627,43 @@ def main():
         [(p.status, p.reason) for p in admitted]
     subs.set_coverage_cap(standing_cap)
     tight.close()
+
+    # -- a payload with zero elements is an answer, not a missing buffer ---
+    emptyStage, emptyRig = _author_empty_rig(Usd, rigexec)
+    emptyAuthored = emptyStage.GetSessionLayer().ExportToString()
+    emptySubs = subscriptions.SubscriptionService(emptyRig, workers=0)
+    emptyOutputs = [binding for binding in emptySubs.discover()
+                    if binding.kind == "points"]
+    assert emptyOutputs, "an empty Points prim exports no points output"
+    emptySub = emptySubs.subscribe(emptyOutputs, [None])
+    assert emptySub.ok, (emptySub.status, emptySub.reason)
+    _drain(emptySubs)
+    emptyPackets = emptySub.poll()
+    assert len(emptyPackets) == len(emptyOutputs), emptyPackets
+    for packet in emptyPackets:
+        assert packet.status == subscriptions.READY, (packet.semantic_key,
+                                                      packet.status,
+                                                      packet.reason)
+        assert packet.elements == 0, packet.elements
+        assert packet.payload_error == "", packet.payload_error
+        answer = packet.value
+        assert answer is not None and len(answer) == 0, answer
+        assert tuple(answer.points) == (), tuple(answer.points)
+        # Strictness is not relaxed to accommodate the empty case: an empty
+        # payload still has no point zero to hand back.
+        try:
+            answer.point(0)
+        except IndexError:
+            pass
+        else:
+            raise AssertionError("point(0) answered for a zero-point payload")
+    # The live path answers the same rig with the same nothing, and the
+    # subscription authored nothing into the stage.
+    assert len(emptyRig.evaluate().moved_property(EMPTY_TARGET)) == 0
+    assert emptyStage.GetSessionLayer().ExportToString() == emptyAuthored
+    emptySub.close()
+    emptySubs.close_all()
+    assert emptySubs.stats()["pinned_payloads"] == 0, emptySubs.stats()
 
     # -- the service owns its pool and cache -------------------------------
     subs.close_all()
