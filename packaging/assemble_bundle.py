@@ -51,7 +51,7 @@ PLATFORMS = ("windows", "macos", "linux")
 IMAGING_NAMES = ("rigExecImaging.dll", "librigExecImaging.dylib",
                  "librigExecImaging.so")
 TOOL_NAMES = ("rigExecPose", "rigExecBake", "rigExecReplayInputs")
-EXAMPLE_NAMES = ("rigexec_flat.usda", "ArmShotAnim.usda")
+EXAMPLE_NAMES = ("rigexec_flat.usda", "ArmShotAnim.usda", "ArmRig.usda")
 LEGAL_NAMES = ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md")
 
 _IGNORE_RUNTIME = shutil.ignore_patterns(
@@ -514,6 +514,9 @@ def assemble(args) -> Path:
         if candidate.is_file():
             examples_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(candidate, examples_dir / name)
+
+    if (source / "icons").is_dir():
+        copy_tree(source / "icons", app_dir / "icons", trim_dev=False)
 
     if platform == "macos":
         problems = check_macos_python_stub(app_dir)

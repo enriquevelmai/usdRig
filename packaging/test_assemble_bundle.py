@@ -73,13 +73,14 @@ def make_trees(base: Path, platform: str) -> dict:
     for plugin in ("touchPose", "shapeEditor"):
         touch(source / "plugin" / plugin / "plugInfo.json", "{}\n")
         touch(source / "plugin" / plugin / "module.py")
-    for name in ("rigexec_flat.usda", "ArmShotAnim.usda"):
+    for name in ("rigexec_flat.usda", "ArmShotAnim.usda", "ArmRig.usda"):
         touch(source / "examples" / name, "#usda 1.0\n")
     for name in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
         touch(source / name, f"{name}\n")
     build = base / "build"
     tool = "rigExecPose.exe" if platform == "windows" else "rigExecPose"
     touch(build / tool, "tool\n")
+    touch(source / "icons" / "control.png")
     return {"usd": usd, "rig": rig, "python": python_home,
             "source": source, "build": build}
 
@@ -180,6 +181,8 @@ class AssembleBundleTest(unittest.TestCase):
                          "plugInfo.json").is_file())
         self.assertTrue((output / "app" / "examples" /
                          "rigexec_flat.usda").is_file())
+        self.assertTrue((output / "app" / "examples" / "ArmRig.usda").is_file())
+        self.assertTrue((output / "app" / "icons" / "control.png").is_file())
         manifest = json.loads(
             (output / "bundle-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], "1.2.0")

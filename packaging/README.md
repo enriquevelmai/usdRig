@@ -27,7 +27,8 @@ notarizes as one unit. Inside `app/`:
 | `python/` | CPython home OpenUSD was compiled against |
 | `rig/` | RigExec `cmake --install` prefix, plus CLI tools in `rig/bin` |
 | `plugins/` | `touchPose`, `shapeEditor` usdview plug-ins |
-| `examples/` | `rigexec_flat.usda`, `ArmShotAnim.usda` |
+| `examples/` | `rigexec_flat.usda`, `ArmShotAnim.usda`, and its referenced `ArmRig.usda` |
+| `icons/` | node icons referenced by the example rig |
 
 The launcher derives all of these paths from its own location, sets
 `PYTHONPATH`, `PXR_PLUGINPATH_NAME`, `PATH`, and the platform loader
