@@ -498,6 +498,7 @@ BuildEnv(const Bundle &bundle)
     env.emplace_back("TOUCHPOSE_PLUGIN_DIR",
                      (app / "plugins" / "touchPose").string());
     env.emplace_back("PYTHONNOUSERSITE", "1");
+    env.emplace_back("PYTHONDONTWRITEBYTECODE", "1");
     return env;
 }
 

@@ -85,6 +85,17 @@ still warn and skip, producing clearly unsigned bundles.
 | macOS | `codesign` (hardened runtime) on every Mach-O, then notarization + stapling (`packaging/sign-macos.sh`) | `MACOS_SIGNING_IDENTITY`, `MACOS_CERTIFICATE_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `AC_API_KEY_ID`, `AC_API_ISSUER_ID`, `AC_API_KEY_BASE64` |
 | Linux | No per-`.so` OS signing exists; the publish job GPG-detach-signs `SHA256SUMS.txt` when a key is configured | `LINUX_GPG_PRIVATE_KEY`, `LINUX_GPG_PASSPHRASE` |
 
+Signing orders canonical paths from nested code outward so signing
+`Python.app` cannot invalidate the containing framework's resource seal.
+The launcher disables Python bytecode writes to preserve that seal during
+use. CI verifies the Python library directly as well as the outer app,
+including after archive extraction and startup.
+
+A rejected notarization prints Apple's detailed report and stops before
+stapling or publishing. To retrieve an older report with the repository's
+existing signing credentials, dispatch `notarization-log.yml` with its
+`submission_id` input.
+
 ## Building a bundle by hand
 
 Given an OpenUSD install built with usdview + Python, a RigExec build,

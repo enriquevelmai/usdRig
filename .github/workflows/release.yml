@@ -413,6 +413,9 @@ jobs:
           env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             QT_QPA_PLATFORM=offscreen "$exe" "$stage" \
             --norender --quitAfterStartup
+          app_bundle="${exe%/Contents/MacOS/usdRigView}"
+          codesign --verify --deep --strict "$app_bundle"
+          codesign --verify --strict "$app_bundle/Contents/Resources/app/python/Python"
 
       # ---- Linux: assemble, smoke, tar ---------------------------------
       - name: Assemble, smoke and tar bundle (Linux)

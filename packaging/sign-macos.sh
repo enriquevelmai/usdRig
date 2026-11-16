@@ -56,14 +56,13 @@ sign_entitled() {
 }
 
 # Executables that host usdview need the entitlements, not just the
-# launcher: the bundled Python interpreter (bin/python* and the
-# Python.framework binary) dlopens the plug-in libraries and runs Qt.
+# launcher: bin/python* and the Python.app host dlopen plug-in libraries
+# and run Qt. The framework Python binary is a dylib, not an executable,
+# and must not receive entitlements.
 needs_entitlements() {
     case "$1" in
         */app/python/bin/python*) return 0 ;;
-        */app/python/Python) return 0 ;;
         */app/python/Resources/Python.app/Contents/MacOS/Python) return 0 ;;
-        */Python.framework/Versions/*/Python) return 0 ;;
         *.app) return 0 ;;
         *) return 1 ;;
     esac
@@ -86,9 +85,9 @@ needs_entitlements() {
             esac
         fi
     done
-    find "$app" -type d \( -name "*.framework" -o -name "*.app" \
+    find "$app_real" -type d \( -name "*.framework" -o -name "*.app" \
         -o -name "*.xpc" -o -name "*.appex" \) | while IFS= read -r dir; do
-        if [ "$dir" != "$app" ]; then
+        if [ "$dir" != "$app_real" ]; then
             echo "$dir"
         fi
     done
@@ -103,14 +102,49 @@ done
 
 sign_entitled "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
+# The flattened framework is inferred as a bundle from Resources/Info.plist.
+# Outer --deep verification does not validate its resource envelope here.
+if [ -f "$app/Contents/Resources/app/python/Python" ]; then
+    codesign --verify --strict --verbose=2 \
+        "$app/Contents/Resources/app/python/Python"
+fi
 
 if [ -n "${AC_API_KEY_ID:-}" ] && [ -n "${AC_API_ISSUER_ID:-}" ] && \
    [ -n "${AC_API_KEY_PATH:-}" ]; then
-    zip_file="$(mktemp -d)/usdRigView.zip"
+    notary_dir="$(mktemp -d)"
+    trap 'rm -rf "$notary_dir"' EXIT
+    zip_file="$notary_dir/usdRigView.zip"
+    result_file="$notary_dir/submission.json"
     ditto -c -k --keepParent "$app" "$zip_file"
+    submit_exit=0
     xcrun notarytool submit "$zip_file" \
         --key "$AC_API_KEY_PATH" --key-id "$AC_API_KEY_ID" \
-        --issuer "$AC_API_ISSUER_ID" --wait
+        --issuer "$AC_API_ISSUER_ID" --wait --output-format json \
+        > "$result_file" || submit_exit=$?
+    cat "$result_file"
+    read -r submission_id status < <(python3 - "$result_file" <<'PYNOTARY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        result = json.load(stream)
+    print(result.get("id") or "-", result.get("status") or "-")
+except (OSError, ValueError, AttributeError):
+    print("- -")
+PYNOTARY
+    )
+    if [ "$submit_exit" != "0" ] || [ "$status" != "Accepted" ]; then
+        echo "error: notarization not accepted (status: $status," \
+            "submit exit: $submit_exit, submission: $submission_id)" >&2
+        if [ "$submission_id" != "-" ]; then
+            xcrun notarytool log "$submission_id" \
+                --key "$AC_API_KEY_PATH" --key-id "$AC_API_KEY_ID" \
+                --issuer "$AC_API_ISSUER_ID" || \
+                echo "warning: could not retrieve notarization log" >&2
+        fi
+        exit 1
+    fi
     xcrun stapler staple "$app"
     xcrun stapler validate "$app"
     spctl -a -t exec -vvv "$app"

@@ -414,6 +414,7 @@ class AssembleBundleTest(unittest.TestCase):
         self.assertEqual(env_result.returncode, 0, env_result.stderr)
         env_values = dict(line.split("=", 1)
                           for line in env_result.stdout.splitlines())
+        self.assertEqual(env_values["PYTHONDONTWRITEBYTECODE"], "1")
         editor_dir = imaging.parent / "python" / "rigExecUsdview"
         self.assertIn(editor_dir.resolve(),
                       [Path(entry).resolve() for entry in
