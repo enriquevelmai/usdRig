@@ -12,7 +12,8 @@
 // fallback path. Subscribe, UpdateSubscription, PollResults, PumpCallbacks and
 // Close are owner-thread calls; a worker carries only values captured before
 // it was queued and validates liveness and the scheduler's fences at
-// completion, outside every lock it holds.
+// completion, holding the pool's publish fence across the coverage insert and
+// that frame's completion, and never the state lock.
 //
 // Demand is shared, never mutated after dispatch: outputs union into one
 // launched mask per exact key — rig, frame, compile epoch, and the compiled
@@ -341,6 +342,14 @@ public:
 private:
     std::shared_ptr<RigExecSubscriptionState> _state;
 };
+
+/// Test-only probe for the deterministic publish-fence race: when set, the
+/// job body of the service above runs it while holding the scheduler's fence
+/// mutex, after a passing freshness check and before the coverage insert and
+/// that frame's completion. Null in production. Set it only while no publish
+/// is in flight (a test sets it around one driven job); the probe itself must
+/// never publish, clear, or take the fence.
+void RigExecSetExplicitPublishFenceProbeForTesting(std::function<void()> probe);
 
 /// A coarse container-size estimate for one sampled vector: what a capture
 /// charges the coverage budget for the values it holds. It counts the

@@ -12,11 +12,19 @@
 #include "outputSubscription.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <set>
 #include <utility>
 
 namespace rigExec {
+
+// The test-only publish-fence probe (see
+// RigExecSetExplicitPublishFenceProbeForTesting): null in production, set
+// only while no publish is in flight. The fenced publish below runs it while
+// holding the fence mutex, so probe and publication share a translation unit.
+static std::function<void()> _sPublishFenceProbe;
+
 namespace {
 
 // One frame of one rig at one compiled epoch of one compilation: the unit
@@ -1193,15 +1201,6 @@ private:
                 return RigExecExplicitOutcome::DeclinedInvalid;
             }
         }
-        // The publish fence, beside the generation check the run itself makes:
-        // an edit that landed while the bodies were running owns this frame
-        // now, so an answer under the retired token never lands.
-        if (!_host.scheduler->IsExplicitRequestCurrent(request)) {
-            return _RetireRun(job, request,
-                              RigExecExplicitOutcome::DeclinedGeneration,
-                              RigExecOutputStatus::Invalidated,
-                              "the pool retired this frame while its job ran");
-        }
         size_t payload = 0;
         for (const RigExecOutputPacket &packet : result.packets) {
             payload += packet.payload.ByteCount();
@@ -1212,6 +1211,22 @@ private:
                 job, request, RigExecExplicitOutcome::DeclinedInvalid,
                 RigExecOutputStatus::Failed,
                 "the coverage budget declined this frame's payloads");
+        }
+        // The publish fence spans the freshness check, the coverage insert and
+        // this frame's completion: the owner's cancel-then-clear holds the
+        // same mutex across generation bump + queue purge + cache clear, so a
+        // retired answer can neither slip between the check and the store nor
+        // stamp its frame Ready after that clear. Lock order: fence, then the
+        // state lock; the bodies and the byte charge above stay outside it.
+        std::lock_guard<std::mutex> fence(_host.scheduler->FenceMutex());
+        if (!_host.scheduler->IsExplicitRequestCurrent(request)) {
+            return _RetireRun(job, request,
+                              RigExecExplicitOutcome::DeclinedGeneration,
+                              RigExecOutputStatus::Invalidated,
+                              "the pool retired this frame while its job ran");
+        }
+        if (_sPublishFenceProbe) {
+            _sPublishFenceProbe();
         }
         // The lane's arena dies with the job, so the record keeps the payloads
         // and claims no retained workspace.
@@ -1486,6 +1501,12 @@ bool
 RigExecOutputSubscriptionService::IsStopping() const
 {
     return _state->IsStopping();
+}
+
+void
+RigExecSetExplicitPublishFenceProbeForTesting(std::function<void()> probe)
+{
+    _sPublishFenceProbe = std::move(probe);
 }
 
 size_t

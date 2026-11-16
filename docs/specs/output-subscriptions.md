@@ -458,7 +458,11 @@ subscription id and the exact frames the request demands:
 - **The publish fence runs twice**, before the bodies and again before the
   publish, so an edit that lands while a job runs publishes nothing: the frame
   answers `Invalidated`, and the owner's next pump re-captures under the live
-  fence token. A scoped edit retires only the times it names.
+  fence token. The second check holds the pool's publish fence across the
+  coverage insert and that frame's completion, exactly as the background-warm
+  route does, so the owner's cancel-then-clear serializes on either side of the
+  whole publication rather than slipping between its check and its store. A
+  scoped edit retires only the times it names.
 - **Answers are pinned, not copied.** A poll that answers from a record pins
   that payload for as long as the subscription lives; the pin is shared between
   clients that ask for the same output, and closing releases it.

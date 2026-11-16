@@ -1201,6 +1201,150 @@ TestScopedRetirementWhileRunningInvalidates()
     CHECK(AllReady(service.PollResults(sub)));
 }
 
+// The test-only seam: the service runs this while holding the pool's publish
+// fence, after its freshness check passed and before the coverage insert.
+struct _PublishProbe {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> inside{false};
+    std::atomic<bool> release{false};
+};
+
+bool
+_WaitUntil(const std::function<bool()> &predicate)
+{
+    for (int spin = 0; spin < 10000; ++spin) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+// The owner's cancel-then-clear, fenced as RigExecImagingRegistry's clear
+// fences it: the pool's fence outermost, the cancel before the cache clear,
+// neither under the service's state lock or a cache lock.
+void
+_FencedCancelAndClear(RigExecBackgroundScheduler &scheduler,
+                      RigExecFrameCache &cache, const SdfPath &rig,
+                      bool scopedTime, double timeValue,
+                      std::atomic<bool> &done)
+{
+    std::lock_guard<std::mutex> fence(scheduler.FenceMutex());
+    if (scopedTime) {
+        scheduler.CancelGenerationTimes(rig, {UsdTimeCode(timeValue)});
+    } else {
+        scheduler.CancelGeneration(rig);
+    }
+    cache.Clear();
+    done.store(true);
+}
+
+// FENCE-RACE. A job paused between its freshness check and its coverage
+// insert -- holding the pool's fence -- while the owner runs its
+// cancel-then-clear: the clear cannot land mid-pause, so it serializes after
+// the insert and the cache stays empty. Without the shared fence the clear
+// slips between the check and the store, and the resumed insert repopulates a
+// record for a generation the owner already retired, which the frame then
+// answers Ready from values its current inputs do not stand for.
+void
+_RunPausedPublicationAgainstFencedClear(const char *testName, bool scopedTime)
+{
+    std::printf("progress: %s\n", testName);
+    std::fflush(stdout);
+    Harness h(1);
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const RigExecOutputTime frame = TimeOf(12.0);
+
+    _PublishProbe probe;
+    RigExecSetExplicitPublishFenceProbeForTesting([&] {
+        probe.inside.store(true);
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        probe.cv.wait_for(lock, std::chrono::seconds(20),
+                          [&] { return probe.release.load(); });
+    });
+
+    h.gateOpen = false;
+    auto sub = service.Subscribe(a.root, RequestAt(frame, {a.scalar}));
+    CHECK(sub.IsValid());
+    // The job waits inside its bodies, so it has not reached the publish fence
+    // yet: the clear below can only meet it there.
+    CHECK(h.WaitUntilRunning());
+    const RigExecFrameGeneration generationBefore =
+        h.scheduler->CurrentGeneration(a.root);
+    const RigExecWarmFenceToken tokenBefore =
+        h.scheduler->CurrentExplicitFenceToken(a.root, frame);
+    h.OpenGate();
+    CHECK(_WaitUntil([&] { return probe.inside.load(); }));
+
+    std::atomic<bool> cleared{false};
+    std::thread clearer([&] {
+        _FencedCancelAndClear(*h.scheduler, h.cache, a.root, scopedTime, 12.0,
+                              cleared);
+    });
+    // The clear reached the fence and waits: the job holds the fence across
+    // its check, its insert, and this frame's completion.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(!cleared.load());
+    {
+        std::lock_guard<std::mutex> lock(probe.mutex);
+        probe.release.store(true);
+    }
+    probe.cv.notify_all();
+    clearer.join();
+    RigExecSetExplicitPublishFenceProbeForTesting(nullptr);
+    h.scheduler->WaitUntilIdle();
+
+    // The job published under the token that stood when it checked, and the
+    // serialized clear took that record back: no retired coverage stands and
+    // no poll answers the retired generation.
+    CHECK(h.laneRuns == 1);
+    CHECK(h.scheduler->Stats().explicitPublished == 1);
+    CHECK(h.scheduler->Stats().explicitDeclinedGeneration == 0);
+    CHECK(h.cache.CoverageRecordCount() == 0);
+    CHECK(h.cache.CoverageHeld().payload == 0);
+    CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    if (scopedTime) {
+        CHECK(h.scheduler->CurrentGeneration(a.root) == generationBefore);
+        CHECK(h.scheduler->CurrentExplicitFenceToken(a.root, frame) !=
+              tokenBefore);
+    } else {
+        CHECK(h.scheduler->CurrentGeneration(a.root) == generationBefore + 1);
+    }
+    const std::vector<RigExecOutputPacket> retired = service.PollResults(sub);
+    CHECK(retired.size() == 1);
+    if (!retired.empty()) {
+        CHECK(retired[0].status != RigExecOutputStatus::Ready);
+        CHECK(retired[0].payload.IsEmpty());
+    }
+
+    // The owner's pump re-captures against the live generation, so the frame
+    // is answerable again rather than stuck on the wiped record.
+    service.PumpCallbacks();
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+    h.scheduler->WaitUntilIdle();
+    CHECK(h.laneRuns == 2);
+    CHECK(h.cache.CoverageRecordCount() == 1);
+    CHECK(AllReady(service.PollResults(sub)));
+}
+
+void
+TestFencedGenerationClearSerializesAfterPausedPublication()
+{
+    _RunPausedPublicationAgainstFencedClear(
+        "TestFencedGenerationClearSerializesAfterPausedPublication", false);
+}
+
+void
+TestFencedScopedTimeClearSerializesAfterPausedPublication()
+{
+    _RunPausedPublicationAgainstFencedClear(
+        "TestFencedScopedTimeClearSerializesAfterPausedPublication", true);
+}
+
 void
 TestExactTimesAcrossRigsAndStages()
 {
@@ -2459,6 +2603,8 @@ main()
     TestScopedRetirementOfAQueuedJobRedispatches();
     TestGenerationBumpWhileRunningPublishesNothing();
     TestScopedRetirementWhileRunningInvalidates();
+    TestFencedGenerationClearSerializesAfterPausedPublication();
+    TestFencedScopedTimeClearSerializesAfterPausedPublication();
     TestExactTimesAcrossRigsAndStages();
     TestExplicitDemandRunsWhileWarmingIsOff();
     TestCoverageHitPullsNothing();
