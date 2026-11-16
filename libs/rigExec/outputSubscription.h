@@ -169,6 +169,12 @@ private:
 /// pointers alive. A capture holds no stage, evaluator, imaging registry or
 /// live handle, which is what makes it safe to queue.
 ///
+/// The capture hook fills `inputs`, `context`, `captured`, `upstreamRevision`
+/// and `bytes`; the lane hook fills `snapshot`, `patch` and `workspace`. The
+/// service calls the lane hook only after the coverage record missed and the
+/// byte reservation was granted, so a frame answered from coverage or refused
+/// by the budget never builds an arena.
+///
 /// `bytes` is the admission estimate: `capture` for the sampled vector,
 /// `workspace` for the lane's private arena, `payload` for the values the run
 /// will publish. The frame cache refuses the job before it allocates when the
@@ -205,15 +211,27 @@ struct RigExecSubscriptionCapture {
 using RigExecSubscriptionCatalogHook =
     std::function<std::shared_ptr<const RigExecOutputCatalog>(const SdfPath &)>;
 
-/// Captures one exact frame's job for `demand`: sample its inputs, take the
-/// frozen snapshot, and state the generation and byte estimate the answers
-/// belong to. Owner thread only -- this is the only live-USD read in the
-/// lifecycle. False, having dispatched nothing, when the frame cannot be
-/// captured; the packets then report `Failed` with `error`, and the service
-/// tries again on the owner's next pump.
+/// Preflights one exact frame's job for `demand`: sample its inputs and state
+/// the generation and byte estimate the answers belong to. Owner thread only --
+/// this is the only live-USD read in the lifecycle, and it allocates no
+/// snapshot and no arena. False, having dispatched nothing, when the frame
+/// cannot be captured; the packets then report `Failed` with `error`, and the
+/// service tries again on the owner's next pump.
 using RigExecSubscriptionCaptureHook = std::function<bool(
     const SdfPath &rig, const RigExecOutputTimeDemand &demand,
     const RigExecOutputCatalog &catalog, RigExecSubscriptionCapture *out,
+    std::string *error)>;
+
+/// Builds the lane `capture` runs on: the frozen snapshot of the standing
+/// program and the private arena cloned from it. The service calls this only
+/// after the coverage record missed and `TryReserveCoverage` granted the
+/// estimate the capture hook stated, so a frame that coverage answers or the
+/// budget refuses allocates nothing. Owner thread only, and it must not read
+/// live USD: the frame's facts are already in `capture`. False leaves the frame
+/// `Failed`, and the reservation the frame held comes back with it.
+using RigExecSubscriptionLaneHook = std::function<bool(
+    const SdfPath &rig, const RigExecOutputTimeDemand &demand,
+    const RigExecOutputCatalog &catalog, RigExecSubscriptionCapture *capture,
     std::string *error)>;
 
 /// What the service needs from its host. `stepRunner` names the lane's
@@ -225,6 +243,7 @@ struct RigExecSubscriptionHost {
     RigExecFrameCache *frameCache = nullptr;
     RigExecSubscriptionCatalogHook resolveCatalog;
     RigExecSubscriptionCaptureHook capture;
+    RigExecSubscriptionLaneHook lane;
     RigExecFrozenRequestedStepRunner stepRunner;
 };
 

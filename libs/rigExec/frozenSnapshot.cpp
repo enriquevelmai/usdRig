@@ -8,7 +8,13 @@
 #include "pxr/base/tf/getenv.h"
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <optional>
 #include <set>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 namespace rigExec {
 
@@ -545,6 +551,873 @@ _CloneImpl(const RigExecBakedProgramImpl &src, RigExecBakedProgramImpl *dst,
     }
 }
 
+// ------------------------------------------------------------
+// Frozen lane storage
+// ------------------------------------------------------------
+
+namespace {
+
+// A frozen lane owns a field-by-field clone of the compiled program
+// (_CloneImpl above), so the arena's bytes are the program's container
+// storage. The sums below are the bound a host charges the coverage budget
+// for a lane before that arena exists.
+//
+// Shared immutable storage -- a shared_ptr's target, a VtValue's array,
+// interned path and token text -- is aliased by the copy rather than
+// re-owned, so it contributes only the stored size of the handle that points
+// at it. Containers are counted by element, and an element's own containers
+// one level down; the idle scratch the clone lets go of is still counted,
+// because the bound is taken before anything is dropped.
+
+// A red-black node carries its value, a colour and three links; a hash
+// bucket array holds one pointer per bucket.
+constexpr size_t kTreeLinks = 4 * sizeof(void *);
+constexpr size_t kHashLinks = 2 * sizeof(void *);
+// A short string lives inside the object; only a longer one allocates.
+constexpr size_t kStringInline = 16;
+
+// Whether one element type owns containers of its own: most containers the
+// arena clones hold plain values, and walking an element that owns nothing is
+// pure cost, so the walk is compiled out for them.
+template <class T> struct _OwnsStorage : std::false_type {};
+
+template <class T>
+size_t
+_OwnedBytes(const T &)
+{
+    return 0;
+}
+
+size_t _OwnedBytes(const std::string &text);
+size_t _OwnedBytes(const RigExecCompiledGraph &graph);
+size_t _OwnedBytes(const RigExecCompiledOp &op);
+size_t _OwnedBytes(const RigExecOpCluster &cluster);
+size_t _OwnedBytes(const RigExecOpValueState &value);
+size_t _OwnedBytes(const RigExecOpAdapterState &state);
+size_t _OwnedBytes(const RigExecOpExclusionProof &proof);
+size_t _OwnedBytes(const RigExecBakedLeafPools &pools);
+size_t _OwnedBytes(const RigExecBakedPathLeaves &leaves);
+size_t _OwnedBytes(const RigExecBakedSourceWatch &watch);
+size_t _OwnedBytes(const RigExecBakedCones &cones);
+size_t _OwnedBytes(const RigExecBakedClusterSet &set);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::ConstraintArrays &arrays);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::Constraint &constraint);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::Solver &solver);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::GeomChain &chain);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::GeomRevision &revision);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::WeightObject &object);
+size_t _OwnedBytes(const RigExecBakedProgramImpl::WeightField &field);
+
+template <> struct _OwnsStorage<std::string> : std::true_type {};
+template <> struct _OwnsStorage<RigExecCompiledGraph> : std::true_type {};
+template <> struct _OwnsStorage<RigExecCompiledOp> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpCluster> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpValueState> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpAdapterState> : std::true_type {};
+template <> struct _OwnsStorage<RigExecOpExclusionProof> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedLeafPools> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedPathLeaves> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedSourceWatch> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedCones> : std::true_type {};
+template <> struct _OwnsStorage<RigExecBakedClusterSet> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::ConstraintArrays>
+    : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::Constraint> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::Solver> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::GeomChain> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::GeomRevision> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::WeightObject> : std::true_type {};
+template <>
+struct _OwnsStorage<RigExecBakedProgramImpl::WeightField> : std::true_type {};
+
+size_t
+_OwnedBytes(const std::string &text)
+{
+    return text.capacity() >= kStringInline ? text.capacity() + 1 : 0;
+}
+
+template <class T, class Alloc>
+size_t
+_OwnedBytes(const std::vector<T, Alloc> &values)
+{
+    size_t bytes = values.capacity() * sizeof(T);
+    if constexpr (_OwnsStorage<T>::value) {
+        for (const T &value : values) {
+            bytes += _OwnedBytes(value);
+        }
+    }
+    return bytes;
+}
+
+template <class Key, class Value, class Compare, class Alloc>
+size_t
+_OwnedBytes(const std::map<Key, Value, Compare, Alloc> &entries)
+{
+    size_t bytes =
+        entries.size() * (sizeof(std::pair<const Key, Value>) + kTreeLinks);
+    if constexpr (_OwnsStorage<Value>::value) {
+        for (const auto &entry : entries) {
+            bytes += _OwnedBytes(entry.second);
+        }
+    }
+    return bytes;
+}
+
+template <class Key, class Compare, class Alloc>
+size_t
+_OwnedBytes(const std::set<Key, Compare, Alloc> &keys)
+{
+    return keys.size() * (sizeof(Key) + kTreeLinks);
+}
+
+template <class Key, class Value, class Hash, class Equal, class Alloc>
+size_t
+_OwnedBytes(const std::unordered_map<Key, Value, Hash, Equal, Alloc> &entries)
+{
+    size_t bytes =
+        entries.bucket_count() * sizeof(void *) +
+        entries.size() * (sizeof(std::pair<const Key, Value>) + kHashLinks);
+    if constexpr (_OwnsStorage<Value>::value) {
+        for (const auto &entry : entries) {
+            bytes += _OwnedBytes(entry.second);
+        }
+    }
+    return bytes;
+}
+
+template <class T>
+size_t
+_OwnedBytes(const std::optional<T> &held)
+{
+    return held ? _OwnedBytes(*held) : 0;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedClusterSet &set)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(set.words);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecCompiledOp &op)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(op.predecessors);
+    add(op.successors);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecOpCluster &cluster)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(cluster.members);
+    add(cluster.predecessors);
+    add(cluster.successors);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecOpValueState &value)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(value.key);
+    add(value.scratch);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecCompiledGraph &graph)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(graph.ops);
+    add(graph.canonicalIndex);
+    add(graph.readers);
+    add(graph.cycles);
+    add(graph.cycleMembers);
+    add(graph.clusters);
+    add(graph.opClusters);
+    add(graph.volatileOps);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecOpAdapterState &state)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(state.values);
+    add(state.leaves);
+    add(state.changedLeaves);
+    add(state.changedValues);
+    add(state.excludedValues);
+    add(state.skipEffects);
+    add(state.seeds);
+    add(state.candidateOps);
+    add(state.inputRevisions);
+    add(state.inputKeys);
+    add(state.inputScratch);
+    add(state.sourceKeys);
+    add(state.sourceScratch);
+    add(state.coveredPropertyInputs);
+    add(state.coveredTypedInputs);
+    add(state.inputExact);
+    add(state.retainedFirst);
+    add(state.constantSource);
+    add(state.sourceVisits);
+    add(state.contentSourceKeys);
+    add(state.contentInputKeys);
+    add(state.leafVersionMismatch);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecOpExclusionProof &proof)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(proof.keys);
+    add(proof.removedKeys);
+    add(proof.cycles);
+    add(proof.cycleMembers);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedLeafPools &pools)
+{
+    size_t total = 0;
+    pools.ForEach([&total](const auto &pool) {
+        const auto add = [&total](const auto &member) {
+            total += _OwnedBytes(member);
+        };
+        add(pool.value);
+        add(pool.changed);
+        add(pool.mustSample);
+        add(pool.id);
+        add(pool.changedList);
+        add(pool.markedList);
+        add(pool.editSerial);
+    });
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedPathLeaves &leaves)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(leaves.attributes);
+    add(leaves.hops);
+    add(leaves.varying);
+    add(leaves.compiledRig);
+    add(leaves.overrideReached);
+    add(leaves.walks);
+    add(leaves.values);
+    add(leaves.changed);
+    add(leaves.versions);
+    add(leaves.observed);
+    add(leaves.observedVersions);
+    add(leaves.observedRuns);
+    add(leaves.mustSample);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedSourceWatch &watch)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(watch.values);
+    add(watch.words);
+    add(watch.exact);
+    add(watch.dirty);
+    add(watch.overrideSlotsHeld);
+    add(watch.dirtyList);
+    add(watch.standing);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedCones &cones)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(cones.avarCluster);
+    add(cones.chainBaseClusters);
+    add(cones.solverPointsClusters);
+    add(cones.revisionClusters);
+    add(cones.revisionStaticCluster);
+    add(cones.nativeSourceClusters);
+    add(cones.deltaBaseClusters);
+    add(cones.constraintArrayClusters);
+    add(cones.varyingSteps);
+    add(cones.overrideSteps);
+    add(cones.headReaders);
+    add(cones.walkReaders);
+    add(cones.fieldReaders);
+    add(cones.fieldSteps);
+    add(cones.restReaders);
+    add(cones.ladderReaders);
+    add(cones.editRoute);
+    add(cones.avarStep);
+    add(cones.avarVersionSteps);
+    add(cones.chainBaseSteps);
+    add(cones.solverPointsSteps);
+    add(cones.revisionSteps);
+    add(cones.revisionStaticStep);
+    add(cones.nativeSourceSteps);
+    add(cones.deltaBaseSteps);
+    add(cones.constraintArraySteps);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::ConstraintArrays &arrays)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(arrays.pathText);
+    add(arrays.weights);
+    add(arrays.translationOffsets);
+    add(arrays.rotationOffsets);
+    add(arrays.diagnostics);
+    add(arrays.lastWeights);
+    add(arrays.lastTranslationOffsets);
+    add(arrays.lastRotationOffsets);
+    add(arrays.lastDiagnostics);
+    add(arrays.poleWeights);
+    add(arrays.lastPoleWeights);
+    add(arrays.poleDiagnostics);
+    add(arrays.lastPoleDiagnostics);
+    add(arrays.attributes);
+    add(arrays.keys);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::Constraint &constraint)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(constraint.pathText);
+    add(constraint.sourcePathTexts);
+    add(constraint.deltaBasePathText);
+    add(constraint.weightScratch);
+    add(constraint.weightError);
+    add(constraint.targetSlots);
+    add(constraint.snapshotTargets);
+    add(constraint.sources);
+    add(constraint.sourceNatives);
+    add(constraint.sourcePaths);
+    add(constraint.ikRestLive);
+    add(constraint.poleObjects);
+    add(constraint.poleObjectNatives);
+    add(constraint.matchScalars);
+    add(constraint.matchPoleSourceRides);
+    add(constraint.matchShown);
+    add(constraint.matchRiders);
+    add(constraint.harmonicsScalars);
+    add(constraint.harmonicsPositions);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::Solver &solver)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(solver.pathText);
+    add(solver.relationshipRequirements);
+    add(solver.solveDescriptorKey);
+    add(solver.restSlots);
+    add(solver.restRefs);
+    add(solver.restReads);
+    add(solver.restOverrides);
+    add(solver.controls);
+    add(solver.bone2dDoubles);
+    add(solver.bone2dBools);
+    add(solver.bone2dSelectors);
+    add(solver.jointGroupSelectors);
+    add(solver.ribbonPoints);
+    add(solver.lastRibbonPoints);
+    add(solver.ribbonConstantPoints);
+    add(solver.outputs);
+    add(solver.outputSnapshots);
+    add(solver.outFrames);
+    add(solver.outPresent);
+    add(solver.outPosition);
+    add(solver.fallbackSlots);
+    add(solver.controlReads);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomChain &chain)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(chain.revisions);
+    add(chain.groupBounds);
+    add(chain.baseGroups);
+    add(chain.resultIds);
+    add(chain.spareIds);
+    add(chain.derived);
+    add(chain.gpuLastFrame);
+    add(chain.gpuScratch);
+    add(chain.gpuDerivedSteps);
+    add(chain.windowDeviceDerivedSteps);
+    add(chain.gpuKeyOps);
+    add(chain.gpuExtentSample);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::GeomRevision &revision)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(revision.moverPathText);
+    add(revision.blendChannels);
+    add(revision.blendSamples);
+    add(revision.influenceSlots);
+    add(revision.output);
+    add(revision.stagingOutput);
+    add(revision.gpuChannels);
+    add(revision.pointBindings);
+    add(revision.transformRecords);
+    add(revision.influenceRecords);
+    add(revision.packetInfluences);
+    add(revision.influences);
+    add(revision.chunks);
+    add(revision.partitionProducerSets);
+    add(revision.envelope);
+    add(revision.resolveScratch);
+    add(revision.rows);
+    add(revision.palette);
+    add(revision.passedPoints);
+    add(revision.layoutOverlay);
+    add(revision.windowCache);
+    add(revision.deviceTicks);
+    add(revision.joinSeen);
+    add(revision.groupWritten);
+    add(revision.enteringWriter);
+    add(revision.haloGroups);
+    add(revision.haloPoints);
+    add(revision.mushGroups);
+    add(revision.groups);
+    add(revision.groupIds);
+    add(revision.wholeEntering);
+    add(revision.pins);
+    add(revision.deltasSpare);
+    add(revision.layoutLeaves);
+    add(revision.leaves);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::WeightObject &object)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(object.oracleFrozenKeys);
+    add(object.oracleName);
+    add(object.oracleAxisName);
+    add(object.oracleBoundsName);
+    add(object.values);
+    add(object.indices);
+    add(object.inputs);
+    add(object.combineTargetPoints);
+    add(object.targetPoints);
+    add(object.samplePoints);
+    add(object.curvePoints);
+    add(object.falloffCurve);
+    add(object.packetPointViews);
+    add(object.packetPointScratch);
+    add(object.packetLocalCurve);
+    add(object.packetInputRefs);
+    add(object.oracleLeaves);
+    add(object.pointLeaves);
+    return total;
+}
+
+size_t
+_OwnedBytes(const RigExecBakedProgramImpl::WeightField &field)
+{
+    size_t total = 0;
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    add(field.volumes);
+    add(field.availableChains);
+    add(field.scalarReads);
+    add(field.scalarObjects);
+    add(field.scalarMembers);
+    add(field.pointReads);
+    add(field.values);
+    add(field.enteringGather);
+    add(field.error);
+    return total;
+}
+
+size_t
+_ProgramStorageBytes(const RigExecBakedProgramImpl &src)
+{
+    size_t total = sizeof(RigExecBakedProgramImpl);
+    const auto add = [&total](const auto &member) {
+        total += _OwnedBytes(member);
+    };
+    // Every field the program clone copies (_CloneImpl above, in its order):
+    // a container contributes its elements, anything else contributes
+    // nothing. A new compiled-rig field belongs in both lists.
+    add(src.assetRootPath);
+    add(src.ownedJointSolverBinding);
+    add(src.cycleExclusionProof);
+    add(src.cycleSkipReasons);
+    add(src.hasPropertyChains);
+    add(src.programAffinity);
+    add(src.paths);
+    add(src.pathTexts);
+    add(src.index);
+    add(src.slotKind);
+    add(src.providerActive);
+    add(src.parent);
+    add(src.propParent);
+    add(src.xformSlots);
+    add(src.xformPrimsBySlot);
+    add(src.assetRoot);
+    add(src.xformBase);
+    add(src.lastXformBase);
+    add(src.constraintArrays);
+    add(src.nativeSources);
+    add(src.nativeFrames);
+    add(src.lastNativeFrames);
+    add(src.nativeFrameOk);
+    add(src.lastNativeFrameOk);
+    add(src.ladders);
+    add(src.interveningSlots);
+    add(src.interveningAnchors);
+    add(src.ladderVarying);
+    add(src.ladderOverrides);
+    add(src.restChainVaries);
+    add(src.posedAuthored);
+    add(src.posedAuthoredM);
+    add(src.restM);
+    add(src.restPts);
+    add(src.restFrames);
+    add(src.selfD);
+    add(src.posedD);
+    add(src.parentSpaceM);
+    add(src.parentSpaceAuthored);
+    add(src.lastPosedD);
+    add(src.lastParentSpaceM);
+    add(src.lastParentSpaceAuthored);
+    add(src.lastRotationSign);
+    add(src.parentDinv);
+    add(src.rotOrder);
+    add(src.restRoundTrip);
+    add(src.defaultRoundTrip);
+    add(src.lastRestM);
+    add(src.lastSelfD);
+    add(src.lastParentDinv);
+    add(src.lastPosedAuthoredM);
+    add(src.lastPosedAuthored);
+    add(src.lastRotOrder);
+    add(src.restChanged);
+    add(src.ladderChanged);
+    add(src.restMoved);
+    add(src.ladderMoved);
+    add(src.xyzToken);
+    add(src.noScaleAvars);
+    add(src.rotationSign);
+    add(src.poseInterpolators);
+    add(src.poseWeightPaths);
+    add(src.poseWeights);
+    add(src.poseWeightIndex);
+    add(src.avarConstants);
+    add(src.avarBindings);
+    add(src.avarConstantBindings);
+    add(src.avarBindingBegin);
+    add(src.avarConstantBindingBegin);
+    add(src.patchableAvars);
+    add(src.promotedAvars);
+    add(src.boundInputs);
+    add(src.varyingInputs);
+    add(src.avars);
+    add(src.posedM);
+    add(src.base);
+    add(src.fin);
+    add(src.finLast);
+    add(src.baseLast);
+    add(src.propertyResults);
+    add(src.frameRecords);
+    add(src.frameMatrix);
+    add(src.frameMatrixValid);
+    add(src.finalMatrix);
+    add(src.baseMatrix);
+    add(src.needFinal);
+    add(src.needBase);
+    add(src.solvers);
+    add(src.guideSolvers);
+    add(src.solverIndex);
+    add(src.aggregates);
+    add(src.constraints);
+    add(src.windowedOps);
+    add(src.historyMask);
+    add(src.windowCaptures);
+    add(src.windowRings);
+    add(src.windowRingChanged);
+    add(src.windowRingSerial);
+    add(src.windowOfOp);
+    add(src.walkSteps);
+    add(src.steps);
+    add(src.epilogue);
+    add(src.excludedSteps);
+    add(src.opGraph);
+    add(src.opAdapter);
+    add(src.verifyChainVersions);
+    add(src.chainContentKeys);
+    add(src.verifyPacketVersions);
+    add(src.packetContentKeys);
+    add(src.verifyRangeChains);
+    add(src.sourceWatch);
+    add(src.verifySourceKeys);
+    add(src.composeGroups);
+    add(src.spaceSwitches);
+    add(src.autoClavicles);
+    add(src.autoClavicleBySlot);
+    add(src.switchFrameContexts);
+    add(src.switchFrames);
+    add(src.spaceSwitchBySlot);
+    add(src.commits);
+    add(src.revisionIndex);
+    add(src.derivedIndex);
+    add(src.chainRevisionBegin);
+    add(src.chainRevisionEnd);
+    add(src.revisionChunkBase);
+    add(src.revisionChunkCount);
+    add(src.chainChunkBegin);
+    add(src.chainChunkEnd);
+    add(src.revisionFuseStep);
+    add(src.chunkRevision);
+    add(src.skinTopologyLayouts);
+    add(src.clustering);
+    add(src.chunkVertexTarget);
+    add(src.gpuDeformStats);
+    add(src.scheduleParallel);
+    add(src.scheduleReport);
+    add(src.scheduleCalibrate);
+    add(src.scheduleStepTiming);
+    add(src.traceAllSteps);
+    add(src.calibrationFrames);
+    add(src.stepTimingFrames);
+    add(src.chunkCap);
+    add(src.rangeChains);
+    add(src.groupVertexTarget);
+    add(src.groupCap);
+    add(src.groupGates);
+    add(src.roleMode);
+    add(src.exportKeep);
+    add(src.exportPinnedPaths);
+    add(src.useSimd);
+    add(src.purityAudit);
+    add(src.cones);
+    add(src.closedSteps);
+    add(src.closed);
+    add(src.lastAvars);
+    add(src.lastOverridden);
+    add(src.lastHaveBase);
+    add(src.lastTime);
+    add(src.everRan);
+    add(src.programStamp);
+    add(src.lastProgramStamp);
+    add(src.edited);
+    add(src.anyEdited);
+    add(src.valueEditSerial);
+    add(src.editSerial);
+    add(src.lastClosedClusters);
+    add(src.lastClosedSteps);
+    add(src.jointSlots);
+    add(src.jointPaths);
+    add(src.controlSlots);
+    add(src.controlPaths);
+    add(src.solverArrays);
+    add(src.jointPublishOrder);
+    add(src.controlPublishOrder);
+    add(src.solverPublishOrder);
+    add(src.jointPathsAscending);
+    add(src.controlPathsAscending);
+    add(src.solverArraysAscending);
+    add(src.measureColdRuns);
+    add(src.stampedSteps);
+    add(src.timedClusters);
+    add(src.jointMatrixPublished);
+    add(src.chains);
+    add(src.gpuDeformMode);
+    add(src.deltaValues);
+    add(src.deltaPresent);
+    add(src.deltaBasePaths);
+    add(src.deltaBaseMatrix);
+    add(src.lastDeltaBaseMatrix);
+    add(src.deltaBaseOk);
+    add(src.lastDeltaBaseOk);
+    add(src.weightObjects);
+    add(src.weightProgram);
+    add(src.weightCycleBlocked);
+    add(src.weightFields);
+    add(src.volumePlacementBase);
+    add(src.weightIndex);
+    add(src.volumePlacement);
+    add(src.placedVolumes);
+    add(src.currentPhaseWeights);
+    add(src.falloffLuts);
+    add(src.weightPackets);
+    add(src.rebuild);
+    add(src.sourceBackedPaths);
+    add(src.named);
+    add(src.prims);
+    add(src.xformPrims);
+    add(src.overridden);
+    add(src.overridableInputs);
+    add(src.leaves);
+    add(src.leafRefs);
+    add(src.leafOfOverride);
+    add(src.leafByPath);
+    add(src.routedOverrides);
+    add(src.lastRoutedOverrides);
+    add(src.upstreamAdmissible);
+    add(src.upstreamOracle);
+    add(src.upstreamSetsBuilt);
+    add(src.upstream);
+    add(src.lastUpstream);
+    add(src.upstreamOn);
+    add(src.upstreamChanged);
+    add(src.upstreamMovedThisRun);
+    add(src.leafSamples);
+    add(src.pathLeafRefs);
+    add(src.pathLeafChainResults);
+    add(src.pathLeafChainSerial);
+    add(src.pathLeafSamples);
+    add(src.pathLeafRun);
+    add(src.pathLeafGating);
+    add(src.verifyPathLeafGating);
+    add(src.leafFlagCompiledRig);
+    add(src.avarConstantSerial);
+    add(src.sparseSampling);
+    add(src.verifySparseSampling);
+    add(src.resolvedRoutedPrims);
+    add(src.avarsDisturbed);
+    add(src.folded);
+    add(src.anyOverridden);
+    add(src.publishWeightFields);
+    add(src.propertyChains);
+    add(src.oraclePublications);
+    add(src.oracleWeightInputs);
+    add(src.propertyRecords);
+    add(src.propertyRecordById);
+    add(src.poseDependencyPaths);
+    add(src.compiledProviderProgram);
+    add(src.providerProgram);
+    add(src.providerValues);
+    add(src.providerLeaves);
+    add(src.providerLeafBlocked);
+    add(src.providerLeafEditSerial);
+    add(src.spaceLeafIndex);
+    add(src.spaceLeafRekey);
+    add(src.spaceLeafKeys);
+    add(src.providerLeafValues);
+    add(src.providerLeafChains);
+    add(src.providerRoutedReads);
+    add(src.providerFrozenKeys);
+    add(src.providerExternalSlots);
+    add(src.providerFrameInputs);
+    add(src.poseProviderInputs);
+    add(src.connectedPoseProviders);
+    add(src.providerParentRawLeaves);
+    add(src.providerPruneViolations);
+    add(src.providerStepsPruned);
+    add(src.providerPruneRoots);
+    add(src.providerRefreshes);
+    add(src.providerRefreshBefore);
+    add(src.propertyVersionCount);
+    add(src.headLeaves);
+    add(src.headOverrideSlots);
+    add(src.headOverrideSlotsByName);
+    add(src.propertyValues);
+    add(src.propertyVersionValid);
+    add(src.propertyChanged);
+    add(src.chainValid);
+    add(src.chainFinal);
+    add(src.recordValues);
+    add(src.recordStoodAside);
+    add(src.headOverrides);
+    add(src.lastHeadOverrides);
+    add(src.headOverrideMoved);
+    add(src.headLeavesSampled);
+    add(src.headLeafTime);
+    add(src.headLeafStamp);
+    add(src.headEverRan);
+    add(src.headStamp);
+    add(src.headLeafSamples);
+    add(src.headOpsRun);
+    add(src.readerWalks);
+    add(src.crossDomainReads);
+    add(src.crossDomainErrors);
+    add(src.crossDomainOrdinals);
+    add(src.readerWalkMoved);
+    add(src.readerWalkChanged);
+    add(src.avarHeadReads);
+    add(src.verifyCloneKeys);
+    return total;
+}
+
+} // namespace
+
 void
 _SettleCloneVerdict(RigExecBakedProgramImpl *program)
 {
@@ -840,6 +1713,15 @@ RigExecFrozenAvarRegionDigest(const RigExecBakedProgram &program)
         h = _HashBytes(h, &promoted, sizeof(promoted));
     }
     return h;
+}
+
+// The owned storage one frozen execution lane clones from `live`, the bound a
+// host charges the coverage budget for a frame before its arena exists. See
+// docs/specs/output-subscriptions.md, "Retained bytes and backpressure".
+size_t
+RigExecEstimateFrozenArenaBytes(const RigExecBakedProgram &live)
+{
+    return frozenDetail::_ProgramStorageBytes(live.GetStepGraph());
 }
 
 } // namespace rigExec

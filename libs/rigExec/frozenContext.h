@@ -362,6 +362,15 @@ bool RigExecCanFreezeProgram(const RigExecRigEvaluator &evaluator,
 /// decide patch-vs-keep; the compiled rig signature does not fold it.
 uint64_t RigExecFrozenAvarRegionDigest(const RigExecBakedProgram &program);
 
+/// The owned storage one frozen execution lane clones from `program`: a lane's
+/// arena is a field-by-field clone of the compiled program, so this is the
+/// program's container storage, counted by element and shared with no one.
+/// Shared immutable storage -- a shared_ptr's target, a VtValue's array,
+/// interned path and token text -- counts only the handle that points at it.
+/// The idle scratch a clone lets go of is still counted: a host takes this
+/// bound before it allocates the arena, not after. Owner thread only.
+size_t RigExecEstimateFrozenArenaBytes(const RigExecBakedProgram &program);
+
 /// The compiled rig constant digest: the value-sensitive constant region
 /// the compiled rig signature does not cover, captured at compiled rig build and at every
 /// value patch. Folds into control-digest derivation (see

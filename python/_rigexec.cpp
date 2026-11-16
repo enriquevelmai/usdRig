@@ -780,7 +780,14 @@ public:
                               const rigExec::RigExecOutputCatalog &catalog,
                               rigExec::RigExecSubscriptionCapture *out,
                               std::string *error) {
-            return _Capture(rigPath, demand, catalog, out, error);
+            return _Preflight(rigPath, demand, catalog, out, error);
+        };
+        host.lane = [this](const SdfPath &rigPath,
+                           const rigExec::RigExecOutputTimeDemand &demand,
+                           const rigExec::RigExecOutputCatalog &catalog,
+                           rigExec::RigExecSubscriptionCapture *capture,
+                           std::string *error) {
+            return _Lane(rigPath, demand, catalog, capture, error);
         };
         _service = std::make_unique<rigExec::RigExecOutputSubscriptionService>(
             std::move(host));
@@ -951,16 +958,19 @@ private:
         return _catalog;
     }
 
-    // One exact frame's capture, on the owner thread: the sampled input
-    // vector, a snapshot of the standing program, this job's own lane, and
-    // the generation the answers belong to. The input revision is the
-    // frame-cache control digest with the compiled rig's constant region
-    // folded in, so a scene edit at the same frame is a different generation
-    // and an answered frame that stands is a coverage hit.
-    bool _Capture(const SdfPath &rigPath,
-                  const rigExec::RigExecOutputTimeDemand &demand,
-                  const rigExec::RigExecOutputCatalog &catalog,
-                  rigExec::RigExecSubscriptionCapture *out, std::string *error)
+    // One exact frame's preflight, on the owner thread: the sampled input
+    // vector, the digests and counts the lane is bound by, and the generation
+    // the answers belong to. The input revision is the frame-cache control
+    // digest with the compiled rig's constant region folded in, so a scene
+    // edit at the same frame is a different generation and an answered frame
+    // that stands is a coverage hit. Nothing is cloned here: the snapshot and
+    // the arena wait for `_Lane`, which the service calls only once the
+    // coverage record missed and the byte reservation was granted.
+    bool _Preflight(const SdfPath &rigPath,
+                    const rigExec::RigExecOutputTimeDemand &demand,
+                    const rigExec::RigExecOutputCatalog &catalog,
+                    rigExec::RigExecSubscriptionCapture *out,
+                    std::string *error)
     {
         if (rigPath != _rig->rigPath) {
             *error = "this host subscribes " + _rig->rigPath.GetString();
@@ -1003,15 +1013,6 @@ private:
             flags |= rigExec::kRigExecFrozenSolverGuidesEnabled;
         }
         out->context.flags = flags;
-        if (!rigExec::RigExecFreezeProgram(*_rig->evaluator, &out->snapshot,
-                                           error)) {
-            return false;
-        }
-        out->workspace = rigExec::RigExecCreateFrozenWorkspace(out->snapshot);
-        if (!out->workspace) {
-            *error = "no execution lane for this frame";
-            return false;
-        }
         out->captured.programIdentity = catalog.GetCompileEpoch();
         out->captured.inputRevision =
             rigExec::RigExecControlStateDigestWithConstants(
@@ -1023,7 +1024,29 @@ private:
         out->captured.historyRevision = 0;
         out->upstreamRevision = 0;
         out->bytes.capture = rigExec::RigExecEstimateCaptureBytes(out->inputs);
-        out->bytes.workspace = out->context.slotCount * sizeof(double);
+        // The arena this frame would allocate is a clone of the standing
+        // program, so the lane is charged what that clone owns.
+        out->bytes.workspace =
+            rigExec::RigExecEstimateFrozenArenaBytes(*program);
+        return true;
+    }
+
+    // The frame is owed work and the budget holds for it: clone the standing
+    // program into this job's own lane. Owner thread, no live USD read.
+    bool _Lane(const SdfPath &, const rigExec::RigExecOutputTimeDemand &,
+               const rigExec::RigExecOutputCatalog &,
+               rigExec::RigExecSubscriptionCapture *capture, std::string *error)
+    {
+        if (!rigExec::RigExecFreezeProgram(*_rig->evaluator, &capture->snapshot,
+                                           error)) {
+            return false;
+        }
+        capture->workspace =
+            rigExec::RigExecCreateFrozenWorkspace(capture->snapshot);
+        if (!capture->workspace) {
+            *error = "no execution lane for this frame";
+            return false;
+        }
         return true;
     }
 

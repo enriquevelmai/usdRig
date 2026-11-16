@@ -489,6 +489,10 @@ struct RigExecBakedLeafPools {
     {
         std::apply([&fn](auto &...pool) { (fn(pool), ...); }, pools);
     }
+    template <class Fn> void ForEach(Fn &&fn) const
+    {
+        std::apply([&fn](const auto &...pool) { (fn(pool), ...); }, pools);
+    }
 };
 
 /// The path leaves of one revision or weight object: the reads its packet

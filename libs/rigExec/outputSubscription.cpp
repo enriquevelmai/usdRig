@@ -896,11 +896,11 @@ private:
             catalog = group->second.catalog;
             desired = group->second.desired;
         }
-        if (!catalog || !_host.capture) {
+        if (!catalog || !_host.capture || !_host.lane) {
             std::lock_guard<std::mutex> lock(_mutex);
             _DropCoverageLocked(groupKey);
             _NoteStatusLocked(groupKey, RigExecOutputStatus::Failed,
-                              "no capture hook for this rig");
+                              "no capture and lane hook for this rig");
             return;
         }
         // The epoch the handles were minted at has to be the epoch standing
@@ -947,6 +947,9 @@ private:
         demand.handles = desired;
         auto capture = std::make_shared<RigExecSubscriptionCapture>();
         std::string error;
+        // The preflight only: the sampled vector, the generation the answers
+        // come from, and the byte estimate the arena will be charged at. The
+        // snapshot and the arena wait until the frame is actually owed work.
         if (!_host.capture(groupKey.rig, demand, *catalog, capture.get(),
                            &error)) {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -958,7 +961,6 @@ private:
             ++_stats.captureFailures;
             return;
         }
-        capture->BindContext();
         const RigExecFrameGeneration editGeneration =
             _host.scheduler->CurrentGeneration(groupKey.rig);
         capture->context.generation = editGeneration;
@@ -1013,6 +1015,17 @@ private:
             ++_stats.declinedCoverageBudget;
             return;
         }
+        // The frame is owed work and the budget holds for it, so the arena is
+        // paid for before it exists. A lane the host cannot build leaves the
+        // reservation to die with this scope.
+        if (!_host.lane(groupKey.rig, demand, *catalog, capture.get(),
+                        &error)) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _NoteStatusLocked(groupKey, RigExecOutputStatus::Failed,
+                              "lane: " + error);
+            return;
+        }
+        capture->BindContext();
 
         RigExecFrozenRequestedRun requested;
         // One record answers every client of this frame: the job asks for

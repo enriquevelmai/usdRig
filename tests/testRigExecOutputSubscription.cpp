@@ -295,6 +295,16 @@ TotalBytes(const RigExecCoverageBytes &bytes)
     return total;
 }
 
+// What one container owns for its elements: the same arithmetic the lane
+// charge uses, applied here to the program a lane clones.
+template <class Container>
+size_t
+_OwnedSpan(const Container &values)
+{
+    using Value = typename Container::value_type;
+    return values.capacity() * sizeof(Value);
+}
+
 struct RigFixture {
     UsdStageRefPtr stage;
     std::unique_ptr<RigExecRigEvaluator> evaluator;
@@ -419,9 +429,15 @@ struct Harness {
     // Knobs.
     bool captureOk = true;
     bool laneOk = true;
+    // False makes the host refuse to build the arena at all, which is a
+    // different refusal from a lane whose bodies decline (`laneOk`).
+    bool laneBuildOk = true;
     uint64_t programIdentityOverride = 0;
     uint64_t inputRevision = 1;
     size_t captureBytes = 4096;
+    // What the host charges for the arena a frame's lane would clone. The
+    // service refuses a frame that does not fit before it calls the lane hook.
+    size_t workspaceBytes = 0;
     bool gateOpen = true;
 
     // Observations.
@@ -443,6 +459,9 @@ struct Harness {
     std::atomic<int> queuedExplicit{0};
     std::atomic<int> finishedExplicit{0};
     std::atomic<int> captures{0};
+    // Counts the lanes the service asked the host to build: a frame the
+    // coverage record answers or the budget refuses must never reach it.
+    std::atomic<int> lanes{0};
     std::atomic<int> laneRuns{0};
     // Counts the jobs that reached the gated lane and wait there.
     std::atomic<int> laneArrivals{0};
@@ -504,8 +523,19 @@ struct Harness {
                 out->captured.programIdentity = programIdentityOverride;
                 out->upstreamRevision = 0;
                 out->bytes.capture = captureBytes;
+                out->bytes.workspace = workspaceBytes;
                 return true;
             };
+        host.lane = [this](const SdfPath &, const RigExecOutputTimeDemand &,
+                           const RigExecOutputCatalog &,
+                           RigExecSubscriptionCapture *, std::string *error) {
+            ++lanes;
+            if (!laneBuildOk) {
+                *error = "the harness refused the arena";
+                return false;
+            }
+            return true;
+        };
         host.stepRunner = [this](const RigExecFrozenEvalContext &context,
                                  const RigExecFrameInputs &inputs,
                                  RigExecFrozenArena &arena,
@@ -1822,6 +1852,128 @@ TestBoundsRefuseBeforeAllocating()
     CHECK(TotalBytes(h.cache.CoverageHeld()) > TotalBytes(standing));
 }
 
+// The lane charge is the arena a frame would clone, so the budget's refusal
+// lands before the arena exists: a frame the coverage record answers and a
+// frame the budget declines both preflight and build no lane, and an admitted
+// frame builds exactly one.
+void
+TestCoverageHitAndBudgetRefusalBuildNoArena()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    auto service = h.MakeService();
+    const size_t laneBytes =
+        RigExecEstimateFrozenArenaBytes(*a.evaluator->GetBakedProgram());
+    CHECK(laneBytes > 0);
+    h.workspaceBytes = laneBytes;
+
+    // Room for the sampled vector and the payloads, none for a lane.
+    h.cache.SetByteCap(h.captureBytes + 1024);
+    auto declined =
+        service.Subscribe(a.root, RequestAt(TimeOf(3.0), {a.scalar}));
+    CHECK(declined.IsValid());
+    CHECK(service.Stats().declinedCoverageBudget == 1);
+    CHECK(h.captures == 1);
+    CHECK(h.lanes == 0);
+    CHECK(h.laneRuns == 0);
+    CHECK(h.scheduler->Stats().explicitAccepted == 0);
+    CHECK(TotalBytes(h.cache.CoverageHeld()) == 0);
+
+    // The same frame now fits: one preflight, one arena, one run.
+    declined.Close();
+    h.cache.SetByteCap(size_t(64) << 20);
+    auto admitted =
+        service.Subscribe(a.root, RequestAt(TimeOf(5.0), {a.scalar}));
+    CHECK(admitted.IsValid());
+    CHECK(h.scheduler->Stats().explicitAccepted == 1);
+    h.scheduler->DrainQueueForTesting();
+    CHECK(h.lanes == 1);
+    CHECK(h.laneRuns == 1);
+    CHECK(AllReady(service.PollResults(admitted)));
+
+    // A second client for that frame: the frame preflights again, the
+    // standing record answers it, and the service dispatches nothing, so no
+    // second arena is cloned.
+    const int lanesBeforeHit = h.lanes;
+    const int runsBeforeHit = h.laneRuns;
+    auto again = service.Subscribe(a.root, RequestAt(TimeOf(5.0), {a.scalar}));
+    CHECK(again.IsValid());
+    CHECK(service.Stats().coverageHits >= 1);
+    CHECK(h.lanes == lanesBeforeHit);
+    CHECK(h.laneRuns == runsBeforeHit);
+    CHECK(AllReady(service.PollResults(again)));
+
+    // A host that cannot build the lane declines the frame where it stands:
+    // the reservation comes back and the pool sees no job.
+    h.laneBuildOk = false;
+    const int lanesBeforeRefusal = h.lanes;
+    const size_t dispatchesBeforeRefusal = service.Stats().dispatches;
+    const size_t acceptedBeforeRefusal = h.scheduler->Stats().explicitAccepted;
+    auto refused =
+        service.Subscribe(a.root, RequestAt(TimeOf(9.0), {a.scalar}));
+    CHECK(refused.IsValid());
+    CHECK(h.lanes == lanesBeforeRefusal + 1);
+    CHECK(service.Stats().dispatches == dispatchesBeforeRefusal);
+    CHECK(h.scheduler->Stats().explicitAccepted == acceptedBeforeRefusal);
+    CHECK(h.laneRuns == runsBeforeHit);
+    const std::vector<RigExecOutputPacket> declinedLane =
+        service.PollResults(refused);
+    CHECK(declinedLane.size() == 1);
+    for (const RigExecOutputPacket &packet : declinedLane) {
+        CHECK(packet.status == RigExecOutputStatus::Failed);
+        CHECK(packet.reason.find("arena") != std::string::npos);
+    }
+    // The frame that published keeps its payloads charged and no arena: the
+    // lane died with the job.
+    CHECK(TotalBytes(h.cache.CoverageHeld()) > 0);
+    CHECK(h.cache.CoverageHeld().workspace == 0);
+}
+
+// A lane is a clone of the compiled program, so its charge covers the
+// matrices and the geometry that clone carries. Eight bytes per provider, what
+// the first host charged for the same lane, covered none of them.
+void
+TestLaneChargeCoversTheProgramItClones()
+{
+    const RigFixture a = StageA();
+    const RigExecBakedProgram *program = a.evaluator->GetBakedProgram();
+    CHECK(program);
+    if (!program) {
+        return;
+    }
+    const RigExecBakedProgramImpl &B = program->GetStepGraph();
+    CHECK(!B.finalMatrix.empty());
+    CHECK(!B.baseMatrix.empty());
+    CHECK(!B.leaves.Of<GfMatrix4d>().value.empty());
+    CHECK(!B.chains.empty());
+
+    const size_t arena = RigExecEstimateFrozenArenaBytes(*program);
+    CHECK(arena > program->GetProviderCount() * sizeof(double));
+
+    // The matrices and geometry a lane clones, summed straight off the
+    // program it clones them from.
+    size_t owned = sizeof(RigExecBakedProgramImpl);
+    owned += _OwnedSpan(B.finalMatrix) + _OwnedSpan(B.baseMatrix) +
+             _OwnedSpan(B.posedM) + _OwnedSpan(B.base) + _OwnedSpan(B.fin) +
+             _OwnedSpan(B.xformBase) + _OwnedSpan(B.paths) +
+             _OwnedSpan(B.steps);
+    const auto &matrices = B.leaves.Of<GfMatrix4d>();
+    owned += _OwnedSpan(matrices.value) + _OwnedSpan(matrices.changed) +
+             _OwnedSpan(matrices.id) + _OwnedSpan(matrices.editSerial);
+    for (const RigExecBakedProgramImpl::GeomChain &chain : B.chains) {
+        owned += _OwnedSpan(chain.revisions) + _OwnedSpan(chain.baseGroups);
+        for (const RigExecBakedProgramImpl::GeomRevision &revision :
+             chain.revisions) {
+            owned += _OwnedSpan(revision.output) +
+                     _OwnedSpan(revision.influences) +
+                     _OwnedSpan(revision.leaves.values) +
+                     _OwnedSpan(revision.layoutLeaves.values);
+        }
+    }
+    CHECK(arena >= owned);
+}
+
 void
 TestCaptureFailureAndBadGeneration()
 {
@@ -2623,6 +2775,8 @@ main()
     TestRebuildCallbacksStayWithTheirCompilation();
     TestRunningForeignJobCannotOccupyTheFreshFrame();
     TestBoundsRefuseBeforeAllocating();
+    TestCoverageHitAndBudgetRefusalBuildNoArena();
+    TestLaneChargeCoversTheProgramItClones();
     TestCaptureFailureAndBadGeneration();
     TestCompletionCallback();
     TestClosingFromCallbackDropsTheRestOfTheBatch();

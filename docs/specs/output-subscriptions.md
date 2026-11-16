@@ -382,9 +382,10 @@ stays `Invalidated` with the re-subscribe reason until it closes.
 | `PumpCallbacks()` | Runs what the pool completed since the last pump, delivers the queued events, and re-dispatches the demand a retired generation or a launched-mask expansion left owed. |
 | `SetCompletionCallback` | Installs the owner-thread completion callback (null uninstalls). |
 | `Close`, `CloseAll` | Ends one subscription, or every client, with the same release for each demand that no other client holds. |
-| `RigExecSubscriptionHost` | What the service needs from the host: the pool, the cache, a catalog hook, a capture hook, and the lane's step runner. |
-| `RigExecSubscriptionCapture` | One exact frame's captured job: the sampled vector, the frozen owners, the captured generation, the upstream revision half of the coverage key, and the byte estimate admission is bounded by. `BindContext` points its raw owners at the addresses the capture stays at, so a worker cannot read a moved pointer. |
+| `RigExecSubscriptionHost` | What the service needs from the host: the pool, the cache, a catalog hook, a capture hook that preflights the frame, a lane hook that builds the frame's arena, and the lane's step runner. |
+| `RigExecSubscriptionCapture` | One exact frame's captured job: the sampled vector, the frozen owners, the captured generation, the upstream revision half of the coverage key, and the byte estimate admission is bounded by. The capture hook fills everything but the frozen owners; the lane hook fills those once the frame is owed work. `BindContext` points its raw owners at the addresses the capture stays at, so a worker cannot read a moved pointer. |
 | `RigExecEstimateCaptureBytes` | The sampled vector's own container and element sizes — not what a `VtValue` points at — which is what a capture charges the coverage budget. A host whose samples carry large buffers adds its own measure beside it. |
+| `RigExecEstimateFrozenArenaBytes` | What one lane's arena owns: the arena is a clone of the compiled program, so this is that program's container storage, counted per element with shared storage counted once. A host charges this to the `Workspace` domain before it allocates the arena. |
 | `Stats` | `subscriptions`, `framesDemanded`, `demandsInFlight`, `coverageHits`, `dispatches`, `redispatches`, `declinedCoverageBudget`, `declinedAdmission`, `captureFailures`, `retiredInFlight`, `pinnedBytes`, `pinnedPayloads`, `callbacksQueued`. The two declines name which bound refused. |
 
 A refusal never moves demand, a reservation or a lease, and the receipt's
@@ -404,7 +405,10 @@ subscription id and the exact frames the request demands:
 
 - **The owner thread owns the lifecycle.** `Subscribe`, `UpdateSubscription`,
   `PollResults`, `PumpCallbacks` and `Close` run there, and the capture hook is
-  the only live-USD read in the path. A capture holds no stage, evaluator,
+  the only live-USD read in the path. It preflights the frame — sample, digest,
+  state the estimate — and clones nothing; the lane hook builds the frame's
+  snapshot and arena only after the coverage record missed and the byte
+  reservation was granted. A capture holds no stage, evaluator,
   registry or live handle, which is what lets the job be queued. The state lock
   is never held across the pool, a cache call, a fence or a run.
 - **Demand is shared; work is not.** Live subscriptions group by rig, exact
@@ -483,7 +487,7 @@ unprobed. Each answer says which part of the machinery refused it:
 | `Pending` | Nothing has answered yet: the demand is not reconciled, or the coverage budget or the pool declined the frame and the next pump retries it, or the frame's run answered a narrower mask than the demand now names and the rest is owed to the next pump. |
 | `Invalidated` | The capture names another program epoch, the rig recompiled past the epoch the subscription's handles came from, the pool retired the frame while its job ran, or the record's value revision is not the one a non-zero request handle named. |
 | `Unsupported` | The catalog cannot produce the output, or a capture's demand could not be resolved into a job. |
-| `Failed` | The capture hook refused the frame, the run declined, the coverage budget refused the payloads at publish, the cache declined the record, or the run answered fewer outputs than the frame demanded. |
+| `Failed` | The capture hook refused the frame, the host could not build its lane, the run declined, the coverage budget refused the payloads at publish, the cache declined the record, or the run answered fewer outputs than the frame demanded. |
 
 A completion event carries the frame's disposition — `Ready` when the record
 answers every demanded output of that frame, otherwise the status that
@@ -509,14 +513,19 @@ produced it, so a coverage hit never implies the ancestors exist.
   (what the run captured), `Workspace` (the arena its payloads came from),
   `Payload` (the packets) and `Pinned` (payload bytes a live lease holds). A
   pin moves a payload's bytes out of `Payload` into `Pinned`, so the same
-  bytes are never counted twice.
+  bytes are never counted twice. `Workspace` is charged at what the arena owns:
+  a lane clones the compiled program, and `RigExecEstimateFrozenArenaBytes`
+  states that program's container storage, counting a shared buffer once for
+  the handle that aliases it rather than once per lane.
 - **The bound is at admission, not at eviction.** Coverage shares the cache's
   per-rig byte cap with the poses and is never read or dropped by the pose
   store's LRU pass. `TryReserveCoverage` charges the budget before anything
   allocates; a frame it declines answers `Pending` with a retry reason, counts
   `declinedCoverageBudget`, and is tried again at the owner's next pump. A
   capture that states no payload bytes is charged one element per demanded
-  handle as a floor.
+  handle as a floor. The order is fixed: preflight, coverage lookup, budget,
+  then the lane. A frame a standing record answers and a frame the budget
+  refuses both preflight and build no arena.
 - **The run extends the charge before it publishes.** The lane's actual
   payload bytes are added to the reservation before `PublishCoverage`, and a
   payload that would pass the budget fails that frame rather than storing over
