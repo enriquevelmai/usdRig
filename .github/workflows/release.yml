@@ -266,6 +266,33 @@ jobs:
           & "$bundle/app/python/python.exe" "$bundle/app/usd/bin/usdview" --help | Select-Object -First 5
           if ($LASTEXITCODE -ne 0) { throw "usdview --help failed" }
 
+      # The launcher must not inherit another USD/Python install from the
+      # caller's environment (foreign pxr modules, plug-ins, or stale
+      # runtime DLLs on PATH break the bundled interpreter on dev machines).
+      - name: Smoke test launcher env isolation (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION_NUM: ${{ needs.gate.outputs.version-num }}
+        run: |
+          $bundle = "dist/usdRig-$env:VERSION_NUM-windows-x64"
+          $bogus = Join-Path $env:RUNNER_TEMP "bogus-ambient"
+          $env:PYTHONPATH = $bogus
+          $env:PXR_PLUGINPATH_NAME = $bogus
+          $env:PYTHONHOME = $bogus
+          $printed = & "$bundle/usdRigView.exe" --usdRig-print-env
+          if ($LASTEXITCODE -ne 0) { throw "print-env failed" }
+          foreach ($name in "PYTHONPATH", "PXR_PLUGINPATH_NAME", "PYTHONHOME") {
+            $line = $printed | Where-Object { $_ -like "$name=*" }
+            if (-not $line -or $line.Contains($bogus)) {
+              throw "ambient $name leaked into the bundle env: $line"
+            }
+          }
+          $dll = $printed | Where-Object { $_ -like "PXR_USD_WINDOWS_DLL_PATH=*" }
+          if (-not $dll -or -not $dll.Contains($bundle)) {
+            throw "PXR_USD_WINDOWS_DLL_PATH does not pin the bundle: $dll"
+          }
+
       - name: Sign bundle (Windows, when configured)
         if: runner.os == 'Windows'
         shell: pwsh

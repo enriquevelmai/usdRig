@@ -66,6 +66,9 @@ def make_trees(base: Path, platform: str) -> dict:
     if platform == "windows":
         touch(python_home / "python.exe", "py\n")
         touch(python_home / "Lib" / "os.py")
+        for name in ("msvcp140.dll", "vcruntime140.dll"):
+            touch(python_home / "Lib" / "site-packages" / "PySide6" / name,
+                  "runtime\n")
     else:
         touch(python_home / "bin" / "python3", "py\n")
         touch(python_home / "lib" / "python3.11" / "os.py")
@@ -183,6 +186,11 @@ class AssembleBundleTest(unittest.TestCase):
                          "rigexec_flat.usda").is_file())
         self.assertTrue((output / "app" / "examples" / "ArmRig.usda").is_file())
         self.assertTrue((output / "app" / "icons" / "control.png").is_file())
+        for lib in ("usd", "rig"):
+            for name in ("msvcp140.dll", "vcruntime140.dll"):
+                self.assertTrue(
+                    (output / "app" / lib / "lib" / name).is_file(),
+                    f"MSVC runtime not shipped in app/{lib}/lib: {name}")
         manifest = json.loads(
             (output / "bundle-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], "1.2.0")
@@ -444,6 +452,45 @@ class AssembleBundleTest(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(broken.returncode, 2, broken.stdout)
         self.assertIn("Python.framework", broken.stderr)
+
+    def test_real_launcher_env_isolation(self):
+        if not self.launcher:
+            self.skipTest("no usdRigView binary passed")
+        proc, output, _ = assemble(self.base, HOST_PLATFORM, self.launcher,
+                                   archive=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        if HOST_PLATFORM == "macos":
+            exe = (output / "usdRigView.app" / "Contents" / "MacOS" /
+                   "usdRigView")
+            app = (output / "usdRigView.app" / "Contents" / "Resources" /
+                   "app")
+        elif HOST_PLATFORM == "windows":
+            exe = output / "usdRigView.exe"
+            app = output / "app"
+        else:
+            exe = output / "usdRigView"
+            app = output / "app"
+        bogus = str(self.base / "bogus-ambient")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = bogus
+        env["PXR_PLUGINPATH_NAME"] = bogus
+        env["PYTHONHOME"] = bogus
+        printed = subprocess.run([str(exe), "--usdRig-print-env"], env=env,
+                                 capture_output=True, text=True)
+        self.assertEqual(printed.returncode, 0, printed.stderr)
+        values = dict(line.split("=", 1) for line in
+                      printed.stdout.splitlines() if "=" in line)
+        for name in ("PYTHONPATH", "PXR_PLUGINPATH_NAME", "PYTHONHOME"):
+            self.assertIn(name, values)
+            self.assertNotIn(bogus, values[name],
+                             f"ambient {name} leaked into the bundle env")
+        self.assertEqual(Path(values["PYTHONHOME"]), app / "python")
+        if HOST_PLATFORM == "windows":
+            self.assertIn("PXR_USD_WINDOWS_DLL_PATH", values)
+            dll_path = values["PXR_USD_WINDOWS_DLL_PATH"]
+            self.assertNotIn(bogus, dll_path)
+            self.assertIn(str(app / "usd" / "lib"), dll_path)
+            self.assertIn(str(app / "rig" / "lib"), dll_path)
 
 
 if __name__ == "__main__":

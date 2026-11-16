@@ -31,8 +31,17 @@ notarizes as one unit. Inside `app/`:
 | `icons/` | node icons referenced by the example rig |
 
 The launcher derives all of these paths from its own location, sets
-`PYTHONPATH`, `PXR_PLUGINPATH_NAME`, `PATH`, and the platform loader
-path, then runs `app/usd/bin/usdview` with the bundled Python.
+`PYTHONPATH`, `PXR_PLUGINPATH_NAME`, `PATH`, `PYTHONHOME`, and the
+platform loader path, then runs `app/usd/bin/usdview` with the bundled
+Python. The computed values replace the caller's environment rather
+than appending to it (only `PATH` keeps the caller's tail, for child
+tools), so another USD or Python install on the user's machine cannot
+leak its modules, plug-ins, or DLLs into the bundle. On Windows the
+launcher also sets `PXR_USD_WINDOWS_DLL_PATH` to the bundle's library
+directories, and the assembler copies the MSVC runtime
+(`msvcp140*.dll`, `vcruntime140*.dll`, from the bundled Python's
+PySide6 packages) into `app/usd/lib` and `app/rig/lib`, so the bundle
+does not depend on the host's Visual C++ runtime version.
 `usdRigView --usdRig-check` verifies the bundle without starting the
 viewer; `--usdRig-print-env` shows the computed environment. The installed
 `rigExecUsdview` directory is also on `PYTHONPATH`, so TouchPose and Shape

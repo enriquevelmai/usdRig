@@ -8,6 +8,14 @@
 // exports the environment bin/usdview.sh exports for a source tree, and
 // replaces itself with the bundled Python running the bundled usdview.
 //
+// The bundle is self-contained, so the environment it computes replaces
+// the ambient PYTHONPATH, PXR_PLUGINPATH_NAME, PYTHONHOME, and loader
+// paths instead of appending to them: an inherited value can name another
+// USD or Python install whose modules, plug-ins, or stale runtime DLLs
+// break the bundled interpreter. Only PATH keeps the caller's tail (for
+// child tools); on Windows PXR_USD_WINDOWS_DLL_PATH pins USD's own DLL
+// search to the bundle so PATH entries cannot shadow its libraries.
+//
 // Modes:
 //   usdRigView [stage.usda] [usdview flags...]   launch (default)
 //   usdRigView --usdRig-check                    verify the bundle only
@@ -49,6 +57,7 @@ struct Bundle {
     fs::path app;
     fs::path python;
     fs::path pythonDir;
+    fs::path pythonHome;
     fs::path usdview;
     fs::path usdSitePackages;
     fs::path imagingLibrary;
@@ -354,6 +363,7 @@ LocateBundle()
     const fs::path &app = bundle.app;
     bundle.python = FindPython(app);
     bundle.pythonDir = bundle.python.parent_path();
+    bundle.pythonHome = app / "python";
     bundle.usdview = app / "usd" / "bin" / "usdview";
     bundle.usdSitePackages = FindUsdSitePackages(app / "usd");
     bundle.imagingLibrary = app / "rig" / "lib" / ImagingFileName();
@@ -410,7 +420,8 @@ AppendExisting(std::vector<std::string> &entries, const fs::path &path)
 }
 
 std::string
-Join(const std::vector<std::string> &entries, const std::string &tail)
+Join(const std::vector<std::string> &entries,
+     const std::string &tail = std::string())
 {
     std::string joined;
     for (const std::string &entry : entries) {
@@ -483,17 +494,22 @@ BuildEnv(const Bundle &bundle)
     AppendExisting(loaderPath, usd / "lib");
 
     Env env;
-    env.emplace_back("PYTHONPATH", Join(pythonPath, ExistingEnv("PYTHONPATH")));
-    env.emplace_back("PXR_PLUGINPATH_NAME",
-                     Join(pluginPath, ExistingEnv("PXR_PLUGINPATH_NAME")));
+    env.emplace_back("PYTHONPATH", Join(pythonPath));
+    env.emplace_back("PXR_PLUGINPATH_NAME", Join(pluginPath));
     env.emplace_back("PATH", Join(path, ExistingEnv("PATH")));
-#if defined(__APPLE__)
-    env.emplace_back("DYLD_LIBRARY_PATH",
-                     Join(loaderPath, ExistingEnv("DYLD_LIBRARY_PATH")));
-#elif !defined(_WIN32)
-    env.emplace_back("LD_LIBRARY_PATH",
-                     Join(loaderPath, ExistingEnv("LD_LIBRARY_PATH")));
+#if defined(_WIN32)
+    std::vector<std::string> dllPath;
+    AppendExisting(dllPath, bundle.pythonDir);
+    AppendExisting(dllPath, rigLib);
+    AppendExisting(dllPath, usd / "bin");
+    AppendExisting(dllPath, usd / "lib");
+    env.emplace_back("PXR_USD_WINDOWS_DLL_PATH", Join(dllPath));
+#elif defined(__APPLE__)
+    env.emplace_back("DYLD_LIBRARY_PATH", Join(loaderPath));
+#else
+    env.emplace_back("LD_LIBRARY_PATH", Join(loaderPath));
 #endif
+    env.emplace_back("PYTHONHOME", bundle.pythonHome.string());
     env.emplace_back("RIGEXEC_IMAGING_DLL", bundle.imagingLibrary.string());
     env.emplace_back("TOUCHPOSE_PLUGIN_DIR",
                      (app / "plugins" / "touchPose").string());

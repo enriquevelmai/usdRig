@@ -3,12 +3,14 @@
 
 Copies a complete OpenUSD install, the RigExec ``cmake --install`` prefix,
 and the CPython home the USD build was compiled against into one directory
-with the ``usdRigView`` launcher at its head. Nothing in the output refers
-to the build machine: the launcher derives every path from its own
-location at run time (see packaging/launcher/usdRigView.cpp), and on macOS
-every Mach-O install name is rewritten to a bundle-relative
-``@loader_path`` name (see relocate_macos_bundle); assembly fails if any
-non-system absolute dependency remains.
+with the ``usdRigView`` launcher at its head. On Windows it also copies
+the MSVC runtime from the CPython home beside the USD and RigExec DLLs.
+Nothing in the output refers to the build machine: the launcher derives
+every path from its own location at run time (see
+packaging/launcher/usdRigView.cpp), and on macOS every Mach-O install
+name is rewritten to a bundle-relative ``@loader_path`` name (see
+relocate_macos_bundle); assembly fails if any non-system absolute
+dependency remains.
 
 Layout (Windows/Linux)::
     <output>/
@@ -53,6 +55,10 @@ IMAGING_NAMES = ("rigExecImaging.dll", "librigExecImaging.dylib",
 TOOL_NAMES = ("rigExecPose", "rigExecBake", "rigExecReplayInputs")
 EXAMPLE_NAMES = ("rigexec_flat.usda", "ArmShotAnim.usda", "ArmRig.usda")
 LEGAL_NAMES = ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md")
+MSVC_RUNTIME_NAMES = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+                      "msvcp140_atomic_wait.dll",
+                      "msvcp140_codecvt_ids.dll", "vcruntime140.dll",
+                      "vcruntime140_1.dll", "concrt140.dll")
 
 _IGNORE_RUNTIME = shutil.ignore_patterns(
     "__pycache__", "*.pyc", "*.pyo", "*.pdb")
@@ -194,6 +200,40 @@ def copy_tree(src: Path, dst: Path, trim_dev: bool,
     else:
         shutil.copytree(src, dst, dirs_exist_ok=True,
                         ignore=_ignore(trim_dev))
+
+
+def copy_msvc_runtime(app_dir: Path, python_home: Path, usd: Path,
+                      rig: Path) -> list[str]:
+    """Ship the MSVC runtime beside the Windows DLLs that need it.
+
+    Neither the OpenUSD nor the RigExec install carries msvcp140.dll, so
+    without this the bundle depends on whatever runtime the host's
+    System32 (or a stray PATH entry) provides, which may predate the
+    compiler the binaries were built with. The bundled CPython's
+    PySide6/shiboken packages carry a current redistributable set; fall
+    back to the Python home and the install trees.
+    """
+    candidates = (
+        python_home / "Lib" / "site-packages" / "PySide6",
+        python_home / "Lib" / "site-packages" / "shiboken6",
+        python_home,
+        usd / "bin",
+        usd / "lib",
+        rig / "lib",
+    )
+    source = next((d for d in candidates if (d / "msvcp140.dll").is_file()),
+                  None)
+    if source is None:
+        return []
+    copied = []
+    for lib in (app_dir / "usd" / "lib", app_dir / "rig" / "lib"):
+        lib.mkdir(parents=True, exist_ok=True)
+        for name in MSVC_RUNTIME_NAMES:
+            candidate = source / name
+            if candidate.is_file():
+                shutil.copy2(candidate, lib / name)
+                copied.append(name)
+    return copied
 
 
 def make_executable(path: Path) -> None:
@@ -488,6 +528,13 @@ def assemble(args) -> Path:
     copy_tree(python_src, app_dir / "python", args.trim_dev,
               preserve_symlinks=keep_links)
     make_executable(python_executable(app_dir / "python", platform))
+    if platform == "windows" and not copy_msvc_runtime(
+            app_dir, Path(args.python_home), Path(args.usd_install),
+            Path(args.rig_install)):
+        print("assemble_bundle: warning: no MSVC runtime (msvcp140.dll) "
+              "found in the Python home or install trees; the bundle "
+              "will rely on the host's Visual C++ runtime",
+              file=sys.stderr)
 
     source = Path(args.source_root)
     for plugin in ("touchPose", "shapeEditor"):
