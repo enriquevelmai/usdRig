@@ -1,0 +1,30 @@
+name: notarization log
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: Apple notarization submission ID to diagnose
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Read Apple notarization report
+        env:
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
+        run: |
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$AC_API_KEY_BASE64" | base64 --decode > "$key_file"
+          xcrun notarytool log "$SUBMISSION_ID" --key "$key_file" \
+            --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID"
