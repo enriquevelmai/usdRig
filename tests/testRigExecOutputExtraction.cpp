@@ -1525,6 +1525,153 @@ TestForeignCatalogCannotAnswerThisProgram()
     }
 }
 
+// A chain whose target has no points at all: every one of its point
+// versions is an established answer with no buffer behind it.
+const char *const kEmptyTarget =
+    "/EmptyAsset/Container/Geometry/Nothing.points";
+const char *const kEmptyRig = "/EmptyAsset/Container/Character";
+
+const char *const kEmptyStageText = R"USDA(#usda 1.0
+
+def Xform "EmptyAsset"
+{
+    def Scope "Container"
+    {
+        def RigExecRoot "Character"
+        {
+            def Scope "Controls"
+            {
+                def RigExecControl "Drive"
+                {
+                    double avars:ty = 2
+                }
+            }
+
+            def Scope "StackA"
+            {
+                def RigExecMatrixMover "First" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    float inputs:defaultWeight = 1
+                    rel rigExec:moves = </EmptyAsset/Container/Geometry/Nothing.points>
+                    rel rigExec:transform = </EmptyAsset/Container/Character/Controls/Drive>
+                }
+                def RigExecMatrixMover "Second" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    float inputs:defaultWeight = 1
+                    rel rigExec:moves = </EmptyAsset/Container/Geometry/Nothing.points>
+                    rel rigExec:transform = </EmptyAsset/Container/Character/Controls/Drive>
+                }
+            }
+        }
+
+        def Scope "Geometry"
+        {
+            def Points "Nothing"
+            {
+                point3f[] points = []
+            }
+        }
+    }
+}
+)USDA";
+
+// Every packet of an empty chain is Ready with a zero-element payload: the
+// view opens, declares nothing, and refuses an element that is not there.
+void
+CheckAnswersNothing(const std::vector<RigExecOutputPacket> &packets)
+{
+    for (const RigExecOutputPacket &packet : packets) {
+        CHECK(packet.status == RigExecOutputStatus::Ready);
+        CHECK(packet.reason.empty());
+        CHECK(packet.payload.IsEmpty());
+        CHECK(packet.payload.elementCount == 0);
+        std::string error;
+        RigExecPayloadView view;
+        CHECK(view.Open(packet.handle, packet.payload, &error));
+        CHECK(view.ElementCount() == 0);
+        std::array<double, 3> probe{{0.0, 0.0, 0.0}};
+        CHECK(!view.ReadPoint3(0, probe.data()));
+        std::vector<double> points;
+        CHECK(ReadPoints(packet, &points));
+        CHECK(points.empty());
+    }
+}
+
+// Zero points is a payload, not a missing buffer: the base, each mover's
+// phase and the final of an empty chain all extract a zero-element payload,
+// asked alone or together, and a repeat request answers the same nothing.
+void
+TestEmptyPointVersionsAnswerWithNothing()
+{
+    Rig rig = BuildRigFrom(kEmptyStageText, kEmptyRig);
+    if (!rig.program)
+        return;
+    const std::vector<size_t> slots = SlotsForTarget(rig, kEmptyTarget);
+    CHECK(!slots.empty());
+    const std::vector<std::string> phases = PhasesFor(rig, kEmptyTarget);
+    CHECK(phases.size() == slots.size());
+    CHECK(SlotForPhase(rig, kEmptyTarget, "base") != size_t(-1));
+    CHECK(SlotForPhase(rig, kEmptyTarget, "final") != size_t(-1));
+    // One intermediate per mover of the chain.
+    CHECK(PointPhases(rig, kEmptyTarget).size() >= 1);
+
+    std::vector<RigExecOutputPacket> packets;
+    RigExecRequestedRunReport report;
+    std::string error;
+    CHECK(Answer(rig, UsdTimeCode::Default(), slots, slots, &packets, &report,
+                 &error));
+    CHECK(packets.size() == slots.size());
+    CheckAnswersNothing(packets);
+
+    // Each version asked for on its own: a request that stops at an empty
+    // intermediate answers the same nothing as one that runs past it.
+    for (size_t slot : slots) {
+        std::vector<RigExecOutputPacket> alone;
+        RigExecRequestedRunReport aloneReport;
+        CHECK(Answer(rig, UsdTimeCode::Default(), {slot}, {slot}, &alone,
+                     &aloneReport, &error));
+        CHECK(alone.size() == 1);
+        CheckAnswersNothing(alone);
+    }
+
+    // The same request again at the same frame: the run reuses what it did,
+    // and the retained zero-element value still packs an empty payload
+    // rather than reporting a failed extraction.
+    std::vector<RigExecOutputPacket> again;
+    RigExecRequestedRunReport againReport;
+    CHECK(Answer(rig, UsdTimeCode::Default(), slots, slots, &again,
+                 &againReport, &error));
+    CHECK(again.size() == slots.size());
+    CheckAnswersNothing(again);
+    for (size_t i = 0; i < again.size() && i < packets.size(); ++i) {
+        CHECK(again[i].handle.valueRevision == packets[i].handle.valueRevision);
+        CHECK(again[i].payload.IsEmpty());
+    }
+
+    // The whole run publishes the same nothing: the extraction is not
+    // answering with something the rig does not publish.
+    Rig fresh = BuildRigFrom(kEmptyStageText, kEmptyRig);
+    if (fresh.program) {
+        RigExecRigPose pose;
+        CHECK(fresh.program->Run(UsdTimeCode::Default(), &pose));
+        const VtValue moved = Moved(pose, kEmptyTarget);
+        CHECK(moved.IsHolding<VtVec3fArray>());
+        CHECK(moved.Get<VtVec3fArray>().empty());
+        std::vector<RigExecOutputPacket> freshPackets;
+        RigExecRequestedRunReport freshReport;
+        const std::vector<size_t> freshSlots =
+            SlotsForTarget(fresh, kEmptyTarget);
+        CHECK(Answer(fresh, UsdTimeCode::Default(), freshSlots, freshSlots,
+                     &freshPackets, &freshReport, &error));
+        CHECK(freshPackets.size() == freshSlots.size());
+        CheckAnswersNothing(freshPackets);
+    }
+}
+
 } // namespace
 
 int
@@ -1543,6 +1690,7 @@ main()
     TestNoBaseAtTheFrameAnswersWithAStatus();
     TestRetainedPayloadsStandAcrossRuns();
     TestForeignCatalogCannotAnswerThisProgram();
+    TestEmptyPointVersionsAnswerWithNothing();
     if (failures)
         std::printf("%d failures\n", failures);
     return failures ? 1 : 0;

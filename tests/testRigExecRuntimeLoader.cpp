@@ -2846,6 +2846,189 @@ _TestRequestedAtFrame(const RigExecExampleFixture &fixture,
     }
 }
 
+// A rig whose only points target holds no points at all. Zero elements is a
+// payload the extraction packs on purpose, so the file's catalog names the
+// chain's versions and a requested run answers each one -- base, each mover
+// phase, final -- with the same empty payload the live baked program answers,
+// on a repeat request too.
+static const char *const kEmptyPointsStageText = R"USDA(#usda 1.0
+
+def Xform "EmptyBin"
+{
+    def Scope "Container"
+    {
+        def RigExecRoot "Character"
+        {
+            def Scope "Controls"
+            {
+                def RigExecControl "Drive"
+                {
+                    double avars:ty = 2
+                }
+            }
+
+            def Scope "StackA"
+            {
+                def RigExecMatrixMover "First" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    float inputs:defaultWeight = 1
+                    rel rigExec:moves = </EmptyBin/Container/Geometry/Nothing.points>
+                    rel rigExec:transform = </EmptyBin/Container/Character/Controls/Drive>
+                }
+                def RigExecMatrixMover "Second" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    float inputs:defaultWeight = 1
+                    rel rigExec:moves = </EmptyBin/Container/Geometry/Nothing.points>
+                    rel rigExec:transform = </EmptyBin/Container/Character/Controls/Drive>
+                }
+            }
+        }
+
+        def Scope "Geometry"
+        {
+            def Points "Nothing"
+            {
+                point3f[] points = []
+            }
+        }
+    }
+}
+)USDA";
+
+static void
+_TestRequestedEmptyPoints()
+{
+    const SdfLayerRefPtr layer = SdfLayer::CreateAnonymous(".usda");
+    CHECK(layer && layer->ImportFromString(kEmptyPointsStageText));
+    const UsdStageRefPtr stage =
+        layer ? UsdStage::Open(layer) : UsdStageRefPtr();
+    CHECK(stage);
+    if (!stage)
+        return;
+    const SdfPath rigPath = _FindRig(stage);
+    CHECK(!rigPath.IsEmpty());
+    if (rigPath.IsEmpty())
+        return;
+
+    constexpr double kFrame = 1.0;
+    std::string error;
+    RigExecRigEvaluator evaluator(stage, rigPath);
+    std::vector<std::string> compileErrors;
+    CHECK(evaluator.Compile(&compileErrors));
+    std::vector<uint8_t> bytes;
+    if (!RigExecTestBakeAt(evaluator, kFrame, &bytes, &error)) {
+        std::printf("empty points: bake: %s\n", error.c_str());
+        ++failures;
+        return;
+    }
+    const std::unique_ptr<RigExecRuntimeReader> reader =
+        RigExecRuntimeReader::Open(bytes.data(), bytes.size(), &error);
+    CHECK(reader);
+    if (!reader)
+        return;
+
+    // The same rig live: the unified loop promises both evaluators answer one
+    // semantic address with the same bytes.
+    RigExecRigEvaluator live(stage, rigPath);
+    std::vector<std::string> liveErrors;
+    CHECK(live.Compile(&liveErrors));
+    std::vector<std::string> reasons;
+    const std::unique_ptr<RigExecBakedProgram> program =
+        RigExecBakedProgram::Build(&live, &reasons);
+    CHECK(program);
+    if (!program)
+        return;
+    RigExecOutputCatalog catalog;
+    CHECK(RigExecDiscoverOutputs(*program, rigPath.GetString(), 1, &catalog,
+                                 &error));
+
+    RigExecOutputGeneration captured;
+    captured.programIdentity = reader->GetOutputCompileEpoch();
+    const RigExecOutputTime at = _TimeAt(kFrame);
+    int outputs = 0, attempts = 0, matched = 0;
+    for (size_t i = 0; i < reader->GetOutputCount(); ++i) {
+        RigExecRuntimeOutput output;
+        if (!reader->GetOutputAt(i, &output) ||
+            output.handle.type != RigExecPayloadText::point3)
+            continue;
+        const RigExecOutputBinding *binding = nullptr;
+        for (const RigExecOutputBinding &candidate : catalog.GetBindings()) {
+            if (candidate.descriptor.semanticKey == output.handle.semanticKey) {
+                binding = &candidate;
+                break;
+            }
+        }
+        size_t slot = 0;
+        if (!binding ||
+            !catalog.GetDemandIndex().Find(binding->handle, &slot)) {
+            std::printf("empty points: %s is not in the live catalog\n",
+                        output.handle.semanticKey.c_str());
+            ++failures;
+            continue;
+        }
+        ++outputs;
+
+        RigExecRequestedRunReport report;
+        CHECK(program->RunRequested(
+            UsdTimeCode(kFrame),
+            catalog.GetDemandIndex().Union(std::vector<size_t>{slot}), &report,
+            &error));
+        std::vector<RigExecOutputPacket> expected;
+        RigExecOutputGeneration nativeCaptured;
+        nativeCaptured.programIdentity = catalog.GetCompileEpoch();
+        CHECK(program->ExtractRequestedOutputs(
+            catalog, report, UsdTimeCode(kFrame), nativeCaptured,
+            std::vector<RigExecOutputHandle>{binding->handle}, &expected,
+            &error));
+        CHECK(expected.size() == 1);
+        CHECK(expected.empty() ||
+              expected[0].status == RigExecOutputStatus::Ready);
+
+        // Twice at the same frame: the second request reuses the value, and
+        // the retained zero-element version packs an empty payload again.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            ++attempts;
+            std::vector<RigExecOutputPacket> got;
+            CHECK(reader->ExecuteRequested(
+                std::vector<RigExecOutputHandle>{output.handle}, at, captured,
+                &got, nullptr, &error));
+            CHECK(got.size() == 1);
+            if (got.empty())
+                continue;
+            CHECK(got[0].status == RigExecOutputStatus::Ready);
+            CHECK(got[0].reason.empty());
+            CHECK(got[0].payload.IsEmpty());
+            CHECK(got[0].payload.elementCount == 0);
+            std::string viewError;
+            RigExecPayloadView view;
+            CHECK(view.Open(got[0].handle, got[0].payload, &viewError));
+            CHECK(view.ElementCount() == 0);
+            double cells[3] = {0.0, 0.0, 0.0};
+            CHECK(!view.ReadPoint3(0, cells));
+            if (expected.size() == 1 &&
+                _SamePayload(got[0].payload, expected[0].payload)) {
+                ++matched;
+            } else {
+                std::printf("empty points: %s differs from the live answer\n",
+                            output.handle.semanticKey.c_str());
+                if (!expected.empty())
+                    _ReportPayloadDiff(got[0].payload, expected[0].payload);
+                ++failures;
+            }
+        }
+    }
+    // The chain's base, one phase per mover, and the final.
+    CHECK(outputs >= 3);
+    CHECK(matched == attempts);
+    std::printf("empty points: %d point version(s) answered zero elements in "
+                "the runtime, %d request(s) equal to the live program\n",
+                outputs, matched);
+}
+
 // Playback along the stage's timeline: the sampler hands a fresh reader the
 // stage's values of its Animated inputs at each time, and each run is a
 // fresh evaluator's generation at that time in every output, the
@@ -3268,6 +3451,7 @@ main(int argc, char **argv)
     }
     CHECK(sawBaking);
     CHECK(sawBytes);
+    _TestRequestedEmptyPoints();
     _TestPhaseFixtures();
     std::printf("phase fixtures: %d of 3 with every step label matching; "
                 "%d frame record refusal(s), %d record list refusal(s), %d "

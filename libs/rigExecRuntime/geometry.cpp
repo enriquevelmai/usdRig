@@ -6045,8 +6045,11 @@ RrGeoExtractPoints(const RrProgram *program, const RrExport &output,
         // published -- the chunks the run computed -- and never recomputed.
         const std::vector<RrVec3f> *version =
             RrGeoPointsVersion(chain, output.version);
-        points = version ? version->data() : nullptr;
-        count = version ? version->size() : 0;
+        if (!version)
+            return fail("chain " + output.handle.semanticKey +
+                        " has no version " + std::to_string(output.version));
+        points = version->data();
+        count = version->size();
         // The gather must have filled the whole chain: a group that never ran
         // leaves a short buffer, which would read as points that moved.
         if (count != chain.lastBase.size())
@@ -6058,8 +6061,12 @@ RrGeoExtractPoints(const RrProgram *program, const RrExport &output,
         return fail("points output " + output.handle.semanticKey +
                     " names a slot that holds no point version");
     }
-    if (!points)
-        return fail("chain " + output.handle.semanticKey + " holds no points");
+    // An established zero-element result has no buffer: the empty payload is
+    // the answer, as in RigExecBakedExtractPoints. Only a nonzero count with
+    // no storage is a missing value.
+    if (!points && count != 0)
+        return fail("chain " + output.handle.semanticKey + " holds " +
+                    std::to_string(count) + " points with no storage");
     if (count > std::numeric_limits<size_t>::max() / 3)
         return fail("points output " + output.handle.semanticKey +
                     " has a point count that overflows its payload");
