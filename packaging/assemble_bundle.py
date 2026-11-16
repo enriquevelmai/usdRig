@@ -58,7 +58,7 @@ _IGNORE_RUNTIME = shutil.ignore_patterns(
     "__pycache__", "*.pyc", "*.pyo", "*.pdb")
 _IGNORE_TRIM_DEV = shutil.ignore_patterns(
     "__pycache__", "*.pyc", "*.pyo", "*.pdb", "*.lib", "*.a",
-    "include", "cmake")
+    "include", "Headers", "cmake")
 
 
 def _ignore(trim_dev: bool):

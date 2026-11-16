@@ -33,7 +33,9 @@ The launcher derives all of these paths from its own location, sets
 `PYTHONPATH`, `PXR_PLUGINPATH_NAME`, `PATH`, and the platform loader
 path, then runs `app/usd/bin/usdview` with the bundled Python.
 `usdRigView --usdRig-check` verifies the bundle without starting the
-viewer; `--usdRig-print-env` shows the computed environment.
+viewer; `--usdRig-print-env` shows the computed environment. The installed
+`rigExecUsdview` directory is also on `PYTHONPATH`, so TouchPose and Shape
+Editor can import the shared editor modules.
 
 On macOS, assembly rewrites every Mach-O install name that points at a
 build-machine location (a copied CPython framework prefix records
@@ -51,6 +53,9 @@ the resolved framework prefix (`Python.framework/Versions/<x.y>`)
 instead of the shim tree; copying the shim alone loses
 `Resources/Python.app`, which the framework interpreter stub spawns at
 run time, and assembly fails if that spawn target is not bundled.
+`--trim-dev` removes both `include` and the framework
+`Headers` alias; retaining the alias after removing its target breaks
+macOS signature verification.
 
 ## Cutting a release
 

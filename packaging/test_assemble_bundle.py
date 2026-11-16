@@ -61,6 +61,7 @@ def make_trees(base: Path, platform: str) -> dict:
         touch(rig / "lib" / "usd" / plug / "resources" / "plugInfo.json",
               "{}\n")
     touch(rig / "lib" / "python" / "rigexec" / "__init__.py")
+    touch(rig / "lib" / "python" / "rigExecUsdview" / "editorExtension.py")
     python_home = base / "python-home"
     if platform == "windows":
         touch(python_home / "python.exe", "py\n")
@@ -249,6 +250,21 @@ class AssembleBundleTest(unittest.TestCase):
         self.assertEqual(copied_python.read_text(encoding="utf-8"),
                          "interpreter\n")
 
+    @unittest.skipUnless(os.name == "posix", "symlinks need POSIX")
+    def test_trim_dev_removes_framework_headers_alias(self):
+        spec = importlib.util.spec_from_file_location("assemble_bundle", ASSEMBLE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        src = self.base / "python-framework"
+        touch(src / "include" / "python3.11" / "Python.h")
+        (src / "Headers").symlink_to("include/python3.11")
+        for trim in (False, True):
+            dst = self.base / ("trimmed" if trim else "complete")
+            module.copy_tree(src, dst, trim_dev=trim, preserve_symlinks=True)
+            self.assertEqual((dst / "include").exists(), not trim)
+            self.assertEqual((dst / "Headers").is_symlink(), not trim)
+            self.assertEqual((dst / "Headers").exists(), not trim)
+
     @unittest.skipUnless(
         sys.platform == "darwin" and (shutil.which("clang") or
                                       shutil.which("cc")) and
@@ -390,6 +406,15 @@ class AssembleBundleTest(unittest.TestCase):
                        "Resources" / "app" / "rig" / "lib" / IMAGING)
         else:
             imaging = output / "app" / "rig" / "lib" / IMAGING
+        env_result = subprocess.run([str(exe), "--usdRig-print-env"],
+                                    capture_output=True, text=True)
+        self.assertEqual(env_result.returncode, 0, env_result.stderr)
+        env_values = dict(line.split("=", 1)
+                          for line in env_result.stdout.splitlines())
+        editor_dir = imaging.parent / "python" / "rigExecUsdview"
+        self.assertIn(editor_dir.resolve(),
+                      [Path(entry).resolve() for entry in
+                       env_values["PYTHONPATH"].split(os.pathsep)])
         imaging.unlink()
         broken = subprocess.run([str(exe), "--usdRig-check"],
                                 capture_output=True, text=True)

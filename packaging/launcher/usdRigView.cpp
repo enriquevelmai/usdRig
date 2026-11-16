@@ -457,6 +457,7 @@ BuildEnv(const Bundle &bundle)
 
     std::vector<std::string> pythonPath;
     AppendExisting(pythonPath, rigPython);
+    AppendExisting(pythonPath, rigPython / "rigExecUsdview");
     if (IsDir(bundle.usdSitePackages)) {
         pythonPath.push_back(bundle.usdSitePackages.string());
     }
