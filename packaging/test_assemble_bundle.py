@@ -494,6 +494,7 @@ class AssembleBundleTest(unittest.TestCase):
                            dll_path.split(os.pathsep) if entry]
             self.assertIn((app / "usd" / "lib").resolve(), dll_entries)
             self.assertIn((app / "rig" / "lib").resolve(), dll_entries)
+            self.assertIn((app / "rig" / "bin").resolve(), dll_entries)
 
 
 if __name__ == "__main__":

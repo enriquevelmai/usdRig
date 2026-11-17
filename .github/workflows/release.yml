@@ -266,6 +266,22 @@ jobs:
           & "$bundle/app/python/python.exe" "$bundle/app/usd/bin/usdview" --help | Select-Object -First 5
           if ($LASTEXITCODE -ne 0) { throw "usdview --help failed" }
 
+      # usdview --help exits before _configurePlugins loads the bundled
+      # plug-ins, so only a real launch catches a plug-in whose DLLs the
+      # launcher cannot resolve (UsdNoodles' noodles.dll lives in rig/bin).
+      - name: Smoke test GUI launch (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION_NUM: ${{ needs.gate.outputs.version-num }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $bundle = "dist/usdRig-$env:VERSION_NUM-windows-x64"
+          & "$bundle/usdRigView.exe" "$bundle/app/examples/rigexec_flat.usda" --norender --quitAfterStartup
+          if ($LASTEXITCODE -ne 0) { throw "GUI launch failed for rigexec_flat.usda" }
+          & "$bundle/usdRigView.exe" "$bundle/app/examples/ArmShotAnim.usda" --norender --quitAfterStartup
+          if ($LASTEXITCODE -ne 0) { throw "GUI launch failed for ArmShotAnim.usda" }
+
       # The launcher must not inherit another USD/Python install from the
       # caller's environment (foreign pxr modules, plug-ins, or stale
       # runtime DLLs on PATH break the bundled interpreter on dev machines).

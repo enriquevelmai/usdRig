@@ -463,6 +463,7 @@ BuildEnv(const Bundle &bundle)
 {
     const fs::path &app = bundle.app;
     const fs::path rigLib = app / "rig" / "lib";
+    const fs::path rigBin = app / "rig" / "bin";
     const fs::path rigPython = rigLib / "python";
     const fs::path usd = app / "usd";
 
@@ -486,11 +487,13 @@ BuildEnv(const Bundle &bundle)
     std::vector<std::string> path;
     AppendExisting(path, bundle.pythonDir);
     AppendExisting(path, rigLib);
+    AppendExisting(path, rigBin);
     AppendExisting(path, usd / "bin");
     AppendExisting(path, usd / "lib");
 
     std::vector<std::string> loaderPath;
     AppendExisting(loaderPath, rigLib);
+    AppendExisting(loaderPath, rigBin);
     AppendExisting(loaderPath, usd / "lib");
 
     Env env;
@@ -501,6 +504,7 @@ BuildEnv(const Bundle &bundle)
     std::vector<std::string> dllPath;
     AppendExisting(dllPath, bundle.pythonDir);
     AppendExisting(dllPath, rigLib);
+    AppendExisting(dllPath, rigBin);
     AppendExisting(dllPath, usd / "bin");
     AppendExisting(dllPath, usd / "lib");
     env.emplace_back("PXR_USD_WINDOWS_DLL_PATH", Join(dllPath));
