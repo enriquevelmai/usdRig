@@ -482,6 +482,9 @@ BuildEnv(const Bundle &bundle)
     AppendExisting(pluginPath, app / "plugins" / "touchPose");
     AppendExisting(pluginPath, app / "plugins" / "shapeEditor");
     AppendExisting(pluginPath, rigPython / "UsdNoodles");
+    // The usdview plug-in container (RigExec menu, viewport tools, pickers)
+    // is discovered through its plugInfo.json, not through PYTHONPATH.
+    AppendExisting(pluginPath, rigPython / "rigExecUsdview");
 
     // The RigExec install prefix puts third-party runtime DLLs (the node
     // editor's noodles.dll) in rig/bin beside the command-line tools, so

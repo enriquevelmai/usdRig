@@ -46,7 +46,9 @@ does not depend on the host's Visual C++ runtime version.
 `usdRigView --usdRig-check` verifies the bundle without starting the
 viewer; `--usdRig-print-env` shows the computed environment. The installed
 `rigExecUsdview` directory is also on `PYTHONPATH`, so TouchPose and Shape
-Editor can import the shared editor modules.
+Editor can import the shared editor modules, and on `PXR_PLUGINPATH_NAME`,
+so usdview loads its plug-in container (the RigExec menu, viewport tools
+and pickers).
 
 On macOS, assembly rewrites every Mach-O install name that points at a
 build-machine location (a copied CPython framework prefix records
