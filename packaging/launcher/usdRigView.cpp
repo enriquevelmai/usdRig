@@ -483,9 +483,15 @@ BuildEnv(const Bundle &bundle)
     AppendExisting(pluginPath, app / "plugins" / "shapeEditor");
     AppendExisting(pluginPath, rigPython / "UsdNoodles");
 
+    // The RigExec install prefix puts third-party runtime DLLs (the node
+    // editor's noodles.dll) in rig/bin beside the command-line tools, so
+    // that directory has to be searched as well as rig/lib.
+    const fs::path rigBin = app / "rig" / "bin";
+
     std::vector<std::string> path;
     AppendExisting(path, bundle.pythonDir);
     AppendExisting(path, rigLib);
+    AppendExisting(path, rigBin);
     AppendExisting(path, usd / "bin");
     AppendExisting(path, usd / "lib");
 
@@ -501,6 +507,7 @@ BuildEnv(const Bundle &bundle)
     std::vector<std::string> dllPath;
     AppendExisting(dllPath, bundle.pythonDir);
     AppendExisting(dllPath, rigLib);
+    AppendExisting(dllPath, rigBin);
     AppendExisting(dllPath, usd / "bin");
     AppendExisting(dllPath, usd / "lib");
     env.emplace_back("PXR_USD_WINDOWS_DLL_PATH", Join(dllPath));
