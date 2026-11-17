@@ -925,13 +925,7 @@ RigExecRuntimeReader::Execute(std::string *error)
                                    store.headLines[i].begin(),
                                    store.headLines[i].end());
         }
-        const size_t target =
-            size_t(program.requiredStageFramesAdmission.firstBadTarget);
-        const size_t slot = size_t(program.slotMeta->xformSlots[target]);
-        const std::string refusal =
-            "could not resolve constraint target " +
-            program.TextOrEmpty(program.slotMeta->paths[slot]) +
-            " relative to the asset root";
+        const std::string refusal = RrStageFramesRefusal(&program);
         poseDiagnostics.push_back(refusal);
         _jointMatrices.clear();
         _points.clear();

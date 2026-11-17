@@ -888,6 +888,14 @@ public:
     /// releases.
     size_t ClearCoverageUnpinned();
 
+    /// Returns coverage bytes to the budget under pressure: drops records no
+    /// lease stands on and no live demand reads, oldest published first, until
+    /// \p bytesNeeded would fit or nothing reclaimable is left. Returns the
+    /// bytes released. A record named in \p keep stays: it is the answer a
+    /// live subscriber still polls, and its packets and charges stand.
+    size_t ReclaimCoverage(size_t bytesNeeded,
+                           const std::vector<RigExecCoverageKey> &keep);
+
 private:
     friend class RigExecCoverageReservation;
     friend class RigExecCoverageLease;
@@ -926,6 +934,8 @@ private:
         RigExecCoverageBytes bytes;
         bool arenaRetained = false;
         size_t leases = 0;
+        // Publish order, so pressure retires the stalest record first.
+        uint64_t published = 0;
     };
     using _CoverageMap =
         std::unordered_map<RigExecCoverageKey, std::shared_ptr<_CoverageEntry>,
@@ -991,6 +1001,9 @@ private:
     size_t _AccountedBytes() const;
     bool _ChargeCoverage(const RigExecCoverageBytes &bytes) const;
     bool _ReleaseCharge(const RigExecCoverageBytes &bytes) const;
+    // Bytes the shared ceiling still has for a new charge: the cap less the
+    // pose store and every standing coverage charge, read as one step.
+    size_t _CoverageHeadroom() const;
     // Moves \p bytes of a live payload from the payload charge to the pinned
     // charge: the total does not change, so pinning cannot take the store over
     // the cap by itself.
@@ -1023,6 +1036,7 @@ private:
     mutable std::atomic<size_t> _coveragePayload{0};
     mutable std::atomic<size_t> _coveragePinned{0};
     mutable std::atomic<size_t> _coverageRecords{0};
+    mutable std::atomic<uint64_t> _coverageSequence{0};
     // Pose residency and the four coverage domains share one byte ceiling, so
     // every mutation of either total -- a coverage charge or release, a
     // payload-to-pinned transfer, or a pose publish, eviction or clear -- runs

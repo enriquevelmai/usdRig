@@ -291,3 +291,9 @@ libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_covera
 libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
 libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> transfer(_coverageAccountMutex);
 libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> transfer(_coverageAccountMutex);
+# Coverage pressure: the account read, and the shard walk that drops records
+# no lease stands on, on the owner thread at admission.
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> account(_coverageAccountMutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/frameCache.cpp | lock | std::lock_guard<std::mutex> lock(shard.mutex);
+libs/rigExec/outputSubscription.cpp | lock | std::lock_guard<std::mutex> lock(_mutex);

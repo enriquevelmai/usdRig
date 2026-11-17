@@ -1853,6 +1853,49 @@ TestBoundsRefuseBeforeAllocating()
     CHECK(TotalBytes(h.cache.CoverageHeld()) > TotalBytes(standing));
 }
 
+// A closed subscription leaves its coverage record charged, but that charge is
+// not a permanent reservation. With the cap at one standing record plus one
+// job less a byte, the next frame is admitted because the ask takes the stale
+// record back: nothing is declined, the store never grows past one record, and
+// the account comes back to what a single answered frame costs.
+void
+TestClosedDemandReturnsItsCoverageOnTheAsk()
+{
+    Harness h;
+    const RigFixture a = StageA();
+    h.catalogs[a.root] = a.catalog;
+    h.workspaceBytes = 1024;
+    auto service = h.MakeService();
+
+    auto first = service.Subscribe(a.root, RequestAt(TimeOf(4.0), {a.scalar}));
+    CHECK(first.IsValid());
+    h.scheduler->DrainQueueForTesting();
+    CHECK(AllReady(service.PollResults(first)));
+    const size_t standing = TotalBytes(h.cache.CoverageHeld());
+    CHECK(standing > 0);
+    CHECK(h.cache.CoverageRecordCount() == 1);
+
+    // Closing gives back the pins, not the record's charge.
+    first.Close();
+    CHECK(h.cache.CoverageRecordCount() == 1);
+    CHECK(h.cache.CoverageHeld().pinned == 0);
+
+    // The cap holds that record and one job with a byte to spare, so the next
+    // frame cannot reserve beside a standing record.
+    const size_t job =
+        h.captureBytes + h.workspaceBytes + PayloadFloorBytes(a.scalar);
+    h.cache.SetByteCap(standing + job - 1);
+
+    auto next = service.Subscribe(a.root, RequestAt(TimeOf(6.0), {a.scalar}));
+    CHECK(next.IsValid());
+    CHECK(service.Stats().declinedCoverageBudget == 0);
+    CHECK(h.scheduler->Stats().explicitAccepted == 2);
+    h.scheduler->DrainQueueForTesting();
+    CHECK(AllReady(service.PollResults(next)));
+    CHECK(h.cache.CoverageRecordCount() == 1);
+    CHECK(TotalBytes(h.cache.CoverageHeld()) <= standing);
+}
+
 // The lane charge is the arena a frame would clone, so the budget's refusal
 // lands before the arena exists: a frame the coverage record answers and a
 // frame the budget declines both preflight and build no lane, and an admitted
@@ -3029,6 +3072,7 @@ main()
     TestRebuildCallbacksStayWithTheirCompilation();
     TestRunningForeignJobCannotOccupyTheFreshFrame();
     TestBoundsRefuseBeforeAllocating();
+    TestClosedDemandReturnsItsCoverageOnTheAsk();
     TestCoverageHitAndBudgetRefusalBuildNoArena();
     TestLaneChargeCoversTheProgramItClones();
     TestLaneChargeWalksTheRecordsItClones();

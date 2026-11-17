@@ -18,8 +18,12 @@
 
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/tf/setenv.h"
+#include "pxr/base/tf/token.h"
 
 #include "pxr/usd/sdf/layer.h"
+#include "pxr/usd/sdf/types.h"
+#include "pxr/usd/usd/attribute.h"
+#include "pxr/usd/usd/relationship.h"
 #include "pxr/usd/usd/stage.h"
 #include "pxr/usd/usdGeom/tokens.h"
 
@@ -156,6 +160,67 @@ def Xform "Asset"
             def Points "Other"
             {
                 point3f[] points = [(0, 0, 0), (0, 0, 1), (0, 1, 1)]
+            }
+        }
+    }
+}
+)USDA";
+
+// The shared rig with one mover more: a position constraint moves a plain
+// Xform prim, whose pose the frame reads off the stage, so that prim is a
+// required stage frame. The frame's admission is one record, so retiring the
+// target's transform schema refuses the whole frame, including a request for
+// an output nowhere in its closure reads that prim.
+const char *const kProbe = "/RefuseAsset/Container/Geometry/Probe";
+const char *const kStageBody = "/RefuseAsset/Container/Geometry/Body.points";
+const char *const kStageFrameRig = "/RefuseAsset/Container/Character";
+
+const char *const kStageFrameStageText = R"USDA(#usda 1.0
+
+def Xform "RefuseAsset"
+{
+    def Scope "Container"
+    {
+        def RigExecRoot "Character"
+        {
+            def Scope "Controls"
+            {
+                def RigExecControl "Drive"
+                {
+                    double avars:ty = 2
+                }
+            }
+
+            def Scope "StackA"
+            {
+                def RigExecPositionConstraint "Hold" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    rel rigExec:moves = </RefuseAsset/Container/Geometry/Probe>
+                    rel rigExec:sources = </RefuseAsset/Container/Character/Controls/Drive>
+                }
+                def RigExecMatrixMover "First" (
+                    prepend apiSchemas = ["RigExecMoverAPI"]
+                )
+                {
+                    float inputs:defaultWeight = 1
+                    rel rigExec:moves = </RefuseAsset/Container/Geometry/Body.points>
+                    rel rigExec:transform = </RefuseAsset/Container/Character/Controls/Drive>
+                }
+            }
+        }
+
+        def Scope "Geometry"
+        {
+            def Xform "Probe"
+            {
+                double3 xformOp:translate = (0, 1, 0)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+            def Points "Body"
+            {
+                point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
             }
         }
     }
@@ -1672,6 +1737,74 @@ TestEmptyPointVersionsAnswerWithNothing()
     }
 }
 
+// A required stage frame the run cannot resolve refuses the frame: every body
+// that reads the admission record is skipped, so the storage holds no answer.
+// The live program declines the request and the extraction in the same words a
+// frozen lane uses (frozenWorker.cpp), and the frame is re-earned when the
+// target's schema comes back.
+void
+TestRefusedStageFrameAnswersNoRequest()
+{
+    Rig rig = BuildRigFrom(kStageFrameStageText, kStageFrameRig);
+    if (!rig.program)
+        return;
+    const UsdPrim probePrim = rig.stage->GetPrimAtPath(SdfPath(kProbe));
+    CHECK(probePrim);
+    const RigExecBakedProgramImpl &graph = rig.program->GetStepGraph();
+    const auto slot = graph.index.find(SdfPath(kProbe));
+    const bool required =
+        slot != graph.index.end() &&
+        std::find(graph.xformSlots.begin(), graph.xformSlots.end(),
+                  int(slot->second)) != graph.xformSlots.end();
+    CHECK(required);
+    if (!required) {
+        std::printf("no stage-frame slot to refuse in this rig\n");
+        return;
+    }
+
+    const std::vector<size_t> slots = SlotsForTarget(rig, kStageBody);
+    CHECK(!slots.empty());
+    std::vector<RigExecOutputPacket> packets;
+    RigExecRequestedRunReport report;
+    std::string error;
+    CHECK(Answer(rig, UsdTimeCode::Default(), slots, slots, &packets, &report,
+                 &error));
+    CHECK(error.empty());
+    CHECK(packets.size() == slots.size());
+    for (const RigExecOutputPacket &packet : packets)
+        CHECK(packet.status == RigExecOutputStatus::Ready);
+
+    CHECK(probePrim.SetTypeName(TfToken("Scope")));
+    RigExecRigPose pose;
+    CHECK(!rig.program->Run(UsdTimeCode::Default(), &pose));
+    CHECK(rig.program->GetLastBail() == RigExecBakedBail::StageFrames);
+
+    packets.clear();
+    error.clear();
+    CHECK(!Request(rig, UsdTimeCode::Default(), ClosureFor(rig, slots), &report,
+                   &error));
+    CHECK(error == "the frame's stage sources were refused");
+
+    // A caller that runs the frame elsewhere and asks for the extraction as a
+    // second step is refused the same way.
+    packets.clear();
+    error.clear();
+    CHECK(!rig.program->ExtractRequestedOutputs(
+        rig.catalog, report, UsdTimeCode::Default(), Captured(rig),
+        HandlesForSlots(rig, slots), &packets, &error));
+    CHECK(packets.empty());
+    CHECK(error == "the frame's stage sources were refused");
+
+    CHECK(probePrim.SetTypeName(TfToken("Xform")));
+    packets.clear();
+    error.clear();
+    CHECK(Answer(rig, UsdTimeCode::Default(), slots, slots, &packets, &report,
+                 &error));
+    CHECK(error.empty());
+    for (const RigExecOutputPacket &packet : packets)
+        CHECK(packet.status == RigExecOutputStatus::Ready);
+}
+
 } // namespace
 
 int
@@ -1691,6 +1824,7 @@ main()
     TestRetainedPayloadsStandAcrossRuns();
     TestForeignCatalogCannotAnswerThisProgram();
     TestEmptyPointVersionsAnswerWithNothing();
+    TestRefusedStageFrameAnswersNoRequest();
     if (failures)
         std::printf("%d failures\n", failures);
     return failures ? 1 : 0;

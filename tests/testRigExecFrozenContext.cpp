@@ -9029,6 +9029,7 @@ def Xform "FrozenAsset"
 )USDA";
 
 const char *const kRequestedRigPath = "/FrozenAsset/Container/Character";
+const char *const kFrozenStageProbe = "/FrozenAsset/Container/Geometry/Probe";
 const char *const kRequestedAmount =
     "/FrozenAsset/Container/Character/PropertyHome.amount";
 const char *const kRequestedJoint = "/FrozenAsset/Container/Character/Joints/X";
@@ -9061,13 +9062,36 @@ struct RequestedRig {
 /// Compiles the mini rig and freezes it without evaluating a generation, so a
 /// lane cloned from the snapshot owns no published value.
 RequestedRig
-BuildRequestedRig(bool evaluateFirst)
+BuildRequestedRig(bool evaluateFirst, bool stageTarget = false)
 {
     RequestedRig rig;
     const SdfLayerRefPtr layer = SdfLayer::CreateAnonymous(".usda");
     CHECK(layer->ImportFromString(kRequestedStageText));
     rig.stage = UsdStage::Open(layer);
     CHECK(rig.stage);
+    if (stageTarget) {
+        // A plain Xform another mover revises is a stage frame: the stage has
+        // to answer its transform, so the frame can be refused.
+        const UsdPrim probe =
+            rig.stage->DefinePrim(SdfPath(kFrozenStageProbe), TfToken("Xform"));
+        CHECK(probe
+                  .CreateAttribute(TfToken("xformOp:translate"),
+                                   SdfValueTypeNames->Double3)
+                  .Set(GfVec3d(0, 1, 0)));
+        CHECK(probe
+                  .CreateAttribute(TfToken("xformOpOrder"),
+                                   SdfValueTypeNames->TokenArray)
+                  .Set(VtTokenArray{TfToken("xformOp:translate")}));
+        const UsdPrim hold = rig.stage->DefinePrim(
+            SdfPath(kRequestedRigPath)
+                .AppendPath(SdfPath("Movers/Constrain/ProbeHold")),
+            TfToken("RigExecPositionConstraint"));
+        CHECK(hold.CreateRelationship(TfToken("rigExec:moves"))
+                  .SetTargets({SdfPath(kFrozenStageProbe)}));
+        CHECK(hold.CreateRelationship(TfToken("rigExec:sources"))
+                  .SetTargets({SdfPath(kRequestedRigPath)
+                                   .AppendPath(SdfPath("Controls/Lead"))}));
+    }
     rig.evaluator = std::make_unique<RigExecRigEvaluator>(
         rig.stage, SdfPath(kRequestedRigPath));
     std::vector<std::string> errors;
@@ -10070,6 +10094,91 @@ TestFrozenRequestedDeclinesAndReports()
     CHECK(!orphan.error.empty());
 }
 
+// A frame whose required stage sources the stage cannot answer is refused by
+// the lane, not answered from its arena, and the lane says it in the words the
+// live program uses for the same frame.
+void
+TestFrozenRequestedRefusesARefusedStageFrame()
+{
+    RequestedRig rig = BuildRequestedRig(/*evaluateFirst=*/true,
+                                         /*stageTarget=*/true);
+    if (!rig.frozen || !rig.catalog)
+        return;
+    const std::vector<size_t> slots = RequestedSlots(*rig.catalog);
+    CHECK(!slots.empty());
+    if (slots.empty())
+        return;
+
+    RigExecFrameInputs inputs;
+    std::string error;
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode::Default(), {},
+                                   &inputs, &error));
+    CHECK(inputs.stageSeeds.requiredStageFramesAdmission.admitted);
+    RigExecFrozenRequestedRun job;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, slots, UsdTimeCode::Default()),
+        RequestedCaptured(*rig.catalog), &job, &error));
+    const RigExecFrozenRequestedResult answered =
+        RunFrozenRequested(rig, inputs, job, nullptr, nullptr);
+    CHECK(answered.ran);
+    CHECK(answered.packets.size() == job.outputs.size());
+    for (const RigExecOutputPacket &packet : answered.packets)
+        CHECK(packet.status == RigExecOutputStatus::Ready);
+
+    // Retire the target's transform schema: the next sample refuses the frame,
+    // and the lane declines the whole request rather than reading bytes its
+    // gated bodies never wrote.
+    const UsdPrim probe = rig.stage->GetPrimAtPath(SdfPath(kFrozenStageProbe));
+    CHECK(probe);
+    CHECK(probe.SetTypeName(TfToken("Scope")));
+    RigExecFrameInputs refusedInputs;
+    error.clear();
+    CHECK(RigExecSampleFrameInputs(*rig.evaluator, UsdTimeCode::Default(), {},
+                                   &refusedInputs, &error));
+    CHECK(!refusedInputs.stageSeeds.requiredStageFramesAdmission.admitted);
+    RigExecFrozenRequestedRun refusedJob;
+    CHECK(RigExecMakeFrozenRequestedRun(
+        rig.catalog,
+        RequestedDemand(*rig.catalog, slots, UsdTimeCode::Default()),
+        RequestedCaptured(*rig.catalog), &refusedJob, &error));
+    const RigExecFrozenRequestedResult refused =
+        RunFrozenRequested(rig, refusedInputs, refusedJob, nullptr, nullptr);
+    CHECK(!refused.ran);
+    CHECK(refused.packets.empty());
+    CHECK(refused.error == "the frame's stage sources were refused");
+
+    // The live program declines the same frame in the same words: the lane is
+    // not the only evaluator that gates a body on this record.
+    RequestedRig native = BuildRequestedRig(/*evaluateFirst=*/false,
+                                            /*stageTarget=*/true);
+    if (!native.stage)
+        return;
+    std::vector<std::string> reasons;
+    auto holder = RigExecBakedProgram::Build(native.evaluator.get(), &reasons);
+    if (!holder)
+        return;
+    auto nativeCatalog = holder ? RequestedCatalog(*holder) : nullptr;
+    if (!holder || !nativeCatalog)
+        return;
+    const std::vector<size_t> nativeSlots = RequestedSlots(*nativeCatalog);
+    CHECK(!nativeSlots.empty());
+    if (nativeSlots.empty())
+        return;
+    const UsdPrim nativeProbe =
+        native.stage->GetPrimAtPath(SdfPath(kFrozenStageProbe));
+    CHECK(nativeProbe);
+    CHECK(nativeProbe.SetTypeName(TfToken("Scope")));
+    RigExecRigPose pose;
+    CHECK(!holder->Run(UsdTimeCode::Default(), &pose));
+    CHECK(holder->GetLastBail() == RigExecBakedBail::StageFrames);
+    RigExecRequestedRunReport report;
+    CHECK(!holder->RunRequested(
+        UsdTimeCode::Default(),
+        nativeCatalog->GetDemandIndex().Union(nativeSlots), &report, &error));
+    CHECK(error == "the frame's stage sources were refused");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -10082,6 +10191,7 @@ main(int argc, char **argv)
     TestFrozenRequestedRefusesAForeignCatalog();
     TestFrozenRequestedPayloadsStandAcrossLaterRuns();
     TestFrozenRequestedDeclinesAndReports();
+    TestFrozenRequestedRefusesARefusedStageFrame();
     if (argc > 1)
         TestFrozenEnvelopeVolumesRecovery(argv[1]);
     TestValuesAreFoundByPath();

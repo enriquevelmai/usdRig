@@ -460,6 +460,26 @@ RrResolveOutput(const RrProgram *program, const RigExecOutputHandle &handle,
                   "output semantic address is not exported");
 }
 
+// The first required target the file could not resolve, in the sentence the
+// whole run declines the frame with.
+std::string
+RrStageFramesRefusal(const RrProgram *program)
+{
+    const auto &admission = program->requiredStageFramesAdmission;
+    const size_t target = size_t(admission.firstBadTarget);
+    if (admission.firstBadTarget < 0 ||
+        target >= program->slotMeta->xformSlots.size()) {
+        return "the frame's stage sources were refused";
+    }
+    const int32_t slot = program->slotMeta->xformSlots[target];
+    if (slot < 0 || size_t(slot) >= program->slotMeta->paths.size()) {
+        return "the frame's stage sources were refused";
+    }
+    return "could not resolve constraint target " +
+           program->TextOrEmpty(program->slotMeta->paths[size_t(slot)]) +
+           " relative to the asset root";
+}
+
 namespace {
 
 // The catalog's own answer for an address it cannot produce: the reason the
@@ -653,6 +673,19 @@ RrRequestOutputs(RrProgram *program,
             }
         *packets = std::move(answers);
         return fail("requested execution did not complete: " + why);
+    }
+    // A completed run is not an admitted frame: the bodies that read the
+    // admission record were skipped (closure.cpp), so this storage holds no
+    // answer. Decline the request in the whole run's words.
+    if (!program->requiredStageFramesAdmission.admitted) {
+        const std::string refusal = RrStageFramesRefusal(program);
+        for (RigExecOutputPacket &packet : answers)
+            if (packet.status == RigExecOutputStatus::Pending) {
+                packet.status = RigExecOutputStatus::Failed;
+                packet.reason = refusal;
+            }
+        *packets = std::move(answers);
+        return fail(refusal);
     }
     for (size_t i = 0; i < answers.size(); ++i) {
         if (bound[i] < 0)

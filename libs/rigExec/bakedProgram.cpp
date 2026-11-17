@@ -5357,6 +5357,10 @@ RigExecBakedProgram::RunRequested(UsdTimeCode time,
     _FrameMarks marks;
     const bool ran = _RunFrame(time, &scratch, /*requested = */ true, &marks);
     RigExecBakedFillRequestedRunReport(B, report);
+    // The bodies a refused frame gates never ran, so this storage answers
+    // nothing; the refusal is the cause ahead of any failure they left behind.
+    if (!B.requiredStageFramesAdmission.admitted)
+        return fail("the frame's stage sources were refused");
     if (!ran)
         return fail("requested execution did not complete");
     return true;
@@ -5400,6 +5404,11 @@ RigExecBakedExtractRequestedOutputs(
     // counts alone are not.
     if (!B.programAffinity || catalog.GetProgramAffinity() != B.programAffinity)
         return fail("output catalog is not this program's compiled graph");
+
+    // A refused frame answers nothing: its gated bodies never ran, so this
+    // storage holds another generation's bytes at best.
+    if (!B.requiredStageFramesAdmission.admitted)
+        return fail("the frame's stage sources were refused");
 
     // The default frame is its own identity; a numeric one must be a finite
     // time code, which is what the demand contract carries.

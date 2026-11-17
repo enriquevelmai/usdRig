@@ -628,6 +628,54 @@ def main():
     subs.set_coverage_cap(standing_cap)
     tight.close()
 
+    # -- a closed subscription does not spend the budget forever -----------
+    # An answered frame leaves a coverage record charged for what its run
+    # captured, and closing the subscription releases the pins its polls took
+    # but keeps that charge. The record is not a permanent reservation: at a
+    # cap that holds one standing record and one job, a host that closes each
+    # subscription before demanding the next frame still gets every frame
+    # answered, with the cap and the service untouched.
+    cycleStage, cycleRig, cycleCtrl, cycleTz = _author_rig(Usd, Sdf, rigexec)
+    cycle = subscriptions.SubscriptionService(cycleRig, workers=0)
+    cycleScalar = _find(cycle.discover(), SCALAR_TARGET, kind="scalar",
+                        phase="final")
+    assert cycleScalar, "no scalar output to cycle"
+    warm = cycle.subscribe([cycleScalar], [None])
+    assert warm.ok, (warm.status, warm.reason)
+    _drain(cycle)
+    assert all(p.status == subscriptions.READY for p in warm.poll()), \
+        [(p.status, p.reason) for p in warm.poll()]
+    warm.close()
+    warmStats = cycle.stats()
+    standing = warmStats["coverage_bytes"]
+    # Closing gave the pins back and kept the record's own charge.
+    assert standing > 0, warmStats
+    assert warmStats["pinned_bytes"] == 0, warmStats
+    assert warmStats["coverage_records"] == 1, warmStats
+
+    # The cap holds that record beside one job's workspace with a fraction of
+    # the record to spare: a standing record leaves no room for the next job,
+    # so each later cycle lands only if admission takes the stale record back.
+    cap = cycle.coverage_estimate() + standing + max(1, standing // 8)
+    cycle.set_coverage_cap(cap)
+    for frame in (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0):
+        nxt = cycle.subscribe([cycleScalar], [frame])
+        assert nxt.ok, (frame, nxt.status, nxt.reason)
+        _drain(cycle)
+        answered = nxt.poll()
+        assert answered and all(p.status == subscriptions.READY
+                                for p in answered), \
+            (frame, [(p.status, p.reason) for p in answered])
+        nxt.close()
+    stats = cycle.stats()
+    # Every cycle was admitted on its own ask: nothing waited for a later pump
+    # to retry, and the store never grew past the frame being answered.
+    assert stats["declined_coverage_budget"] == 0, stats
+    assert stats["coverage_records"] == 1, stats
+    assert cycle.coverage_cap() == cap, cycle.coverage_cap()
+    cycle.close_all()
+    assert cycle.stats()["pinned_payloads"] == 0, cycle.stats()
+
     # -- a payload with zero elements is an answer, not a missing buffer ---
     emptyStage, emptyRig = _author_empty_rig(Usd, rigexec)
     emptyAuthored = emptyStage.GetSessionLayer().ExportToString()

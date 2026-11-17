@@ -1008,12 +1008,26 @@ private:
         }
         RigExecCoverageReservation reservation;
         if (!_host.frameCache->TryReserveCoverage(budget, &reservation)) {
-            std::lock_guard<std::mutex> lock(_mutex);
-            _NoteStatusLocked(groupKey, RigExecOutputStatus::Pending,
-                              "the coverage budget declined this frame; the "
-                              "next pump retries it");
-            ++_stats.declinedCoverageBudget;
-            return;
+            // A record whose demand is gone is the cost of an answered frame,
+            // not a toll on every frame after it: the records no lease holds
+            // and no live frame reads come back, oldest first, and this frame
+            // asks once more.
+            size_t needed = 0;
+            budget.TryTotal(&needed);
+            std::vector<RigExecCoverageKey> live;
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                live = _LiveCoverageKeysLocked();
+            }
+            _host.frameCache->ReclaimCoverage(needed, live);
+            if (!_host.frameCache->TryReserveCoverage(budget, &reservation)) {
+                std::lock_guard<std::mutex> lock(_mutex);
+                _NoteStatusLocked(groupKey, RigExecOutputStatus::Pending,
+                                  "the coverage budget declined this frame; "
+                                  "the next pump retries it");
+                ++_stats.declinedCoverageBudget;
+                return;
+            }
         }
         // The frame is owed work and the budget holds for it, so the arena is
         // paid for before it exists. A lane the host cannot build leaves the
@@ -1126,6 +1140,20 @@ private:
             }
         }
         return true;
+    }
+
+    // The coverage keys live demand reads now, one per frame a client still
+    // demands: pressure reclaims every other unpinned record and leaves these.
+    std::vector<RigExecCoverageKey> _LiveCoverageKeysLocked() const
+    {
+        std::vector<RigExecCoverageKey> keys;
+        keys.reserve(_groups.size());
+        for (const auto &group : _groups) {
+            if (group.second.hasCoverage) {
+                keys.push_back(group.second.coverage);
+            }
+        }
+        return keys;
     }
 
     void _NoteStatusLocked(const _GroupKey &key, RigExecOutputStatus status,

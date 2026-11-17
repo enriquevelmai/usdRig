@@ -921,6 +921,15 @@ public:
         out["pinned_bytes"] = stats.pinnedBytes;
         out["pinned_payloads"] = stats.pinnedPayloads;
         out["callbacks_queued"] = stats.callbacksQueued;
+        // What the answers cost the shared budget now: every standing
+        // coverage charge, against the cap the service's cache holds.
+        const rigExec::RigExecCoverageBytes coverage =
+            _frameCache->CoverageHeld();
+        size_t coverageBytes = 0;
+        coverage.TryTotal(&coverageBytes);
+        out["coverage_bytes"] = coverageBytes;
+        out["coverage_records"] = _frameCache->CoverageRecordCount();
+        out["coverage_cap"] = _frameCache->GetByteCap();
         out["stopping"] = _service->IsStopping();
         return out;
     }

@@ -2731,6 +2731,79 @@ _TestRequestedUnextractable(const RigExecExampleFixture &fixture,
     }
 }
 
+// A refused stage frame is a valid file, not a malformed one: its preparation
+// runs and every body that reads the admission record is skipped. The
+// requested run declines that frame instead of answering a handle from the
+// storage those bodies never wrote, and the whole run declines it in the same
+// words. The live program and a frozen lane refuse the same frame the same way
+// (testRigExecOutputExtraction).
+static int stageFrameRefusals = 0;
+
+static void
+_TestRequestedStageFramesRefusal(const RigExecExampleFixture &fixture,
+                                 const std::vector<uint8_t> &bytes)
+{
+    const std::unique_ptr<fb::RigExecWireFile> baseline =
+        RigExecTestUnpack(bytes);
+    if (!baseline || !baseline->pose ||
+        !baseline->pose->requiredStageFramesAdmission ||
+        !baseline->pose->requiredStageFramesAdmission->admitted ||
+        baseline->slotMeta->xformSlots.empty()) {
+        return;
+    }
+    const std::vector<uint8_t> refusedBytes =
+        RigExecTestEdited(bytes, [](fb::RigExecWireFile *file) {
+            file->pose->requiredStageFramesAdmission->admitted = 0;
+            file->pose->requiredStageFramesAdmission->firstBadTarget = 0;
+        });
+    std::string why;
+    const std::unique_ptr<RigExecRuntimeReader> reader =
+        RigExecRuntimeReader::Open(refusedBytes.data(), refusedBytes.size(),
+                                   &why);
+    // A refused admission is a supported state of a valid file.
+    CHECK(reader);
+    if (!reader) {
+        std::printf("%s: refused-admission open: %s\n", fixture.stage,
+                    why.c_str());
+        return;
+    }
+
+    std::vector<RigExecOutputHandle> asked;
+    for (size_t i = 0; i < reader->GetOutputCount() && asked.size() < 3; ++i) {
+        RigExecRuntimeOutput output;
+        if (reader->GetOutputAt(i, &output) &&
+            output.status == RigExecOutputStatus::Pending) {
+            asked.push_back(output.handle);
+        }
+    }
+    // A file older than the catalog names no outputs, so it has no request to
+    // refuse: that refusal is held to account elsewhere.
+    if (asked.empty()) {
+        return;
+    }
+    RigExecOutputGeneration captured;
+    captured.programIdentity = reader->GetOutputCompileEpoch();
+    std::vector<RigExecOutputPacket> packets;
+    std::string error;
+    CHECK(!reader->ExecuteRequested(asked, _TimeAt(0.0), captured, &packets,
+                                    nullptr, &error));
+    CHECK(!error.empty());
+    CHECK(packets.size() == asked.size());
+    for (const RigExecOutputPacket &packet : packets) {
+        CHECK(packet.status != RigExecOutputStatus::Ready);
+        CHECK(packet.payload.IsEmpty());
+    }
+    // The whole run declines the same frame, and names it the same way.
+    std::string runError;
+    CHECK(!reader->Execute(&runError));
+    CHECK(!runError.empty());
+    CHECK(runError == error);
+    ++stageFrameRefusals;
+    std::printf("%s: refused stage frame: requested run and whole run both "
+                "decline: %s\n",
+                fixture.stage, error.c_str());
+}
+
 // The requested run at a frame the bake did not capture: the reader's inputs
 // sample to that frame, and the same request on the live program at that time
 // answers the same bytes. A file with windowed operations is left out: its
@@ -3392,6 +3465,7 @@ _TestFixture(const RigExecExampleFixture &fixture, const std::string &stagePath,
     // program: at the bake time, and at a frame the bake did not capture.
     _TestRequestedOutputs(fixture, stage, rigPath, atFirst, bakeFrames.front());
     _TestRequestedUnextractable(fixture, atFirst, bakeFrames.front());
+    _TestRequestedStageFramesRefusal(fixture, atFirst);
     if (bakeFrames.size() > 1 && std::string(fixture.animation) != "static") {
         _TestRequestedAtFrame(fixture, stage, rigPath, atFirst,
                               bakeFrames.back());
@@ -3465,6 +3539,7 @@ main(int argc, char **argv)
     CHECK(reservedRefusals > 0);
     CHECK(volumeRefusals > 0);
     CHECK(versionRefusals > 0);
+    CHECK(stageFrameRefusals > 0);
     _TestOwnChainPreceding();
     std::printf("own-chain preceding: %d run(s) equal to live baked and off "
                 "the base read; %d refusal(s)\n",

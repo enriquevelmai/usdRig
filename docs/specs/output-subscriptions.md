@@ -305,6 +305,15 @@ produce stays `Unsupported` with the reason the file recorded.
   been restricted too, and the operations it masked out were never asked about,
   so their clean state says nothing about what this store holds. A whole run
   resets that. See "What a run leaves out is owed, not trusted" above.
+- **A refused frame is refused in every evaluator.** A file whose
+  `required_stage_frames_admission` says the stage could not answer a required
+  target opens, runs its preparation, and gates every body that reads the
+  admission record, exactly as the live program and a frozen lane do. A whole
+  run declines the frame with the unresolved target's path, and a requested run
+  declines it the same way before answering: no handle of a refused frame is
+  `Ready`, and the handles that were already terminal keep their own answers.
+  A second-step extraction is refused as well, so no caller reads a refused
+  frame out of storage its gated bodies never wrote.
 - **An older bake is not guessed at.** A file older than the catalog exposes the
   getters it always had, names no outputs, and refuses a request with a reason
   rather than resolving an address it never recorded.
@@ -524,9 +533,14 @@ produced it, so a coverage hit never implies the ancestors exist.
 - **The bound is at admission, not at eviction.** Coverage shares the cache's
   per-rig byte cap with the poses and is never read or dropped by the pose
   store's LRU pass. `TryReserveCoverage` charges the budget before anything
-  allocates; a frame it declines answers `Pending` with a retry reason, counts
-  `declinedCoverageBudget`, and is tried again at the owner's next pump. A
-  capture that states no payload bytes is charged one element per demanded
+  allocates. A refusal is pressure, so the host reclaims before it retries:
+  `ReclaimCoverage` returns the bytes of every record no lease stands on and no
+  frame a live subscription demands reads, oldest published first, stopping as
+  soon as the request would fit, and the frame asks once more. Only a frame
+  that still does not fit answers `Pending` with a retry reason, counts
+  `declinedCoverageBudget`, and is tried again at the owner's next pump; a cap
+  too small for the job itself declines on the retry with nothing reclaimable.
+  A capture that states no payload bytes is charged one element per demanded
   handle as a floor. The order is fixed: preflight, coverage lookup, budget,
   then the lane. A frame a standing record answers and a frame the budget
   refuses both preflight and build no arena.
@@ -535,10 +549,12 @@ produced it, so a coverage hit never implies the ancestors exist.
   payload that would pass the budget fails that frame rather than storing over
   budget. A subscription job's arena dies with the lane, so its record
   publishes claiming no retained workspace.
-- **Pins outlive records; records outlive demand.** A record with a standing
-  lease is never dropped, and closing every client releases only the charges
-  those clients held. `RetireCoverageArena` releases a record's workspace
-  charge and marks the arena retired while every payload stays reusable.
+- **Pins outlive records; records outlive demand while they are free to.** A
+  record with a standing lease is never dropped, and closing every client
+  releases only the charges those clients held: the record stays, unprobed and
+  still charged, until budget pressure reclaims it or a later host re-demands
+  its frame. `RetireCoverageArena` releases a record's workspace charge and
+  marks the arena retired while every payload stays reusable.
   Publishing under a held key replaces the record and releases the bytes the
   old one held, except what a live lease still owes.
 
@@ -561,7 +577,7 @@ worker.
 | `OutputValue` | The answer as read-only arrays: `doubles`, `scalar`, `matrix` (row-major, USD row-vector form), `points`, `point(i)`. A poll copies the published bytes, so a held answer never aliases a live result and never moves under its holder. |
 | `pump()`, `settle(timeout=5.0)`, `run_next_queued()` | The host's own tick: deliver what the pool completed and re-dispatch what a retired generation or a widened demand left owed. `settle` pumps and runs until nothing is in flight. `run_next_queued()` is `workers=0`'s manual mode: run the highest-priority queued job on this thread. |
 | `Subscription.close()`, `close_all()` | End one subscription or all of them, with the same release for each demand no other client holds. Leaving a subscription's `with` block closes it, and leaving the service's `with` block closes every client. |
-| `stats()` | The service's lifecycle counters: `subscriptions`, `frames_demanded`, `demands_in_flight`, `coverage_hits`, `dispatches`, `redispatches`, `declined_coverage_budget`, `declined_admission`, `capture_failures`, `retired_in_flight`, `pinned_bytes`, `pinned_payloads`, `callbacks_queued`, `stopping`. |
+| `stats()` | The service's lifecycle counters: `subscriptions`, `frames_demanded`, `demands_in_flight`, `coverage_hits`, `dispatches`, `redispatches`, `declined_coverage_budget`, `declined_admission`, `capture_failures`, `retired_in_flight`, `pinned_bytes`, `pinned_payloads`, `callbacks_queued`, `coverage_bytes`, `coverage_records`, `coverage_cap`, `stopping`. |
 
 A service holds its `rigexec.Rig` alive, because the capture hook samples it
 on the owner thread and is the only live-USD read in the lifecycle. Handles

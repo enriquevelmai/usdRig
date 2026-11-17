@@ -1791,6 +1791,70 @@ TestCoverageSharesTheCapAndClearSweepsIt()
     CHECK(CoverageTotal(cache) == 0);
 }
 
+// A record no one demands any more is not a toll on every frame after it.
+// Pressure reclaims the unpinned records oldest first, stops once the room is
+// there, and leaves a leased record and any key the caller names as live.
+void
+TestCoveragePressureReclaimsTheStalestUnpinnedRecord()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(330);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+    // Three records of 100 captured bytes plus an 8-byte payload, published
+    // oldest first.
+    std::vector<RigExecCoverageKey> keys;
+    for (int i = 0; i < 3; ++i) {
+        const RigExecCoverageKey key = MakeCoverageKey(1, double(i + 1), gen);
+        CHECK(cache.PublishCoverage(
+            key,
+            {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 1)},
+            Reserve(cache, 100, 0, 8), false));
+        keys.push_back(key);
+    }
+    CHECK(cache.CoverageRecordCount() == 3);
+    CHECK(CoverageTotal(cache) == 324);
+
+    // The newest frame is being read through a lease, and the caller names the
+    // middle one as live demand: only the oldest record is owed back.
+    RigExecCoverageLease lease;
+    CHECK(cache.PinCoverage(keys[2], handle, &lease));
+    CHECK(cache.ReclaimCoverage(150, {keys[1]}) == 108);
+    CHECK(cache.CoverageRecordCount() == 2);
+    RigExecCoverageRecord record;
+    CHECK(!cache.LookupCoverage(keys[0], &record));
+    CHECK(cache.LookupCoverage(keys[1], &record));
+    CHECK(cache.LookupCoverage(keys[2], &record));
+    CHECK(CoverageTotal(cache) == 216);
+    CHECK(cache.CoverageHeld().pinned == 8);
+    // The leased packet stays answerable at its own key and generation.
+    CHECK(lease.IsValid());
+    RigExecOutputPacket served;
+    CHECK(cache.CoverageAnswers(keys[2], handle, &served));
+    CHECK(served.Answers(handle, keys[2].time, gen));
+
+    // Nothing else is reclaimable: a live lease is never revoked and a live
+    // key is never dropped, so the walk reports no more room to make.
+    CHECK(cache.ReclaimCoverage(150, {keys[1]}) == 0);
+    CHECK(cache.CoverageRecordCount() == 2);
+
+    // With no key named, the retired frame's record goes too, and the walk
+    // stops at the room it asked for rather than emptying the store.
+    CHECK(cache.ReclaimCoverage(150, {}) == 108);
+    CHECK(cache.CoverageRecordCount() == 1);
+    CHECK(cache.LookupCoverage(keys[2], &record));
+    CHECK(CoverageTotal(cache) == 108);
+    CHECK(cache.CoverageHeld().pinned == 8);
+
+    CHECK(lease.Release());
+    // The leased record stood through the walk, so it is still there with its
+    // payload back in the charge. Only an explicit clear takes it.
+    CHECK(cache.CoverageRecordCount() == 1);
+    CHECK(CoverageTotal(cache) == 108);
+    CHECK(cache.ClearCoverageUnpinned() == 1);
+    CHECK(CoverageTotal(cache) == 0);
+}
+
 // Publish and lookup on the same keys from several threads keep the account
 // honest: every surviving record is charged exactly once, and emptying the
 // store ends at zero.
@@ -2263,6 +2327,7 @@ main()
     TestSharedPayloadStaysSharedWhenARecordDropsIt();
     TestReleaseIsBalancedOrDeclined();
     TestCoverageSharesTheCapAndClearSweepsIt();
+    TestCoveragePressureReclaimsTheStalestUnpinnedRecord();
     TestConcurrentCoveragePublishKeepsAccountingHonest();
     TestConcurrentCoverageReservationsCannotPassTheCapTwice();
     TestPosePublicationYieldsToResidentCoverage();

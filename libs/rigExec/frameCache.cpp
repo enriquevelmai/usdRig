@@ -1733,6 +1733,22 @@ RigExecFrameCache::_ReleaseCharge(const RigExecCoverageBytes &bytes) const
     return true;
 }
 
+size_t
+RigExecFrameCache::_CoverageHeadroom() const
+{
+    std::lock_guard<std::mutex> account(_coverageAccountMutex);
+    const size_t cap = _byteCap.load(std::memory_order_relaxed);
+    size_t coverage = 0;
+    size_t used = 0;
+    if (!_CoverageCharge().TryTotal(&coverage) ||
+        !RigExecCheckedAdd(_bytes.load(std::memory_order_relaxed), coverage,
+                           &used) ||
+        used >= cap) {
+        return 0;
+    }
+    return cap - used;
+}
+
 bool
 RigExecFrameCache::_PinPayload(size_t bytes) const
 {
@@ -1968,6 +1984,8 @@ RigExecFrameCache::PublishCoverage(
     std::shared_ptr<_CoverageEntry> entry = std::make_shared<_CoverageEntry>();
     entry->bytes = record;
     entry->arenaRetained = arenaRetained;
+    entry->published =
+        _coverageSequence.fetch_add(1, std::memory_order_relaxed);
     entry->outputs.reserve(packets.size());
     for (const RigExecOutputPacket &packet : packets) {
         entry->outputs.push_back(_CoveredOutput{packet, false});
@@ -2201,6 +2219,55 @@ RigExecFrameCache::ClearCoverageUnpinned()
         }
     }
     return dropped;
+}
+
+size_t
+RigExecFrameCache::ReclaimCoverage(size_t bytesNeeded,
+                                   const std::vector<RigExecCoverageKey> &keep)
+{
+    // Pressure, not a sweep: the walk stops once the room is there, and takes
+    // the stalest record first. A live lease is never revoked, and a key the
+    // caller names is the answer a live subscriber still polls.
+    size_t released = 0;
+    while (_CoverageHeadroom() < bytesNeeded) {
+        bool found = false;
+        uint64_t oldest = 0;
+        RigExecCoverageKey victim;
+        for (const _Shard &shard : _shards) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            for (const auto &entry : shard.coverage) {
+                if (entry.second->leases > 0 ||
+                    std::find(keep.begin(), keep.end(), entry.first) !=
+                        keep.end()) {
+                    continue;
+                }
+                if (!found || entry.second->published < oldest) {
+                    found = true;
+                    oldest = entry.second->published;
+                    victim = entry.first;
+                }
+            }
+        }
+        if (!found) {
+            return released;
+        }
+        _Shard &shard = _GetCoverageShard(victim);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        const auto it = shard.coverage.find(victim);
+        // A lease arrived, or another owner took the record, since the scan:
+        // leave it and re-read the room rather than drop held bytes.
+        if (it == shard.coverage.end() || it->second->leases > 0) {
+            continue;
+        }
+        size_t bytes = 0;
+        it->second->bytes.TryTotal(&bytes);
+        _DetachCoverageEntry(shard, it);
+        if (bytes > (std::numeric_limits<size_t>::max)() - released) {
+            return (std::numeric_limits<size_t>::max)();
+        }
+        released += bytes;
+    }
+    return released;
 }
 
 } // namespace rigExec
