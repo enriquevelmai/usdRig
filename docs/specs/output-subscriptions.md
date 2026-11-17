@@ -602,4 +602,10 @@ intermediate at 2.5 while the artist sits at frame 12 demands 2.5 and leaves 12
 on screen: the module has no `SetTime` path, holds no evaluator, reads no stage,
 and has no route to a frame the service did not publish, so the panel, a
 headless host and the tests share one frame semantics and one set of
-dispositions.
+dispositions. The panel ticks while `HasWork()` reports a line owed, and tells
+the model what its host saw when the stage changed under a standing demand, so
+the capture a later poll takes re-earns an answered frame the artist has since
+edited. That note reports a fact about the host's stage, moves no demand by
+itself, and asks for one bounded tick: the capture either finds the standing
+record still answers the frame or demands its new answer, and the frame being
+inspected and the viewer's are both left where they were.

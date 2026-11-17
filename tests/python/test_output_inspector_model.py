@@ -59,6 +59,9 @@ DEFAULT_TY = 0.0
 TZ_SAMPLES = {-6.0: -1.0, 0.0: 0.0, 10.0: 5.0}
 TY_SAMPLES = {0.0: 0.0, 10.0: 3.0}
 
+# The value this test authors onto the driven attribute mid-run.
+EDITED_AMOUNT = 11.0
+
 # The frame the stand-in host is showing: past both splines' last knots, so
 # it answers the held values -- and it is a frame the rig is never asked for
 # anywhere but here.
@@ -583,6 +586,57 @@ def main():
     # -- nothing above authored a stage opinion ---------------------------
     _Check(stage.GetSessionLayer().ExportToString() == authored,
            "the inspector authored into the stage")
+
+    # -- a stage edit under an answered line owes one more tick -----------
+    # The service reads the live stage in the capture its poll takes, so a
+    # host that stops ticking the moment a line answers shows the value it
+    # captured before the edit. The host's note is what keeps the line owed
+    # long enough for one more poll, and that poll decides the rest. The edit
+    # is the test's own: the inspector still authored nothing.
+    dataAttr = stage.GetPrimAtPath(DATA_PATH).GetAttribute("amount")
+    _Check(model.Attach(rig), "a reopened inspector found no outputs")
+    scalarHandles = model.HandlesFor(DATA_PATH)
+    finalHandle = [b for b in scalarHandles if b.phase == "final"][0]
+    model.Select(scalarHandles)
+    model.DemandFrame(2.0)
+    rows = _DrainReady(model, 2.0, len(scalarHandles))
+    shown = _Row(rows, finalHandle)
+    _Check(_Close(shown.packet.value.scalar,
+                  float(rig.evaluate(2.0).moved_property(SCALAR_TARGET))),
+           shown.ValueText())
+    _Check(not model.HasWork(), "a settled line reported work")
+    heldGeneration = shown.generation["input_revision"]
+    heldText = shown.ValueText()
+    dataAttr.Set(EDITED_AMOUNT, Usd.TimeCode(2.0))
+    editedAuthored = stage.GetSessionLayer().ExportToString()
+    # An edit the host never reported leaves the settled line settled: the
+    # service cannot be asked about a frame nobody is polling.
+    _Check(not model.HasWork(), "an unreported edit owed a tick")
+    model.NoteStageEdit()
+    _Check(model.HasWork(),
+           "a stage edit under an answered line left the host no reason to "
+           "poll again")
+    rows = _DrainReady(model, 2.0, len(scalarHandles))
+    answered = _Row(rows, finalHandle)
+    _Check(answered.generation["input_revision"] != heldGeneration,
+           "the same generation answered a moved stage")
+    _Check(answered.ValueText() != heldText,
+           "the edited stage answered the old value")
+    _Check(_Close(answered.packet.value.scalar,
+                  float(rig.evaluate(2.0).moved_property(SCALAR_TARGET))),
+           answered.ValueText())
+    # The tick that answered needs no further one, and the line the host was
+    # already showing keeps the answer it was showing.
+    _Check(not model.HasWork(), "the edit-driven poll kept owing work")
+    _Check(shown.ValueText() == heldText,
+           "the answer the host was showing moved under it")
+    # The inspected frame is the frame still demanded, and the host's frame
+    # is the one it was showing before any of this.
+    _Check(model.Frame() == 2.0 and model.FrameText() == "2", model.Frame())
+    _Check(host.frame == SHOWN_FRAME and host.reached == [], host.reached)
+    _Check(stage.GetSessionLayer().ExportToString() == editedAuthored,
+           "the inspector authored into the stage after the edit")
+    model.Close()
 
     # -- a payload with no points is an answer, not a missing value -------
     emptyStage, emptyRig = _author_empty_rig(rigexec)

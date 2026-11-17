@@ -5,10 +5,10 @@ The execution stack panel's output inspector, driven on its real widgets.
 This drives plugin/rigExecUsdview/execStackUI.ExecStackPanel itself, on Qt's
 offscreen platform, over the rig test_output_inspector_model authors: the
 output chooser, the frame field, the lines the panel paints, the stack row
-and the viewport pick that name a request, the panel's own tick, and its
-teardown. The usdview api is a stand-in carrying the attributes the panel
-reads, and its playhead refuses to be moved, so a reach for the viewer's
-clock fails at the line that reaches.
+and the viewport pick that name a request, the panel's own tick, the stage
+edit that re-arms it, and its teardown. The usdview api is a stand-in
+carrying the attributes the panel reads, and its playhead refuses to be
+moved, so a reach for the viewer's clock fails at the line that reaches.
 
 What a demanded frame answers is pinned in test_output_inspector_model; this
 test pins that the panel asks for one exact frame, paints the disposition it
@@ -41,6 +41,13 @@ from test_output_inspector_model import (  # noqa: E402
     SHOWN_FRAME, TZ_SAMPLES, _author_empty_rig, _author_rig)
 
 STATUS_WORDS = set(insp.STATUS_LABELS.values())
+
+# ChangeNotice.RESYNC: the value usdview's data model carries on
+# signalPrimsChanged when a prim or property changed on the stage.
+_RESYNC = 1
+
+# The value this test authors onto the driven attribute mid-run.
+EDITED_AMOUNT = 11.0
 
 # The widgets need an application before any of them exists; offscreen keeps
 # it from asking for a display.
@@ -90,6 +97,10 @@ class _Data(object):
         self.frameWrites = []
         self.selection = _Selection()
         self.signalStageReplaced = _Signal()
+        # usdview's data model registers one Usd.Notice.ObjectsChanged
+        # listener per stage and forwards it here, carrying its two
+        # ChangeNotice values.
+        self.signalPrimsChanged = _Signal()
 
     @property
     def currentFrame(self):
@@ -195,6 +206,30 @@ def _TickUntilAnswered(panel, deadlineSeconds=15.0):
                       for row in rows])
 
 
+def _WaitForEditRepaint(panel, phase, before, deadlineSeconds=15.0):
+    """Let the panel's own tick follow a stage edit: no manual tick here.
+
+    `before` is the painted line the panel showed for `phase` before the
+    edit. The only path to a different one is the host's stage-change signal
+    re-arming the panel's timer, that timer ticking, and the poll reading
+    what the service published for the frame: the selection, the frame field
+    and the viewer's clock are left alone while it runs.
+    """
+    app = QtWidgets.QApplication.instance()
+    deadline = time.monotonic() + deadlineSeconds
+    while time.monotonic() < deadline:
+        app.processEvents()
+        lines = [line for line in _Lines(panel) if line[2] == phase]
+        if (len(lines) == 1 and lines[0] != before
+                and all(row.status == insp.READY
+                        for row in panel._inspector.Rows())):
+            _Check(not panel._inspectorTimer.isActive(),
+                   "the edit-driven tick kept running once it answered")
+            return lines[0]
+    _Check(False, "the edit never reached the screen: before=%r now=%r" %
+           (before, [line for line in _Lines(panel) if line[2] == phase]))
+
+
 def _EmptyStage():
     stage = Usd.Stage.CreateInMemory()
     UsdGeom.Scope.Define(stage, "/Nothing")
@@ -218,6 +253,8 @@ def main():
            "the panel did not subscribe to stage replacement")
     _Check(len(data.selection.signalPrimSelectionChanged.slots) == 1,
            "the panel did not subscribe to viewport selection")
+    _Check(len(data.signalPrimsChanged.slots) == 1,
+           "the panel did not subscribe to stage edits")
 
     panel.Rebuild()
     _Check(panel._rig is not None, panel._status.text())
@@ -381,6 +418,48 @@ def main():
            (final[0].ValueText(), live))
     for line in _Lines(panel):
         _Check(line[3] == "2", line)
+
+    # -- an edit at the inspected frame repaints on the panel's own tick ---
+    # The request has settled and the panel has stopped ticking. usdview
+    # forwards the stage's ObjectsChanged notice on signalPrimsChanged, so a
+    # value the artist changes anywhere reaches the panel through that
+    # signal: no PollTick, no re-pick, and no frame change here.
+    amountAttr = stage.GetPrimAtPath(DATA_PATH).GetAttribute("amount")
+    beforeLines = _Lines(panel)
+    shown = [line for line in beforeLines if line[2] == "final"]
+    _Check(len(shown) == 1, beforeLines)
+    _Check(not panel._inspectorTimer.isActive(),
+           "a settled request kept the panel ticking")
+    heldGeneration = shown[0][5]
+    amountAttr.Set(EDITED_AMOUNT, Usd.TimeCode(2.0))
+    # From here the stage carries this test's own edit; the checks below
+    # still insist the inspector authored nothing of its own.
+    authored = stage.GetSessionLayer().ExportToString()
+    _Check(not panel._inspectorTimer.isActive(),
+           "an edit the host never reported owed a tick")
+    chooser = _Chooser(panel)
+    selected = panel._inspector.Selected()
+    data.signalPrimsChanged.emit(_RESYNC, _RESYNC)
+    _Check(panel._inspectorTimer.isActive(),
+           "the stage edit did not re-arm the panel's tick")
+    line = _WaitForEditRepaint(panel, "final", shown[0])
+    _Check(line[5] != heldGeneration, ("the generation never moved", line))
+    _Check(line[6] != shown[0][6], ("the value never moved", line))
+    live = float(rig.evaluate(2.0).moved_property(SCALAR_TARGET))
+    _Check(_Close(float(line[6]), live), (line[6], live))
+    # The fixture authored one multiply-by-2 mover over the attribute.
+    _Check(_Close(EDITED_AMOUNT * 2.0, float(line[6])), line)
+    # The inspected frame held, the viewer's clock was never touched, and
+    # the standing selection is still the one the viewport pick named.
+    for edited in _Lines(panel):
+        _Check(edited[3] == "2", edited)
+    _Check(panel._inspector.Frame() == 2.0, panel._inspector.FrameText())
+    _Check(float(panel._frameEdit.text()) == 2.0, panel._frameEdit.text())
+    _Check(_Chooser(panel) == chooser, _Chooser(panel))
+    _Check(panel._inspector.Selected() == selected,
+           panel._inspector.Selected())
+    _Check(data.currentFrame == 7.0 and data.frameWrites == [],
+           data.frameWrites)
 
     # -- the stage changed under the panel: the old demand ends ----------
     service = panel._inspector._service

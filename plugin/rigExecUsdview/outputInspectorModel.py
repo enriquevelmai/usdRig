@@ -204,8 +204,9 @@ class OutputInspectorModel(object):
     The lifecycle is the panel's: `Attach` the rig it just compiled,
     `Select` the outputs to look at, `DemandFrame` or
     `DemandDisplayedFrame` for the exact frame, `Poll` on the host's tick,
-    and `Close` on stage replacement or panel teardown -- which ends the
-    demand and releases the pool.
+    `NoteStageEdit` when the host sees the stage move under a standing
+    demand, and `Close` on stage replacement or panel teardown -- which ends
+    the demand and releases the pool.
     """
 
     def __init__(self, host=None, workers=None):
@@ -220,6 +221,7 @@ class OutputInspectorModel(object):
         self._time = None
         self._rows = []
         self._note = ""
+        self._edited = False
 
     def __repr__(self):
         return "<OutputInspectorModel %s frame=%s selected=%d>" % (
@@ -272,6 +274,7 @@ class OutputInspectorModel(object):
         self._rows = []
         self._selected = []
         self._note = ""
+        self._edited = False
 
     @property
     def attached(self):
@@ -380,6 +383,20 @@ class OutputInspectorModel(object):
 
     # -- asking, and reading the answer ----------------------------------
 
+    def NoteStageEdit(self):
+        """Tell the model the host saw its stage change.
+
+        The service reads the live stage in its own capture, so an edit only
+        reaches an answered line through a poll: without this note the host
+        has no reason to take one, and the line keeps showing the value
+        captured before the edit. A host that ticks on `HasWork` therefore
+        owes one more tick, which either finds the standing coverage record
+        still answers the frame -- and reports no work again -- or re-demands
+        it. A host with no timer calls `Poll` itself. The edit may name prims
+        the rig never reads; that is what the tick is for.
+        """
+        self._edited = True
+
     def Poll(self):
         """One host tick: re-dispatch what is owed, then read the lines.
 
@@ -389,6 +406,9 @@ class OutputInspectorModel(object):
         request left owed, and the packets are copies of what the coverage
         records hold.
         """
+        # The capture this poll takes reads whatever the edit changed, so the
+        # rows it returns decide what is owed next.
+        self._edited = False
         if self._service is None:
             changed = bool(self._rows)
             self._rows = []
@@ -453,8 +473,10 @@ class OutputInspectorModel(object):
         return list(self._rows)
 
     def HasWork(self):
-        """True while a demanded line is still owed."""
-        return any(row.status == PENDING for row in self._rows)
+        """True while a demanded line is still owed, or a reported edit has
+        not been read by a poll yet."""
+        return self._edited or any(row.status == PENDING
+                                   for row in self._rows)
 
     @property
     def note(self):

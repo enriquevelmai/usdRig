@@ -40,7 +40,8 @@ except ImportError as _error:
 
 # How often an open panel reads back what the subscription service
 # published. The service's own pool does the work; this only repaints, and
-# it stops while nothing is owed.
+# it stops while nothing is owed -- a demand owed again by a stage edit
+# re-arms it. A host with a recurring tick of its own can drive PollTick().
 _INSPECTOR_POLL_MS = 250
 
 
@@ -169,6 +170,15 @@ class ExecStackPanel(QtWidgets.QDialog):
                 self._OnPrimSelection)
         except Exception:
             pass
+        # usdview forwards Usd.Notice.ObjectsChanged on this signal, from the
+        # listener its data model registers per stage, so a control edit made
+        # anywhere reaches the panel. Optional like the others: a bare api
+        # has no signal to hand over.
+        try:
+            self._api.dataModel.signalPrimsChanged.connect(
+                self._OnPrimsChanged)
+        except Exception:
+            pass
 
     # -- output inspector ------------------------------------------------
 
@@ -222,9 +232,10 @@ class ExecStackPanel(QtWidgets.QDialog):
         self._inspector = (None if outputInspectorModel is None else
                            outputInspectorModel.OutputInspectorModel(
                                host=self))
-        # The panel's own tick, armed only while a demand is owed: pumping
-        # and polling are cheap, and a settled request repaints nothing. A
-        # host with a recurring tick can drive PollTick itself.
+        # The panel's own tick, armed while a demand is owed or the stage
+        # moved under one: pumping and polling are cheap, and a settled
+        # request repaints nothing. A host with a recurring tick can drive
+        # PollTick itself.
         self._inspectorTimer = QtCore.QTimer(self)
         self._inspectorTimer.setSingleShot(False)
         self._inspectorTimer.setInterval(_INSPECTOR_POLL_MS)
@@ -599,6 +610,26 @@ class ExecStackPanel(QtWidgets.QDialog):
         so every demand made from it ends before the new stage is read."""
         self._CloseInspector()
         self.Rebuild()
+
+    def _OnPrimsChanged(self, _primChange=None, _propertyChange=None):
+        """The stage moved under a standing demand: owe one more tick.
+
+        The service reads the live stage in the capture its poll takes, so a
+        control edit reaches an answered line only through a poll. The model
+        counts the edit as owed work, so the panel's next tick takes that
+        capture: it finds the standing record still answers the frame and the
+        tick stops again, or demands the frame's new answer. Restarting a
+        running timer would push its next tick out, so a burst of edits is
+        still read at the panel's own rate, and the inspected frame and the
+        viewer's are both left where they were.
+        """
+        if self._inspector is None or not self.isVisible():
+            return
+        if not self._inspector.Selected():
+            return
+        self._inspector.NoteStageEdit()
+        if not self._inspectorTimer.isActive():
+            self._inspectorTimer.start()
 
     def _OnPrimSelection(self, added=None, removed=None):
         """A prim picked in the viewport names the outputs to inspect.
