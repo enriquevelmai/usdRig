@@ -1162,7 +1162,7 @@ RigExecOutputStatus RrResolveOutput(const RrProgram *program,
 /// This program's words for a refused stage frame: the first required target
 /// the file could not resolve. The whole run and a requested run decline the
 /// frame in the same sentence.
-std::string RrStageFramesRefusal(const RrProgram *program);
+std::string RrStageFramesRefusal(const RrProgram &program);
 /// The whole requested execution: resolve every handle, run the union of their
 /// closures over the inputs as set, and answer each handle from the storage
 /// that run left. The run publishes nothing. The three counts name what the

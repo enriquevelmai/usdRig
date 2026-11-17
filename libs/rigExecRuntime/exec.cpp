@@ -925,7 +925,7 @@ RigExecRuntimeReader::Execute(std::string *error)
                                    store.headLines[i].begin(),
                                    store.headLines[i].end());
         }
-        const std::string refusal = RrStageFramesRefusal(&program);
+        const std::string refusal = RrStageFramesRefusal(program);
         poseDiagnostics.push_back(refusal);
         _jointMatrices.clear();
         _points.clear();

@@ -463,20 +463,20 @@ RrResolveOutput(const RrProgram *program, const RigExecOutputHandle &handle,
 // The first required target the file could not resolve, in the sentence the
 // whole run declines the frame with.
 std::string
-RrStageFramesRefusal(const RrProgram *program)
+RrStageFramesRefusal(const RrProgram &program)
 {
-    const auto &admission = program->requiredStageFramesAdmission;
+    const auto &admission = program.requiredStageFramesAdmission;
     const size_t target = size_t(admission.firstBadTarget);
     if (admission.firstBadTarget < 0 ||
-        target >= program->slotMeta->xformSlots.size()) {
+        target >= program.slotMeta->xformSlots.size()) {
         return "the frame's stage sources were refused";
     }
-    const int32_t slot = program->slotMeta->xformSlots[target];
-    if (slot < 0 || size_t(slot) >= program->slotMeta->paths.size()) {
+    const int32_t slot = program.slotMeta->xformSlots[target];
+    if (slot < 0 || size_t(slot) >= program.slotMeta->paths.size()) {
         return "the frame's stage sources were refused";
     }
     return "could not resolve constraint target " +
-           program->TextOrEmpty(program->slotMeta->paths[size_t(slot)]) +
+           program.TextOrEmpty(program.slotMeta->paths[size_t(slot)]) +
            " relative to the asset root";
 }
 
@@ -678,7 +678,7 @@ RrRequestOutputs(RrProgram *program,
     // admission record were skipped (closure.cpp), so this storage holds no
     // answer. Decline the request in the whole run's words.
     if (!program->requiredStageFramesAdmission.admitted) {
-        const std::string refusal = RrStageFramesRefusal(program);
+        const std::string refusal = RrStageFramesRefusal(*program);
         for (RigExecOutputPacket &packet : answers)
             if (packet.status == RigExecOutputStatus::Pending) {
                 packet.status = RigExecOutputStatus::Failed;
