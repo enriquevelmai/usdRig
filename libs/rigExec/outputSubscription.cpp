@@ -1246,8 +1246,12 @@ private:
         for (const RigExecOutputPacket &packet : result.packets) {
             payload += packet.payload.ByteCount();
         }
-        if (payload > 0 &&
-            !job->reservation.Extend(RigExecCoverageDomain::Payload, payload)) {
+        // Admission already charged the estimate (or the layout floor) for this
+        // payload; a longer answer pays only the gap above it.
+        const size_t reserved = job->reservation.Bytes().payload;
+        const size_t shortfall = payload > reserved ? payload - reserved : 0;
+        if (shortfall > 0 && !job->reservation.Extend(
+                                 RigExecCoverageDomain::Payload, shortfall)) {
             return _RetireRun(
                 job, request, RigExecExplicitOutcome::DeclinedInvalid,
                 RigExecOutputStatus::Failed,

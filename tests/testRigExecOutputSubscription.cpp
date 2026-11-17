@@ -288,6 +288,22 @@ PayloadFloorBytes(const RigExecOutputHandle &handle)
     return size_t(elementBytes);
 }
 
+// What the harness lane publishes for one handle: `ElementCount` elements of
+// its declared layout, the bytes a published coverage record is charged.
+size_t
+HarnessPayloadBytes(const RigExecOutputHandle &handle)
+{
+    RigExecPayloadKind kind = RigExecPayloadKind::Unknown;
+    if (!RigExecPayloadKindForType(handle.type, &kind)) {
+        return 0;
+    }
+    uint64_t bytes = 0;
+    if (!RigExecPayloadByteCount(kind, uint64_t(ElementCount(kind)), &bytes)) {
+        return 0;
+    }
+    return size_t(bytes);
+}
+
 size_t
 TotalBytes(const RigExecCoverageBytes &bytes)
 {
@@ -436,6 +452,9 @@ struct Harness {
     uint64_t programIdentityOverride = 0;
     uint64_t inputRevision = 1;
     size_t captureBytes = 4096;
+    // What the host states for the payloads a frame will publish. Zero leaves
+    // the service to floor the charge at one element per demanded handle.
+    size_t payloadEstimateBytes = 0;
     // What the host charges for the arena a frame's lane would clone. The
     // service refuses a frame that does not fit before it calls the lane hook.
     size_t workspaceBytes = 0;
@@ -525,6 +544,7 @@ struct Harness {
                 out->upstreamRevision = 0;
                 out->bytes.capture = captureBytes;
                 out->bytes.workspace = workspaceBytes;
+                out->bytes.payload = payloadEstimateBytes;
                 return true;
             };
         host.lane = [this](const SdfPath &, const RigExecOutputTimeDemand &,
@@ -1974,6 +1994,107 @@ TestCoverageHitAndBudgetRefusalBuildNoArena()
     CHECK(h.cache.CoverageHeld().workspace == 0);
 }
 
+// Admission charges the payload bytes the host states, or one element per
+// demanded handle when it states none, and the run pays only the gap above
+// that charge. A cap holding the sampled vector plus one whole answer is
+// enough for that answer to publish; a cap that cannot hold it still fails.
+void
+TestPayloadChargePaysOnlyTheGapAboveTheEstimate()
+{
+    const RigFixture a = StageA();
+
+    // The floor estimate is exactly what a transform run publishes, so the
+    // frame arrives fully prepaid.
+    {
+        Harness h;
+        h.catalogs[a.root] = a.catalog;
+        auto service = h.MakeService();
+        const size_t payload = HarnessPayloadBytes(a.transform);
+        CHECK(payload == PayloadFloorBytes(a.transform));
+        h.cache.SetByteCap(h.captureBytes + payload);
+        auto fit =
+            service.Subscribe(a.root, RequestAt(TimeOf(4.0), {a.transform}));
+        CHECK(fit.IsValid());
+        CHECK(h.scheduler->Stats().explicitAccepted == 1);
+        h.scheduler->DrainQueueForTesting();
+        CHECK(h.laneRuns == 1);
+        CHECK(AllReady(service.PollResults(fit)));
+        // The poll pins the answer, which moves its bytes to the pinned
+        // domain; the whole charge still fits the cap exactly.
+        CHECK(h.cache.CoverageHeld().pinned == payload);
+        CHECK(h.cache.CoverageHeld().payload == 0);
+        CHECK(TotalBytes(h.cache.CoverageHeld()) == h.captureBytes + payload);
+    }
+
+    // A host that states the geometry payload is charged that estimate: the
+    // same exact-fit cap admits an answer far above the floor.
+    {
+        Harness h;
+        h.catalogs[a.root] = a.catalog;
+        const size_t payload = HarnessPayloadBytes(a.points);
+        CHECK(payload > PayloadFloorBytes(a.points));
+        h.payloadEstimateBytes = payload;
+        h.cache.SetByteCap(h.captureBytes + payload);
+        auto service = h.MakeService();
+        auto fit =
+            service.Subscribe(a.root, RequestAt(TimeOf(4.0), {a.points}));
+        CHECK(fit.IsValid());
+        CHECK(h.scheduler->Stats().explicitAccepted == 1);
+        h.scheduler->DrainQueueForTesting();
+        CHECK(h.laneRuns == 1);
+        CHECK(AllReady(service.PollResults(fit)));
+        CHECK(h.cache.CoverageHeld().pinned == payload);
+        CHECK(TotalBytes(h.cache.CoverageHeld()) == h.captureBytes + payload);
+    }
+
+    // An answer longer than its estimate grows the charge by the gap, and the
+    // record stands charged at what actually exists.
+    {
+        Harness h;
+        h.catalogs[a.root] = a.catalog;
+        const size_t payload = HarnessPayloadBytes(a.points);
+        h.payloadEstimateBytes = PayloadFloorBytes(a.points);
+        h.cache.SetByteCap(h.captureBytes + payload);
+        auto service = h.MakeService();
+        auto grown =
+            service.Subscribe(a.root, RequestAt(TimeOf(4.0), {a.points}));
+        CHECK(grown.IsValid());
+        CHECK(h.scheduler->Stats().explicitAccepted == 1);
+        h.scheduler->DrainQueueForTesting();
+        CHECK(h.laneRuns == 1);
+        CHECK(AllReady(service.PollResults(grown)));
+        CHECK(h.cache.CoverageHeld().pinned == payload);
+        CHECK(TotalBytes(h.cache.CoverageHeld()) == h.captureBytes + payload);
+    }
+
+    // A budget that cannot hold the actual payload is refused rather than
+    // exceeded: the frame fails at publish, the record never lands, and the
+    // charge comes back with the job.
+    {
+        Harness h;
+        h.catalogs[a.root] = a.catalog;
+        const size_t payload = HarnessPayloadBytes(a.points);
+        h.payloadEstimateBytes = PayloadFloorBytes(a.points);
+        h.cache.SetByteCap(h.captureBytes + payload - 1);
+        auto service = h.MakeService();
+        auto owed =
+            service.Subscribe(a.root, RequestAt(TimeOf(4.0), {a.points}));
+        CHECK(owed.IsValid());
+        CHECK(h.scheduler->Stats().explicitAccepted == 1);
+        h.scheduler->DrainQueueForTesting();
+        CHECK(h.laneRuns == 1);
+        CHECK(service.Stats().declinedCoverageBudget == 0);
+        const std::vector<RigExecOutputPacket> declined =
+            service.PollResults(owed);
+        CHECK(declined.size() == 1);
+        CHECK(declined[0].status == RigExecOutputStatus::Failed);
+        CHECK(declined[0].reason.find("payloads") != std::string::npos);
+        CHECK(h.cache.CoverageRecordCount() == 0);
+        CHECK(TotalBytes(h.cache.CoverageHeld()) == 0);
+        CHECK(h.scheduler->ReservedExplicitBytes() == 0);
+    }
+}
+
 // A lane is a clone of the compiled program, so its charge covers the
 // matrices and the geometry that clone carries. Eight bytes per provider, what
 // the first host charged for the same lane, covered none of them.
@@ -3074,6 +3195,7 @@ main()
     TestBoundsRefuseBeforeAllocating();
     TestClosedDemandReturnsItsCoverageOnTheAsk();
     TestCoverageHitAndBudgetRefusalBuildNoArena();
+    TestPayloadChargePaysOnlyTheGapAboveTheEstimate();
     TestLaneChargeCoversTheProgramItClones();
     TestLaneChargeWalksTheRecordsItClones();
     TestLaneChargeGrowsWithInnerAllocations();

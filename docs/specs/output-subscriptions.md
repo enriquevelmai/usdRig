@@ -544,11 +544,11 @@ produced it, so a coverage hit never implies the ancestors exist.
   handle as a floor. The order is fixed: preflight, coverage lookup, budget,
   then the lane. A frame a standing record answers and a frame the budget
   refuses both preflight and build no arena.
-- **The run extends the charge before it publishes.** The lane's actual
-  payload bytes are added to the reservation before `PublishCoverage`, and a
-  payload that would pass the budget fails that frame rather than storing over
-  budget. A subscription job's arena dies with the lane, so its record
-  publishes claiming no retained workspace.
+- **The run extends the charge before it publishes.** Payload bytes above
+  what admission reserved for them are added to the reservation before
+  `PublishCoverage`, and a payload that would pass the budget fails that frame
+  rather than storing over budget. A subscription job's arena dies with the
+  lane, so its record publishes claiming no retained workspace.
 - **Pins outlive records; records outlive demand while they are free to.** A
   record with a standing lease is never dropped, and closing every client
   releases only the charges those clients held: the record stays, unprobed and
