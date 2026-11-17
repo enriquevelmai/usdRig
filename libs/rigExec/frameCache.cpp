@@ -1771,18 +1771,23 @@ void
 RigExecFrameCache::_DetachCoverageEntry(_Shard &shard,
                                         _CoverageMap::iterator it)
 {
+    _RetireCoverageCharges(*it->second);
+    shard.coverage.erase(it);
+    _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void
+RigExecFrameCache::_RetireCoverageCharges(_CoverageEntry &entry) const
+{
     // Every charge but the pinned bytes a live lease owes comes back now; the
-    // lease returns those when it ends. The record itself stays alive while a
-    // lease holds it.
-    _CoverageEntry &entry = *it->second;
+    // lease returns those when it ends. The record's own bytes go to zero so
+    // nothing releases them a second time.
     RigExecCoverageBytes release = entry.bytes;
     release.pinned = 0;
     _ReleaseCharge(release);
     entry.bytes.capture = 0;
     entry.bytes.workspace = 0;
     entry.bytes.payload = 0;
-    shard.coverage.erase(it);
-    _coverageRecords.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void
@@ -1942,6 +1947,17 @@ RigExecCoverageLease::Release()
     return true;
 }
 
+// The test-only publication probe (see RigExecSetCoveragePublishProbeForTesting
+// and RigExecCoveragePublishPhase): null in production, set only while no
+// publish is in flight, so a test can throw where an allocation may fail.
+static RigExecCoveragePublishProbe _sCoveragePublishProbe;
+
+void
+RigExecSetCoveragePublishProbeForTesting(RigExecCoveragePublishProbe probe)
+{
+    _sCoveragePublishProbe = std::move(probe);
+}
+
 bool
 RigExecFrameCache::PublishCoverage(
     const RigExecCoverageKey &key,
@@ -1964,7 +1980,8 @@ RigExecFrameCache::PublishCoverage(
         }
     }
     // The reservation is what the caller allocated with; the record is charged
-    // for what actually exists. Surplus comes back before the record lands.
+    // for what actually exists. Surplus comes back at the commit below, once
+    // nothing that can fail is left.
     if (payload > reservation.Bytes().payload) {
         return false;
     }
@@ -1976,11 +1993,11 @@ RigExecFrameCache::PublishCoverage(
         surplus.workspace = record.workspace;
         record.workspace = 0;
     }
-    if (surplus.capture || surplus.workspace || surplus.payload ||
-        surplus.pinned) {
-        _ReleaseCharge(surplus);
-    }
 
+    // Everything that allocates happens here, with the reservation still
+    // owning its whole charge and the store still holding any record it had: an
+    // allocation that throws unwinds through the reservation, which returns
+    // exactly what it charged.
     std::shared_ptr<_CoverageEntry> entry = std::make_shared<_CoverageEntry>();
     entry->bytes = record;
     entry->arenaRetained = arenaRetained;
@@ -1990,19 +2007,43 @@ RigExecFrameCache::PublishCoverage(
     for (const RigExecOutputPacket &packet : packets) {
         entry->outputs.push_back(_CoveredOutput{packet, false});
     }
-    // The charge now belongs to the record, not the reservation.
-    reservation._cache = nullptr;
-    reservation._bytes = RigExecCoverageBytes();
+    if (_sCoveragePublishProbe) {
+        _sCoveragePublishProbe(RigExecCoveragePublishPhase::BeforeStore);
+    }
 
+    std::shared_ptr<_CoverageEntry> replaced;
     {
         _Shard &shard = _GetCoverageShard(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
         const auto it = shard.coverage.find(key);
-        if (it != shard.coverage.end()) {
-            _DetachCoverageEntry(shard, it);
+        if (it == shard.coverage.end()) {
+            if (_sCoveragePublishProbe) {
+                _sCoveragePublishProbe(
+                    RigExecCoveragePublishPhase::BeforeInsert);
+            }
+            // The map's node allocation is the last step that can fail, and it
+            // fails with the store and the account unchanged.
+            shard.coverage.emplace(key, entry);
+            _coverageRecords.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // Handing the node's handle over allocates nothing, so the stale
+            // record is replaced rather than dropped ahead of an insert that
+            // might still fail.
+            replaced = it->second;
+            it->second = entry;
         }
-        shard.coverage.emplace(key, std::move(entry));
-        _coverageRecords.fetch_add(1, std::memory_order_relaxed);
+        // The commit cannot throw: one account step returns the surplus, the
+        // record takes the reservation's remaining bytes, and the record the
+        // store dropped returns its own charge.
+        if (surplus.capture || surplus.workspace || surplus.payload ||
+            surplus.pinned) {
+            _ReleaseCharge(surplus);
+        }
+        reservation._cache = nullptr;
+        reservation._bytes = RigExecCoverageBytes();
+        if (replaced) {
+            _RetireCoverageCharges(*replaced);
+        }
     }
     return true;
 }

@@ -40,6 +40,7 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1342,6 +1343,115 @@ TestCoveragePublishReplacingARecordBalancesBytes()
     CHECK(cache.CoverageHeld().pinned == 0);
 }
 
+// A publish that fails part way through is a transaction: the reservation
+// returns exactly what it charged, the record that stood is the record that
+// stands, and no byte leaves another reservation's charge.
+void
+TestFailedCoveragePublishReturnsItsChargeExactlyOnce()
+{
+    RigExecFrameCache cache;
+    cache.SetByteCap(2000);
+    const RigExecOutputGeneration gen = MakeGeneration(1, 1, 0, 0);
+    const RigExecCoverageKey key = MakeCoverageKey(1, 2.0, gen);
+    const RigExecCoverageKey otherKey = MakeCoverageKey(1, 9.0, gen);
+    const RigExecOutputHandle handle = MakeHandle("joint.frame");
+
+    // A standing record, and a second job's reservation charged in every
+    // domain: a surplus released twice comes out of this one.
+    CHECK(cache.PublishCoverage(
+        key,
+        {MakePacket(handle, key.time, gen, RigExecPayloadKind::Scalar, 10)},
+        Reserve(cache, 50, 0, 80), false));
+    RigExecCoverageReservation other = Reserve(cache, 100, 30, 50);
+    CHECK(other.IsValid());
+    const RigExecCoverageBytes standing = cache.CoverageHeld();
+    CHECK(standing.capture == 150);
+    CHECK(standing.workspace == 30);
+    CHECK(standing.payload == 130);
+    CHECK(standing.pinned == 0);
+    CHECK(cache.CoverageRecordCount() == 1);
+
+    // A replacement fails after the record's allocations and before the store
+    // moves: the old record still answers and the account did not blink.
+    RigExecSetCoveragePublishProbeForTesting(
+        [](RigExecCoveragePublishPhase phase) {
+            if (phase == RigExecCoveragePublishPhase::BeforeStore) {
+                throw std::bad_alloc();
+            }
+        });
+    bool threw = false;
+    try {
+        cache.PublishCoverage(
+            key,
+            {MakePacket(handle, key.time, gen, RigExecPayloadKind::Point3, 2)},
+            Reserve(cache, 60, 40, 96), true);
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(cache.CoverageHeld() == standing);
+    CHECK(cache.CoverageRecordCount() == 1);
+    RigExecCoverageRecord record;
+    CHECK(cache.LookupCoverage(key, &record));
+    CHECK(record.packets.size() == 1);
+    CHECK(record.packets[0].payload.elementCount == 10);
+    CHECK(record.bytes.capture == 50);
+    CHECK(record.bytes.payload == 80);
+    CHECK(!record.arenaRetained);
+
+    // A new key fails at the map's own allocation: nothing lands, and the
+    // charge that paid for it comes back rather than stranding the budget.
+    RigExecSetCoveragePublishProbeForTesting(
+        [](RigExecCoveragePublishPhase phase) {
+            if (phase == RigExecCoveragePublishPhase::BeforeInsert) {
+                throw std::bad_alloc();
+            }
+        });
+    threw = false;
+    try {
+        cache.PublishCoverage(otherKey,
+                              {MakePacket(handle, otherKey.time, gen,
+                                          RigExecPayloadKind::Matrix4x4Row, 1)},
+                              Reserve(cache, 20, 10, 128), true);
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(cache.CoverageHeld() == standing);
+    CHECK(cache.CoverageRecordCount() == 1);
+    CHECK(!cache.LookupCoverage(otherKey, &record));
+
+    // The seam is off: both publishes now land, so the failed attempts charged
+    // the budget nothing, and the replacement retires the bytes of the record
+    // it replaced instead of both records' worth.
+    RigExecSetCoveragePublishProbeForTesting(nullptr);
+    CHECK(
+        cache.PublishCoverage(otherKey,
+                              {MakePacket(handle, otherKey.time, gen,
+                                          RigExecPayloadKind::Matrix4x4Row, 1)},
+                              Reserve(cache, 20, 10, 128), true));
+    CHECK(cache.PublishCoverage(
+        key, {MakePacket(handle, key.time, gen, RigExecPayloadKind::Point3, 2)},
+        Reserve(cache, 60, 40, 96), true));
+    CHECK(cache.CoverageRecordCount() == 2);
+    CHECK(cache.LookupCoverage(key, &record));
+    CHECK(record.packets[0].payload.elementCount == 2);
+    CHECK(record.bytes.capture == 60);
+    CHECK(record.bytes.workspace == 40);
+    CHECK(record.bytes.payload == 48);
+    CHECK(record.arenaRetained);
+    CHECK(cache.CoverageHeld().capture == 180);
+    CHECK(cache.CoverageHeld().workspace == 80);
+    CHECK(cache.CoverageHeld().payload == 226);
+    CHECK(cache.CoverageHeld().pinned == 0);
+
+    other.Release();
+    CHECK(cache.CoverageHeld().capture == 80);
+    CHECK(cache.CoverageHeld().workspace == 50);
+    CHECK(cache.CoverageHeld().payload == 176);
+    CHECK(cache.CoverageRecordCount() == 2);
+}
+
 // A partial record never answers a complete-pose lookup, and publishing one
 // leaves the pose store's counters and complete marker untouched.
 void
@@ -2317,6 +2427,7 @@ main()
     TestCoverageAdmissionRefusesBeforeAllocating();
     TestPublishChargesWhatExistsAndReturnsSurplus();
     TestCoveragePublishReplacingARecordBalancesBytes();
+    TestFailedCoveragePublishReturnsItsChargeExactlyOnce();
     TestPartialCoverageNeverSatisfiesPoseLookup();
     TestStaleGenerationMissesCoverage();
     TestArenaRetirementKeepsPayloadsAnswerable();

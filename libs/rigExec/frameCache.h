@@ -616,6 +616,22 @@ private:
     RigExecCoverageBytes _bytes;
 };
 
+/// Where coverage publication can fail an allocation, for the test-only probe
+/// below. `BeforeStore` is after the record's own allocations, with the store
+/// and the byte account untouched; `BeforeInsert` is with a shard lock held,
+/// before a new key's node is allocated.
+enum class RigExecCoveragePublishPhase { BeforeStore, BeforeInsert };
+
+using RigExecCoveragePublishProbe =
+    std::function<void(RigExecCoveragePublishPhase)>;
+
+/// Test-only seam for publication failure injection: while set, PublishCoverage
+/// runs the probe at each phase, so a test can throw there and read what
+/// survived. Null in production. Set it only while no publish is in flight, and
+/// never touch the cache from the probe: `BeforeInsert` holds a shard lock.
+void
+RigExecSetCoveragePublishProbeForTesting(RigExecCoveragePublishProbe probe);
+
 /// A live lease on one coverage payload. While a lease stands, the cache
 /// counts its bytes in the pinned domain and never drops the record
 /// underneath it; the lease's owner returns the bytes by releasing or
@@ -827,6 +843,12 @@ public:
     /// lease still owes: that lease keeps its charge and its packet. A record is
     /// never a pose, and a full-pose Lookup never reads one. false when the
     /// coverage names no output.
+    ///
+    /// The publish is transactional: everything that allocates runs while \p
+    /// reservation still owns its whole charge, and the store edit that follows
+    /// cannot throw. A publish that fails therefore returns the charge through
+    /// the reservation, leaves the record it had standing, and never releases
+    /// bytes another reservation owns.
     bool PublishCoverage(const RigExecCoverageKey &key,
                          const std::vector<RigExecOutputPacket> &packets,
                          RigExecCoverageReservation reservation,
@@ -1020,6 +1042,9 @@ private:
     // pinned bytes a live lease still owes. The record stays alive while a
     // lease holds it. Caller holds the shard lock.
     void _DetachCoverageEntry(_Shard &shard, _CoverageMap::iterator it);
+    // Returns one record's charges, leaving the pinned bytes to the leases that
+    // owe them, and zeroes them so nothing releases the same bytes twice.
+    void _RetireCoverageCharges(_CoverageEntry &entry) const;
     RigExecCoverageBytes _CoverageCharge() const;
 
     mutable std::array<_Shard, _kShardCount> _shards;

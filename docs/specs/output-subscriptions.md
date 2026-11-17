@@ -547,8 +547,11 @@ produced it, so a coverage hit never implies the ancestors exist.
 - **The run extends the charge before it publishes.** Payload bytes above
   what admission reserved for them are added to the reservation before
   `PublishCoverage`, and a payload that would pass the budget fails that frame
-  rather than storing over budget. A subscription job's arena dies with the
-  lane, so its record publishes claiming no retained workspace.
+  rather than storing over budget. The publish itself is transactional: it
+  allocates the record before the store or the account moves, so a publish that
+  fails returns the reservation's charge, keeps the record that stood, and
+  releases nothing another reservation owns. A subscription job's arena dies
+  with the lane, so its record publishes claiming no retained workspace.
 - **Pins outlive records; records outlive demand while they are free to.** A
   record with a standing lease is never dropped, and closing every client
   releases only the charges those clients held: the record stays, unprobed and
